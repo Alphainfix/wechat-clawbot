@@ -1,0 +1,29 @@
+# wechat-clawbot bundle patch: inserts the WeChat ClawBot channel row.
+#
+# Applied after dsh-base/dsh-web-app bundle layers. Users may override every
+# key below from their profile's own cordis.patch.yml (same `id: clawbot`).
+- insert:
+    - id: clawbot
+      name: 'wechat-clawbot'
+      config:
+        autoStart: true
+        allowFrom: []
+        sessionId: 'wechat-main'
+        forwardQuestions: false
+        approvalTimeoutMs: 0
+        logLevel: 'info'
+
+    # dsh-schedule: the DSH official reminder plugin. The WeChat agent uses
+    # its schedule_create/list/delete tools for timed reminders, and the
+    # bridge delivers the injected reminders back to WeChat. Bundled here so
+    # installing this plugin brings the reminder feature automatically —
+    # no profile-level patch needed.
+    # DSH 0.1.7-rc.2 ships its own `schedule` row, disabled by default. This
+    # insert does not merge with it — the entry list ends up with two rows
+    # named `schedule`, and the Loader keys rows by id with the later one
+    # winning, which is this enabled row (bundle patches apply after
+    # dsh-web-app). On rc.2 reminders live in the Host task table
+    # ($DSH_HOME/storages/schedule.json) and survive a session reset; before
+    # rc.2 they lived in the session log and a reset cleared them.
+    - id: schedule
+      name: '@deepseek-ai/dsh-schedule'

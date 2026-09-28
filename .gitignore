@@ -1,0 +1,5 @@
+node_modules/
+lib/
+*.tgz
+qrcode-login.png
+.DS_Store
