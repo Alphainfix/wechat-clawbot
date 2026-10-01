@@ -168,7 +168,7 @@ window.__ModuleLoader__.load({
 .${S.button}:hover:not(:disabled) { color: var(--dsw-alias-label-primary);
   border-color: var(--dsw-alias-label-dimmed); }
 .${S.button}:disabled { opacity: .4; cursor: default; }
-.${S.failed} { color: var(--dsw-alias-label-error); font-size: 12px; line-height: 1.5; }
+.${S.failed} { color: var(--dsw-alias-state-error-primary); font-size: 12px; line-height: 1.5; }
 `;
       document.head.appendChild(el);
     }

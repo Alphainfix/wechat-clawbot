@@ -136,6 +136,12 @@ function askViaWechat(
   }
 
   return new Promise<AskUserQuestionAnswer>((resolveAnswer, rejectAnswer) => {
+    // An already-aborted signal never fires its listeners: bail out before
+    // registering anything that would then outlive its waiter.
+    if (request.signal?.aborted) {
+      rejectAnswer(new Error("ask_user_question was aborted before the user answered"));
+      return;
+    }
     let settled = false;
     const settle = (answer: AskUserQuestionAnswer): void => {
       if (settled) return;
@@ -147,7 +153,9 @@ function askViaWechat(
       tag: "question",
       sender: target,
       resolve: (reply) => {
+        if (settled) return;
         if (reply === null) {
+          settled = true;
           rejectAnswer(new Error("ask_user_question was aborted before the user answered"));
           return;
         }
@@ -156,14 +164,18 @@ function askViaWechat(
     };
     pending.push(answer);
 
-    request.signal?.addEventListener(
-      "abort",
-      () => answer.resolve(null),
-      { once: true },
-    );
+    // An aborted or undeliverable question leaves the queue, so it cannot
+    // swallow the user's next message.
+    const withdraw = (): void => {
+      pending.remove(answer);
+      answer.resolve(null);
+    };
+    request.signal?.addEventListener("abort", withdraw, { once: true });
 
     sendText(target, formatQuestion(request)).catch((err) => {
-      answer.resolve(null);
+      if (settled) return;
+      pending.remove(answer);
+      settled = true;
       rejectAnswer(new Error(`failed to forward question to WeChat: ${String(err)}`));
     });
   });

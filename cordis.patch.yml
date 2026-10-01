@@ -18,12 +18,13 @@
     # bridge delivers the injected reminders back to WeChat. Bundled here so
     # installing this plugin brings the reminder feature automatically —
     # no profile-level patch needed.
-    # DSH 0.1.7-rc.2 ships its own `schedule` row, disabled by default. This
-    # insert does not merge with it — the entry list ends up with two rows
-    # named `schedule`, and the Loader keys rows by id with the later one
-    # winning, which is this enabled row (bundle patches apply after
-    # dsh-web-app). On rc.2 reminders live in the Host task table
+    # Since DSH 0.1.7-rc.2 reminders live in the Host task table
     # ($DSH_HOME/storages/schedule.json) and survive a session reset; before
     # rc.2 they lived in the session log and a reset cleared them.
+    # DSH 0.2.0 no longer ships a `schedule` row in dsh-web-app, so this is the
+    # only one — unless the optional "Automation tasks" bundle is switched on
+    # in the Plugins page. That bundle inserts its own `schedule` row after
+    # this one and the later row wins: harmless while it stays on, but turning
+    # off that bundle's "Task scheduling" row silences WeChat reminders too.
     - id: schedule
       name: '@deepseek-ai/dsh-schedule'

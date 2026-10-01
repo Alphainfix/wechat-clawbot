@@ -80,6 +80,10 @@ export class ApprovalRelay {
       logger.error(`approval: failed to send question to ${sender}: ${String(err)}`);
       return "unavailable";
     }
+    // The send can take seconds. If the turn was stopped meanwhile, the abort
+    // already fired and a listener added now would never run — the entry would
+    // then sit in the queue and swallow the owner's next message.
+    if (req.signal?.aborted) return "cancelled";
 
     return new Promise<ApprovalOutcome>((resolveOutcome) => {
       let settled = false;
@@ -93,6 +97,8 @@ export class ApprovalRelay {
         tag: "approval",
         sender,
         resolve: (reply) => {
+          // Already withdrawn: no stray 已批准/已拒绝 for a request that is gone.
+          if (settled) return;
           if (reply === null) {
             settle("cancelled");
             return;
@@ -104,19 +110,17 @@ export class ApprovalRelay {
       };
       this.pending.push(answer);
 
-      // Withdraw the question when the requesting turn is aborted.
-      req.signal?.addEventListener(
-        "abort",
-        () => {
-          answer.resolve(null);
-        },
-        { once: true },
-      );
+      // Withdraw the question when the requesting turn is aborted or it times
+      // out. Leaving the entry queued would make the sender's next WeChat
+      // message answer a request nobody is waiting on — and eat that message.
+      const withdraw = (): void => {
+        this.pending.remove(answer);
+        answer.resolve(null);
+      };
+      req.signal?.addEventListener("abort", withdraw, { once: true });
 
       if (this.config.approvalTimeoutMs > 0) {
-        setTimeout(() => {
-          answer.resolve(null);
-        }, this.config.approvalTimeoutMs).unref?.();
+        setTimeout(withdraw, this.config.approvalTimeoutMs).unref?.();
       }
     });
   }

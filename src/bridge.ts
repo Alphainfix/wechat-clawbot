@@ -32,7 +32,7 @@ type AgentPresetsService = { mount(ctx: unknown, id?: string): Promise<unknown> 
 
 import type { ClawbotConfig } from "./config.js";
 import { markSessionCreated, wasSessionCreated } from "./state.js";
-import { PendingRegistry } from "./pending.js";
+import { PendingRegistry, type PendingAnswer } from "./pending.js";
 import { TypingIndicator } from "./typing.js";
 import { registerSendFileTool } from "./tool.js";
 import { randomUUID } from "node:crypto";
@@ -144,13 +144,17 @@ export class WechatBridge {
    * Send one text message to a WeChat user, serialized behind every other
    * outbound message so delivery order is preserved.
    */
-  sendTextTo(sender: string, text: string): void {
+  sendTextTo(sender: string, text: string, opts?: { uncapped?: boolean }): boolean {
     // Per-turn message cap (mirrors RULE B's "约 10 条"): beyond 10 messages
     // in one turn, drop extras and warn. Resets when a new turn starts
-    // (drainQueue sets currentSender).
-    if (this.turnMessageCount >= WechatBridge.MAX_TURN_MESSAGES) {
+    // (drainQueue for WeChat turns, the schedule branch of onSessionEvent for
+    // reminder turns). Returns false when the text was dropped, so a caller
+    // never reports a message as sent that never left.
+    // `uncapped` is for a question the agent then blocks on: dropping that one
+    // would leave the bot waiting for an answer to something nobody saw.
+    if (!opts?.uncapped && this.turnMessageCount >= WechatBridge.MAX_TURN_MESSAGES) {
       logger.warn(`sendTextTo: turn message cap (${WechatBridge.MAX_TURN_MESSAGES}) reached for ${sender}; dropping: ${text.slice(0, 40)}…`);
-      return;
+      return false;
     }
     this.turnMessageCount += 1;
     this.sendChain = this.sendChain.then(async () => {
@@ -161,6 +165,7 @@ export class WechatBridge {
         logger.error(`sendTextTo: failed to ${sender}: ${String(err)}`);
       }
     });
+    return true;
   }
 
   get id(): SessionId {
@@ -173,23 +178,33 @@ export class WechatBridge {
    * never pop up in the webapp GUI. Returns the raw reply text, or null on
    * timeout / abort.
    */
-  askWechat(question: string, timeoutMs = 300_000): Promise<string | null> {
+  askWechat(question: string, timeoutMs = 300_000, signal?: AbortSignal): Promise<string | null> {
     const sender = this.currentSender ?? this.deps.getAccount()?.userId;
-    if (!sender) return Promise.resolve(null);
-    this.sendTextTo(sender, question);
+    if (!sender || signal?.aborted) return Promise.resolve(null);
+    this.sendTextTo(sender, question, { uncapped: true });
     return new Promise<string | null>((resolve) => {
-      const timer = setTimeout(() => {
-        this.deps.pending.abortFor(sender);
-        resolve(null);
-      }, timeoutMs);
-      this.deps.pending.push({
+      let settled = false;
+      const entry: PendingAnswer = {
         tag: "question",
         sender,
         resolve: (reply) => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
+          signal?.removeEventListener("abort", withdraw);
           resolve(reply);
         },
-      });
+      };
+      // Timed out or the turn was stopped: withdraw only this question. The
+      // entry must not outlive its waiter, or the sender's next message would
+      // be taken as its answer and never reach the agent.
+      const withdraw = (): void => {
+        this.deps.pending.remove(entry);
+        entry.resolve(null);
+      };
+      const timer = setTimeout(withdraw, timeoutMs);
+      signal?.addEventListener("abort", withdraw, { once: true });
+      this.deps.pending.push(entry);
     });
   }
 
@@ -865,6 +880,11 @@ export class WechatBridge {
         if (owner) {
           logger.info(`sessionEvent: schedule turn attributed to owner ${owner}`);
           this.currentSender = owner;
+          // A reminder turn is a turn of its own: without this it inherited
+          // what the last WeChat turn left of the 10-message budget, and once
+          // that ran out every later reminder was dropped (the tool still said
+          // 已发送) until the owner happened to message the bot again.
+          this.turnMessageCount = 0;
           this.typing.start(owner);
         }
         // dsh-schedule 自己就能把会话唤醒来投递提醒,这条路径**不经过**

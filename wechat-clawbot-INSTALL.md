@@ -1,6 +1,6 @@
 # wechat-clawbot 安装手册（写给替用户装这个插件的 AI 看）
 
-> **适用于：`wechat-clawbot` 0.9.6 + DeepSeek Harness（DSH）≥ 0.1.7（含 0.1.7-rc.2）。**
+> **适用于：`wechat-clawbot` 0.9.7 + DeepSeek Harness（DSH）0.1.7 到 0.2.x（在 0.1.7-rc.2、0.2.0-rc.2 上测过）。**
 >
 > 读者假设：你是一个能跑命令的 agent，正在替某个人把 `wechat-clawbot` 装进他的 DSH。
 > README 讲的是「这插件是什么」，这份讲的是「怎么装成，以及装不成时那个报错到底在说什么」。
@@ -31,7 +31,7 @@ clawbot (…): failed to import
 
 | 要确认的 | 怎么查 | 不满足会怎样 |
 |---|---|---|
-| DSH 版本 | `npx @deepseek-ai/dsh --version` | **需要 ≥ 0.1.7**。插件的 peerDependencies 写的是 `^0.1.7-rc.1`，0.1.7 的**版本门禁**会拿运行时版本去比，不满足就把插件禁用（日志：`Plugin … is incompatible with dsh …`）。装在 0.1.5 上则是浏览器端找不到 `configForms`、整页白屏 |
+| DSH 版本 | `npx @deepseek-ai/dsh --version` | **需要 0.1.7 到 0.2.x**。插件的 peerDependencies 写的是 `^0.1.7-rc.1 \|\| ^0.2.0-rc.1`，0.1.7 起的**版本门禁**会拿运行时版本去比，不满足就把整个插件跳过（日志：`skipping profile bundle "wechat-clawbot": … is incompatible with dsh …`，dsh 本身照常运行）。**0.9.6 及更早的 peer 止于 0.2.0 以下，装在 0.2.0 上会被跳过**——升到 0.9.7。装在 0.1.5 上则是浏览器端找不到 `configForms`、整页白屏 |
 | 包管理器 | `pnpm --version` | `dsh plugin add` 走 pnpm |
 
 如果用户**已经在 0.1.5 上用着这个插件**，要升 DSH，**先看第 2 节**——顺序错了会丢设置。
@@ -134,6 +134,37 @@ legacy reminder schedule-7 carried over as schedule-3f2a9c1e-… (due 2026-10-01
 - provider 多了一个 `deepseek-account`（DeepSeek 账号登录那条），正常情况下是 **10 个**。
 - 回滚到 rc.1 的副作用：已经搬过去、并且在 rc.2 上响过的提醒，rc.1 看会话历史会以为它们还没响，
   **会再补发一次**；在 rc.2 上新设的提醒 rc.1 看不见。
+
+### 从 0.1.7-rc.2 升到 0.2.0：**先把插件升到 0.9.7**
+
+0.2.0 不改会话格式、不迁移任何数据（回滚只要换回旧版 dsh），但**版本门禁**会跳过所有 peer 写着
+`^0.1.x` 的插件——本插件 0.9.6 及更早就是这样，常一起装的第三方插件大多也是。dsh 照常运行，
+只在 stderr 打一行 `skipping profile bundle "<包名>": … is incompatible with dsh 0.2.0-…`。
+
+1. 先把本插件升到 0.9.7，再换宿主。0.9.7 的 peer 是 `^0.1.7-rc.1 || ^0.2.0-rc.1`，回滚到 0.1.7 也能用。
+2. `@deepseek-ai/dsh-subagent-acp` 同号升到 `0.2.0-rc.2`（精确锁版本，回滚时一起退）。
+3. 上游还没放宽 peer 的第三方插件（写这份时：`dsh-vision` 0.2.0、`dsh-plugin-subscriptions` 0.9.6、
+   `deepseek-idesign` 0.2.2），确认它们在 0.2.0 上能用之后，可以用 **0.2.0 的 dsh**（旧版会拒绝）
+   给那个精确版本授权：
+   ```bash
+   npx -y @deepseek-ai/dsh@0.2.0-rc.2 plugin --profile web allow-version <包名>@<版本> --dsh-version 0.2.0-rc.2 --accept-risk
+   ```
+   授权存在 `~/.dsh/profiles/<profile>/compatibility.json`，只认这一个「插件版本 × dsh 版本」组合，
+   插件或 dsh 再升级就又会被跳过。`dsh-plugin-marketplace` 0.3.3 **不要**授权：它依赖 0.1.7 已删除的
+   `settingsScope`，一旦启用整页会卡住。要么升到 0.3.7（放行 0.1.7 和恰好 0.2.0-rc.2——这次升级想留着
+   回滚路就用它；0.2.0 之后的版本会被跳过），确定留在 0.2.x 之后再换 0.4.0（只认 ≥0.2.0-rc.2，回滚到
+   0.1.7 时要退回 0.3.7），要么卸掉。
+4. 0.2.0 的网页端不再自带 `schedule` 行，本插件那一行就是唯一的一行。插件页「官方」里新出现的
+   **自动化任务**（实验性）也会 insert 一行 `schedule`：开着没事，但**别单独关掉它里面的「任务调度」**，
+   那会连微信提醒一起关掉；它的「时间感知」建议关掉——微信消息自带时间戳，这一行反而会让 bot
+   追问你说的是哪个时区。
+5. 「设置 → 通用设置」里多了一个 **「在使用官方模型 API 时上传 Session Log」**（默认开，0.1.7 起其实
+   就一直在传，0.2.0 只是给了开关）：开着时，每次调 DeepSeek 官方 API 都会带上该会话**还没传过的那一段**
+   日志（增量，默认单次最多 8 MiB；累计下来就是整份会话日志，含工具调用和结果）。bot 用的是 DeepSeek
+   官方模型时（DSH 默认的 deepseek-official / deepseek-flash 就是），**整段微信对话都在其中**；bot 换成别家
+   模型时，本插件派出去的子代理仍固定走 deepseek-official / deepseek-flash，交给子代理的那段任务照样会传
+   （只是那个任务，不含之前的微信历史——本插件关掉了会复制上下文的 `subagent_fork`）。介意就关掉；
+   关着期间的内容，之后重新打开时会作为积压一并上传。
 
 ---
 

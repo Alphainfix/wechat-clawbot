@@ -72,6 +72,17 @@ function extractPlainText(msg: WeixinMessage): string | null {
   return null;
 }
 
+/** WeChat's own transcript of a voice message, if the message is one. */
+function extractVoiceText(msg: WeixinMessage): string | null {
+  for (const item of msg.item_list ?? []) {
+    if (item.type === MessageItemType.VOICE) {
+      const text = item.voice_item?.text?.trim();
+      if (text) return text;
+    }
+  }
+  return null;
+}
+
 /** True when the message carries any item that is not plain text. */
 export function hasNonTextItem(msg: WeixinMessage): boolean {
   return (msg.item_list ?? []).some((item) => item.type !== MessageItemType.TEXT);
@@ -200,14 +211,18 @@ export class InboundRouter {
     const quotePrefix = buildQuotePrefix(msg, this.bridge);
 
     // A pending approval/question for this sender wins over a new turn.
+    // A voice reply answers it too (WeChat transcribes voice itself). A reply
+    // with no text at all — a photo, a file — answers nothing: the question is
+    // withdrawn as unanswered and the message goes on to the agent like any
+    // other, instead of being used up and thrown away.
     const pending = this.pending.popFor(sender);
     if (pending) {
-      if (plainText === null) {
-        pending.resolve(null);
-      } else {
-        pending.resolve(plainText);
+      const answer = plainText ?? extractVoiceText(msg);
+      if (answer !== null) {
+        pending.resolve(answer);
+        return;
       }
-      return;
+      pending.resolve(null);
     }
 
     // Download inbound images/files (decrypt + persist), so the agent can

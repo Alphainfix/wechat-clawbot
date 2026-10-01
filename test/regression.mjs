@@ -836,6 +836,186 @@ function check(name, ok, detail) {
       && /event\.type === "turn\/end" && !this\.worker\) this\.typing\.stop\(\)/.test(bridgeSrc));
 }
 
+// ------------------------------- 宿主的版本门禁(0.1.7 起):peer 范围要放行宿主
+// 0.2.0-rc.2 上 `^0.1.7-rc.1` 不再成立,门禁把整个 bundle 跳过——微信监听、MCP 路由、
+// 提醒那一行全没了,只在 stderr 留一行 `skipping profile bundle`,dsh 本身照常运行。
+// 这里直接调宿主自己的 evaluatePluginCompatibility。检查的是一张**固定的**版本表
+// (README 写的支持范围)加上当前宿主——只看当前宿主的话,切换前/回滚后桶是 0.1.7,
+// 0.2.0 上会被跳过的 manifest 也能过。
+{
+  const manifest = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
+  const SUPPORTED = ["0.1.7-rc.2", "0.2.0-rc.2", "0.2.0"];
+  let gate;
+  let importError;
+  try {
+    ({ evaluatePluginCompatibility: gate } = await import(join(NPX, "@deepseek-ai/dsh-app-boot/lib/index.js")));
+  } catch (error) { importError = error; }
+  if (typeof gate !== "function") {
+    // The gate arrived with 0.1.7; older hosts have nothing to check.
+    const [, major, minor, patch] = /^(\d+)\.(\d+)\.(\d+)/.exec(HOST_VERSION) ?? [];
+    const before017 = major !== undefined && Number(major) === 0 && (Number(minor) < 1 || (Number(minor) === 1 && Number(patch) < 7));
+    check(`the host's plugin version gate is importable (host ${HOST_VERSION})`, before017,
+      importError ? String(importError.message ?? importError) : "no evaluatePluginCompatibility export");
+  } else {
+    for (const runtime of new Set([HOST_VERSION, ...SUPPORTED])) {
+      const issue = gate(manifest, {}, runtime);
+      check(`peerDependencies pass the host's version gate on dsh ${runtime}`, issue === undefined,
+        issue && JSON.stringify(issue.peers));
+    }
+  }
+}
+
+// ------------------------- 等回答的那一条不能比等它的人活得久(否则吞下一条消息)
+// 回合被停掉/超时之后,登记的问题要从队列里撤掉;不然用户下一条微信会被当成
+// 「那个问题的回答」吃掉,既到不了 agent,审批还会多回一句「已批准/已拒绝」。
+{
+  const { PendingRegistry } = await import(join(ROOT, "lib/pending.js"));
+  const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+  const { ApprovalRelay } = await import(join(ROOT, "lib/approvals.js"));
+  const { InboundRouter } = await import(join(ROOT, "lib/inbound.js"));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // A pending wait must not hold the suite open when a broken build ignores it.
+  const within = (promise, ms) => Promise.race([promise, sleep(ms).then(() => "still waiting")]);
+  const fakeBridge = (pending, sent) => ({
+    currentSender: "u1",
+    deps: { pending, getAccount: () => ({ userId: "u1" }) },
+    sendTextTo: (_to, text) => { sent.push(text); return true; },
+  });
+
+  {
+    const pending = new PendingRegistry();
+    const sent = [];
+    const stop = new AbortController();
+    const asked = WechatBridge.prototype.askWechat.call(fakeBridge(pending, sent), "去哪?", 3_000, stop.signal);
+    check("a question the bot asks is registered for the sender", pending.hasFor("u1") && sent.length === 1);
+    stop.abort();
+    // Abort listeners run before abort() returns, so this is synchronous.
+    check("stopping the turn withdraws the question at once (the next message is a new turn)", !pending.hasFor("u1"));
+    const first = await within(asked, 50);
+    check("stopping the turn resolves the question with null right away", first === null, String(first));
+  }
+  {
+    const pending = new PendingRegistry();
+    const approval = { tag: "approval", sender: "u1", resolve: () => {} };
+    pending.push(approval);
+    const asked = WechatBridge.prototype.askWechat.call(fakeBridge(pending, []), "去哪?", 20);
+    check("an unanswered question times out with null", (await within(asked, 500)) === null);
+    check("a timed-out question withdraws only itself, not the sender's other pending items",
+      pending.popFor("u1") === approval && !pending.hasFor("u1"));
+  }
+  const relayWith = (pending, sendText) => new ApprovalRelay({
+    config: { approvalTimeoutMs: 0 },
+    getBridge: () => ({ isWechatSession: () => true, activeSender: "u1" }),
+    pending,
+    sendText,
+  });
+  const approvalRequest = (signal) => ({ agent: { id: "a1" }, toolName: "bash", reason: "测试", signal });
+  {
+    const pending = new PendingRegistry();
+    const sent = [];
+    const relay = relayWith(pending, async (_to, text) => { sent.push(text); });
+    const stop = new AbortController();
+    const outcome = relay.answer(approvalRequest(stop.signal), async () => "allowed-once");
+    await sleep(5);
+    check("an approval request waits on the WeChat sender", pending.hasFor("u1"));
+    stop.abort();
+    check("an aborted approval settles as cancelled", (await within(outcome, 500)) === "cancelled");
+    check("an aborted approval leaves the queue", !pending.hasFor("u1"));
+    const late = pending.popFor("u1");
+    check("no stray 已批准/已拒绝 is sent for a withdrawn approval",
+      late === undefined && !sent.some((t) => /已批准|已拒绝/.test(t)), sent.join(" | "));
+  }
+  {
+    // The iLink send can take seconds; a turn stopped meanwhile has already
+    // fired its abort, and a listener added after that never runs.
+    const pending = new PendingRegistry();
+    const relay = relayWith(pending, () => sleep(40));
+    const stop = new AbortController();
+    const outcome = relay.answer(approvalRequest(stop.signal), async () => "allowed-once");
+    await sleep(10);
+    stop.abort();
+    check("an approval stopped while its question is still being sent settles as cancelled",
+      (await within(outcome, 500)) === "cancelled");
+    check("…and never enters the queue", !pending.hasFor("u1"));
+  }
+
+  // 每轮 10 条的上限:提醒那一轮也是新的一轮;被丢掉的那条要让调用方知道。
+  {
+    const fake = {
+      sessionId: "S", worker: undefined, turnMessageCount: 10, currentSender: undefined,
+      typing: { start() {}, stop() {} },
+      deps: { getAccount: () => ({ userId: "owner" }) },
+      ctx: { agents: { get: () => undefined } },
+      installSelection() {}, ensureTools() {},
+    };
+    WechatBridge.prototype.onSessionEvent.call(fake, { id: "S" },
+      { type: "user/message", seq: 1, data: { source: { kind: "schedule" } } });
+    check("a reminder turn goes to the owner with a fresh 10-message budget",
+      fake.currentSender === "owner" && fake.turnMessageCount === 0, `count=${fake.turnMessageCount}`);
+  }
+  {
+    const out = [];
+    const fake = {
+      turnMessageCount: 10, sendChain: Promise.resolve(),
+      sendText: async (_to, text) => { out.push(text); },
+      typing: { noteDelivered() {} },
+    };
+    const dropped = WechatBridge.prototype.sendTextTo.call(fake, "u1", "第 11 条");
+    const asked = WechatBridge.prototype.sendTextTo.call(fake, "u1", "要继续吗?", { uncapped: true });
+    await fake.sendChain;
+    check("past the per-turn cap a message is dropped and the caller is told so", dropped === false);
+    check("a question the bot then waits on is never dropped by the cap",
+      asked === true && out.join() === "要继续吗?", out.join());
+  }
+  const toolSrc = readFileSync(join(ROOT, "src/tool.ts"), "utf-8");
+  check("send_wechat_text reports a capped message as not sent",
+    /if \(!bridge\.sendTextTo\(sender, finalText\)\)\s*\{\s*return \{ ok: false/.test(toolSrc));
+  check("the WeChat ask_user_question forwards the turn's abort signal",
+    /askWechat\(q, undefined, exec\.signal\)/.test(toolSrc));
+
+  // 等回答时,语音回复也算回答;没有文字的(视频、图片)不算回答,但也不能被吃掉。
+  {
+    const state = join(tmpdir(), `clawbot-inbound-${process.pid}`);
+    mkdirSync(state, { recursive: true });
+    const prevState = process.env.CLAWBOT_STATE_DIR;
+    process.env.CLAWBOT_STATE_DIR = state;
+    try {
+      const make = () => {
+        const pending = new PendingRegistry();
+        const notices = [];
+        const enqueued = [];
+        const router = new InboundRouter({
+          config: { allowFrom: [] },
+          account: { accountId: "acc", userId: "u1", cdnBaseUrl: "http://127.0.0.1:9" },
+          bridge: { enqueueMessage: async (...args) => { enqueued.push(args); } },
+          pending,
+          sendText: async (_to, text) => { notices.push(text); },
+        });
+        const answers = [];
+        pending.push({ tag: "question", sender: "u1", resolve: (reply) => answers.push(reply) });
+        return { router, pending, notices, enqueued, answers };
+      };
+      {
+        const h = make();
+        await h.router.handle({ from_user_id: "u1", item_list: [{ type: 3, voice_item: { text: "去北京。" } }] });
+        check("a voice reply answers the pending question with WeChat's transcript",
+          h.answers.length === 1 && h.answers[0] === "去北京。" && h.enqueued.length === 0, JSON.stringify(h.answers));
+      }
+      {
+        const h = make();
+        await h.router.handle({ from_user_id: "u1", item_list: [{ type: 5 }] });
+        check("a reply with no text withdraws the question as unanswered", h.answers.length === 1 && h.answers[0] === null
+          && !h.pending.hasFor("u1"));
+        check("…and the message itself still goes through the normal path (not swallowed)",
+          h.notices.some((t) => /视频/.test(t)), h.notices.join(" | "));
+      }
+    } finally {
+      if (prevState === undefined) delete process.env.CLAWBOT_STATE_DIR; else process.env.CLAWBOT_STATE_DIR = prevState;
+      rmSync(state, { recursive: true, force: true });
+    }
+  }
+}
+
 console.log(`宿主: dsh ${HOST_VERSION}  (${NPX})`);
 console.log(results.join("\n"));
 console.log(`\n${pass} 通过, ${fail} 失败`);

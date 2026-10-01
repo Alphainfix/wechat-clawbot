@@ -538,7 +538,9 @@ function registerSendTextTool(agentCtx: Context, deps: SendFileToolDeps): void {
           return { ok: false, message: "无法确定收件人（没有活跃的微信会话）" };
         }
         const finalText = deps.config.stripEmoji ? stripEmoji(content) : stripWechatCodes(content);
-        bridge.sendTextTo(sender, finalText);
+        if (!bridge.sendTextTo(sender, finalText)) {
+          return { ok: false, message: "这一轮已经发满 10 条，这条没有发出，本轮也不能再发了。" };
+        }
         logger.info(`send_wechat_text: to=${sender} chars=${finalText.length}`);
         return { ok: true, message: content };
       },
@@ -583,13 +585,15 @@ function registerWechatAskTool(agentCtx: Context, deps: SendFileToolDeps): void 
           },
         ],
       },
-      async execute(args) {
+      async execute(args, exec) {
         const { question } = args as { question?: string };
         const q = (question ?? "").trim();
         if (!q) return { ok: false, message: "问题为空" };
         const bridge = deps.getBridge();
         if (!bridge) return { ok: false, message: "微信桥接未运行（监控未启动）" };
-        const answer = await bridge.askWechat(q);
+        // Forward the turn's signal: a stopped turn withdraws its question
+        // instead of leaving it to swallow the user's next message.
+        const answer = await bridge.askWechat(q, undefined, exec.signal);
         return answer !== null
           ? { ok: true, answer, message: "已收到回答" }
           : { ok: false, message: "等待回答超时或中断" };

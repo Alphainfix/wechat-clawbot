@@ -38,6 +38,18 @@ export class PendingRegistry {
     return answer;
   }
 
+  /**
+   * Withdraw one interaction that ended without a reply (aborted, timed out).
+   * It must leave the queue: otherwise the sender's next WeChat message is
+   * taken as the answer to a question nobody waits for any more, and is lost.
+   */
+  remove(answer: PendingAnswer): boolean {
+    const index = this.queue.indexOf(answer);
+    if (index < 0) return false;
+    this.queue.splice(index, 1);
+    return true;
+  }
+
   /** Remove and abort every pending interaction for a sender (on logout etc.). */
   abortFor(sender: string): void {
     for (let i = this.queue.length - 1; i >= 0; i -= 1) {
