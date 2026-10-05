@@ -120,6 +120,28 @@ export interface ClawbotConfig {
   autoMemory: boolean;
 
   /**
+   * Compact the session in the quiet time after a reply instead of right
+   * before the next one (see `src/idle-compact.ts`). On by default: the host's
+   * own compaction runs at the start of a step, so without this the owner's
+   * message is what triggers it and the reply waits behind it (17 s on
+   * 2026-10-04). Ten minutes after the last turn, if the last request was
+   * within 85% of the host's threshold, the host's `/compact` runs on the
+   * session. The host's pre-step compaction stays as the fallback.
+   */
+  idleCompaction: boolean;
+
+  /**
+   * Whether DSH may splice workspace instruction files (AGENTS.md / CLAUDE.md)
+   * into the WeChat session (see `src/workspace-instructions.ts`). On by
+   * default — the host's own behaviour, and for some owners an AGENTS.md in
+   * the bot's working directory is how they instruct it. Off keeps them out of
+   * this session only: the host re-sends the WHOLE file on every edit, so a
+   * developer notebook in a project the bot once touched keeps growing the
+   * chat. Web sessions and subagents are never affected.
+   */
+  workspaceInstructions: boolean;
+
+  /**
    * Whether the `/plugins/clawbot/mcp/*` bridge answers requests — the surface
    * dsh-mcp-bridge (and therefore Claude Code) calls. Off makes every route
    * return 403 while leaving them registered, so this is a live kill switch
@@ -191,6 +213,8 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   maxImageEdge: 2048,
   stripEmoji: true,
   autoMemory: true,
+  idleCompaction: true,
+  workspaceInstructions: true,
   mcpBridge: true,
   imageQuality: 80,
   compressThresholdBytes: 1024 * 1024,
@@ -256,6 +280,10 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
       typeof r.stripEmoji === "boolean" ? r.stripEmoji : DEFAULT_CONFIG.stripEmoji,
     autoMemory:
       typeof r.autoMemory === "boolean" ? r.autoMemory : DEFAULT_CONFIG.autoMemory,
+    idleCompaction:
+      typeof r.idleCompaction === "boolean" ? r.idleCompaction : DEFAULT_CONFIG.idleCompaction,
+    workspaceInstructions:
+      typeof r.workspaceInstructions === "boolean" ? r.workspaceInstructions : DEFAULT_CONFIG.workspaceInstructions,
     mcpBridge:
       typeof r.mcpBridge === "boolean" ? r.mcpBridge : DEFAULT_CONFIG.mcpBridge,
     noticeMinBytes:
@@ -314,6 +342,19 @@ export const BaseConfig = Schema.object({
       + "跟对话去的是同一个地方,不是额外的厂商。"
       + "不想要就在 cordis.patch.yml 的 clawbot 块里写 autoMemory: false。"
       + "关掉不影响 remember_user_info。",
+    ),
+  idleCompaction: Schema.boolean()
+    .default(true)
+    .description(
+      "空闲时整理对话(默认开):回复结束、安静 10 分钟后,如果上一次请求已接近宿主的压缩阈值,"
+      + "就趁空闲把旧对话整理成摘要。下一条消息来时不用再等压缩。关掉则只剩宿主在回复前压缩。",
+    ),
+  workspaceInstructions: Schema.boolean()
+    .default(true)
+    .description(
+      "把工作目录的说明文件(AGENTS.md / CLAUDE.md)交给 bot(默认开,DSH 原样)。"
+      + "关掉则微信会话里不再自动塞这些文件——DSH 每次文件改动都会重发整份,"
+      + "bot 只在某个项目里干过一次活,那份文件也会一直跟着涨。网页会话和子代理不受影响。",
     ),
   mcpBridge: Schema.boolean()
     .default(true)
@@ -406,6 +447,8 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "attachImages",
   // 纯读取的开关,下一条消息生效即可,不需要重启。
   "autoMemory",
+  "idleCompaction",
+  "workspaceInstructions",
   "stripEmoji",
   "mcpBridge",
   "maxImageEdge",

@@ -34,6 +34,7 @@ import type { ClawbotConfig } from "./config.js";
 import { markSessionCreated, wasSessionCreated } from "./state.js";
 import { PendingRegistry, type PendingAnswer } from "./pending.js";
 import { TypingIndicator } from "./typing.js";
+import { IdleCompactor, IDLE_COMPACT_RATIO, hostCompactionThreshold } from "./idle-compact.js";
 import { registerSendFileTool } from "./tool.js";
 import { randomUUID } from "node:crypto";
 import { captureTurnMemory, type MemoryJudge } from "./memory-auto.js";
@@ -111,6 +112,10 @@ export class WechatBridge {
   private sendChain: Promise<void> = Promise.resolve();
   /** 「对方正在输入…」 from the moment a WeChat message is picked up until the turn ends. */
   private readonly typing: TypingIndicator;
+  /** Compacts the session in the quiet time after a reply (see idle-compact.ts). */
+  private readonly idleCompact: IdleCompactor;
+  /** Tokens the last model request on this session carried, as reported by the provider. */
+  private lastRequestTokens: number | undefined;
 
   constructor(ctx: Context, config: ClawbotConfig, sendText: SendTextFn, deps: BridgeDeps) {
     this.ctx = ctx;
@@ -123,6 +128,72 @@ export class WechatBridge {
       getContextToken: (sender) => deps.getContextToken(sender),
       isWaitingFor: (sender) => deps.pending.hasFor(sender),
     });
+    this.idleCompact = new IdleCompactor({
+      enabled: () => this.config.idleCompaction !== false,
+      isBusy: () => this.disposed
+        || this.worker !== null
+        || this.queue.length > 0
+        || deps.pending.size > 0
+        || this.ctx.agents.get(this.sessionId)?.status === "running",
+      lastRequestTokens: () => this.lastRequestTokens,
+      hostThreshold: () => this.hostCompactionThreshold(),
+      compact: (signal) => this.runHostCompact(signal),
+      onCompacted: () => { this.lastRequestTokens = undefined; },
+    });
+  }
+
+  /**
+   * Log once at startup whether idle compaction can work here: the host's
+   * command registry must be reachable and carry `/compact` for this session,
+   * and the route must declare a window. Without this line a missing piece
+   * would only show as "never compacts while idle".
+   */
+  async reportIdleCompactReadiness(): Promise<void> {
+    if (this.config.idleCompaction === false) {
+      logger.info("idle-compact: 关闭(配置 idleCompaction: false)");
+      return;
+    }
+    const commands = (this.ctx as unknown as { get?: (name: string) => unknown }).get?.("commands") as {
+      find?: (agent: unknown, name: string) => unknown;
+    } | undefined;
+    const agent = this.ctx.agents.get(this.sessionId);
+    const hasCompact = commands?.find !== undefined && agent !== undefined && commands.find(agent, "compact") !== undefined;
+    let threshold: number | undefined;
+    try { threshold = await this.hostCompactionThreshold(); } catch { threshold = undefined; }
+    logger.info(
+      `idle-compact: /compact ${hasCompact ? "可用" : "不可用(只剩宿主回复前的压缩)"};`
+      + ` 宿主阈值 ${threshold ?? "未知"},空闲时超过 ${threshold === undefined ? "?" : Math.floor(threshold * IDLE_COMPACT_RATIO)} token 就整理`
+      + `(上次请求 ${this.lastRequestTokens ?? "未知"})`,
+    );
+  }
+
+  /** The host's pre-step compaction threshold for the bot's current route. */
+  private async hostCompactionThreshold(): Promise<number | undefined> {
+    const route = this.currentRoute();
+    const llm = this.service<{
+      resolveModelInfo?: (p: string, m: string) => Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number }>;
+    }>("llm");
+    if (route === null || llm?.resolveModelInfo === undefined) return undefined;
+    const info = await llm.resolveModelInfo(route.provider, route.model);
+    return hostCompactionThreshold(info?.context?.contextWindow, info?.defaultMaxTokens);
+  }
+
+  /**
+   * Run the host's `/compact` on the WeChat session through the command
+   * registry — the same entry the web UI's slash command uses, so the host does
+   * the compaction exactly as it would by hand. Undefined when the registry or
+   * the command is absent (e.g. a preset without compaction).
+   */
+  private async runHostCompact(signal: AbortSignal): Promise<{ ok: boolean; text: string } | undefined> {
+    const commands = (this.ctx as unknown as { get?: (name: string) => unknown }).get?.("commands") as {
+      execute?: (agent: unknown, line: string, attachments: readonly unknown[], signal: AbortSignal) =>
+        Promise<{ result: { kind: string; text?: string } } | undefined>;
+    } | undefined;
+    const agent = this.ctx.agents.get(this.sessionId);
+    if (commands?.execute === undefined || agent === undefined) return undefined;
+    const out = await commands.execute(agent, "/compact", [], signal);
+    if (out === undefined) return undefined;
+    return { ok: out.result.kind === "success", text: out.result.text ?? "" };
   }
 
   /** Keep 「正在输入」 up for this sender (no-op if it already is). */
@@ -724,6 +795,7 @@ export class WechatBridge {
   }
 
   async enqueueMessage(sender: string, text: string, imagePath?: string): Promise<void> {
+    this.idleCompact.noteActivity();
     if (this.disposed) return;
     // Prefix every WeChat-originated message with a visible marker so the
     // agent can distinguish it from system-injected content and knows this
@@ -843,8 +915,11 @@ export class WechatBridge {
       } catch (err) {
         logger.error(`drainQueue: turn failed sender=${task.sender} err=${String(err)}`);
       }
-      // 后面还有排队的消息就接着显示,否则收起「正在输入」。
-      if (this.queue.length === 0) this.typing.stop();
+      // 后面还有排队的消息就接着显示,否则收起「正在输入」,开始等空闲压缩。
+      if (this.queue.length === 0) {
+        this.typing.stop();
+        this.idleCompact.noteIdle();
+      }
     }
     this.currentSender = undefined;
   }
@@ -865,7 +940,15 @@ export class WechatBridge {
     logger.debug(`sessionEvent: type=${event.type} seq=${event.seq}`);
     // Turns the worker drives stop the indicator themselves; this covers
     // reminder turns and messages steered into a turn someone else started.
-    if (event.type === "turn/end" && !this.worker) this.typing.stop();
+    if (event.type === "assistant/message") {
+      const tokens = (event.data as { usage?: { totalTokens?: unknown } } | undefined)?.usage?.totalTokens;
+      if (typeof tokens === "number" && tokens > 0) this.lastRequestTokens = tokens;
+    }
+    if (event.type === "turn/start") this.idleCompact.noteActivity();
+    if (event.type === "turn/end" && !this.worker) {
+      this.typing.stop();
+      this.idleCompact.noteIdle();
+    }
     if (event.type === "user/message" && !this.worker) {
       // v4 drops the `plugin` field: dsh-schedule now writes `{ kind: "schedule" }`
       // and the v3→v4 converter maps old reminders to the same. Checking only
@@ -1064,6 +1147,7 @@ export class WechatBridge {
     if (this.disposed) return;
     this.disposed = true;
     this.typing.dispose();
+    this.idleCompact.dispose();
     // Dispose the agent first: this stops the driver, so a pending whenIdle
     // resolves and the worker can exit instead of hanging forever.
     try {

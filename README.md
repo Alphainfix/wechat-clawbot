@@ -17,6 +17,7 @@ It uses WeChat's official **微信ClawBot** channel (Tencent iLink): no second a
 - **Long-term memory**: remembers your habits and preferences, so you don't have to repeat them
 - **Asks before it acts**: anything that needs your approval (e.g. touching files outside its working directory) is asked in WeChat; reply `同意` / `拒绝` (or `yes` / `no`)
 - **Understands quotes**: reply to an older message with WeChat's quote feature and it knows which one you mean
+- **Long chats stay quick**: when the conversation gets long, it tidies older messages into a summary during a quiet spell after a reply, so your next message never waits for it
 
 ## Requirements
 
@@ -55,6 +56,8 @@ Open **Plugins → wechat-clawbot → 微信 Bot** in the DSH web sidebar. Chang
 - **Model**: pin a provider / model / reasoning effort for the bot. Leave it empty to follow DSH's global default.
 - **Who may message the bot**: only you (the person who scanned) by default. Add WeChat user ids to let others in.
 - **Images**: whether photos go straight to the model, and how outgoing images are resized and compressed.
+- **空闲时整理对话** (tidy up while idle): on by default. Off leaves only DSH's own compaction, which runs right before a reply and makes that reply wait.
+- **把工作目录的说明文件交给 bot** (workspace instruction files): on by default (DSH's own behaviour: once the bot works in a project, its AGENTS.md / CLAUDE.md is put into the chat, and the whole file again after every edit). Off keeps them out of the WeChat session, which helps when those files are long and change often; the bot can still read them when it needs to.
 - **开放 Claude 桥** (Claude bridge): see "Working with Claude Code" below.
 
 A few options (the session id, the working directory, whether to start with DSH) live in the `- id: clawbot` entry of

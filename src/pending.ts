@@ -30,6 +30,11 @@ export class PendingRegistry {
     return this.queue.some((a) => a.sender === sender);
   }
 
+  /** How many interactions are waiting for an answer from anyone. */
+  get size(): number {
+    return this.queue.length;
+  }
+
   /** Pop the oldest pending interaction for a sender, if any. */
   popFor(sender: string): PendingAnswer | undefined {
     const index = this.queue.findIndex((a) => a.sender === sender);

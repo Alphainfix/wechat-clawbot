@@ -36,6 +36,7 @@ import {
 import { sendMessageWeixin } from "./ilink/messaging/send.js";
 import { stripEmoji, stripWechatCodes } from "./emoji.js";
 import { setLogLevel, logger } from "./ilink/util/logger.js";
+import { registerWorkspaceInstructionsFilter } from "./workspace-instructions.js";
 
 /** Stable Cordis plugin name for the clawbot row. */
 export const name = "clawbot";
@@ -331,6 +332,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
         carryOverLegacyReminders();
         // 现在 installSelection() 已经跑过,路由才是真的,自检结果才可信。
         await boundBridge?.reportVisionReadiness();
+        await boundBridge?.reportIdleCompactReadiness();
       },
       (err) => logger.warn(`startMonitor: agent warm-up failed: ${String(err)}`),
     );
@@ -363,6 +365,13 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     sendText,
   });
   relay.register(ctx);
+
+  // Optionally keep AGENTS.md / CLAUDE.md out of the WeChat session (config
+  // workspaceInstructions; read per step, so the switch is live).
+  registerWorkspaceInstructionsFilter(
+    ctx,
+    (agentId) => config.workspaceInstructions === false && (bridge?.isWechatSession(agentId) ?? false),
+  );
 
   // Optional ask_user_question / plan-review forwarding.
   tryRegisterQuestionProvider({

@@ -832,8 +832,8 @@ function check(name, ok, detail) {
   check("typing starts for queued turns, steered messages and reminder turns",
     (bridgeSrc.match(/this\.typing\.start\(/g) ?? []).length >= 3);
   check("typing stops when the queue drains and when a turn nobody drives ends",
-    /if \(this\.queue\.length === 0\) this\.typing\.stop\(\)/.test(bridgeSrc)
-      && /event\.type === "turn\/end" && !this\.worker\) this\.typing\.stop\(\)/.test(bridgeSrc));
+    /if \(this\.queue\.length === 0\) \{?\s*this\.typing\.stop\(\)/.test(bridgeSrc)
+      && /event\.type === "turn\/end" && !this\.worker\) \{?\s*this\.typing\.stop\(\)/.test(bridgeSrc));
 }
 
 // ------------------------------- 宿主的版本门禁(0.1.7 起):peer 范围要放行宿主
@@ -1014,6 +1014,146 @@ function check(name, ok, detail) {
       rmSync(state, { recursive: true, force: true });
     }
   }
+}
+
+// ------------------------------------------------ 空闲时整理对话(2026-10-04)
+// 宿主的自动压缩挂在 agent/pre-step:机主的消息一来就先压,回复要等(那天等了 17 秒)。
+// clawbot 改成回复结束、安静一段时间后,趁空闲用宿主自己的 /compact 压掉。
+{
+  const { IdleCompactor, hostCompactionThreshold } = await import(join(ROOT, "lib/idle-compact.js"));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  check("host threshold, 400k window: 301,696 (why 296k never compacted)", hostCompactionThreshold(400000, 32768) === 301696);
+  check("host threshold, 340k window: 241,696", hostCompactionThreshold(340000, 32768) === 241696);
+  check("host threshold, 1M window: capped at 80%", hostCompactionThreshold(1000000, 32768) === 800000);
+  check("host threshold: none when the window leaves no budget", hostCompactionThreshold(64000, 32768) === undefined);
+
+  const make = (over = {}) => {
+    const calls = [];
+    const compactor = new IdleCompactor({
+      enabled: () => true,
+      isBusy: () => false,
+      lastRequestTokens: () => 230000,
+      hostThreshold: async () => 241696,
+      compact: async () => { calls.push(1); return { ok: true, text: "Compacted 10 history items" }; },
+      delayMs: 20,
+      ...over,
+    });
+    return { compactor, calls };
+  };
+  {
+    const h = make();
+    h.compactor.noteIdle(); await sleep(5);
+    check("idle compaction waits for the quiet period", h.calls.length === 0);
+    await sleep(40);
+    check("after the quiet period a session near the threshold is compacted once", h.calls.length === 1);
+  }
+  {
+    const h = make({ lastRequestTokens: () => 150000 });
+    h.compactor.noteIdle(); await sleep(40);
+    check("a session well below the threshold is left alone", h.calls.length === 0);
+  }
+  {
+    const h = make();
+    h.compactor.noteIdle(); await sleep(5); h.compactor.noteActivity(); await sleep(40);
+    check("a message during the quiet period cancels the check", h.calls.length === 0);
+  }
+  {
+    const h = make({ isBusy: () => true });
+    h.compactor.noteIdle(); await sleep(40);
+    check("a busy session (turn running, queued, or waiting on an answer) is not compacted", h.calls.length === 0);
+  }
+  {
+    const h = make({ enabled: () => false });
+    h.compactor.noteIdle(); await sleep(40);
+    check("the idleCompaction switch turns it off", h.calls.length === 0);
+  }
+  {
+    const h = make();
+    h.compactor.noteIdle(); await sleep(5); h.compactor.noteIdle(); await sleep(5); h.compactor.noteIdle(); await sleep(40);
+    check("several turns ending in a row compact at most once", h.calls.length === 1);
+  }
+  {
+    let used = 230000;
+    const h = make({ lastRequestTokens: () => used, onCompacted: () => { used = undefined; } });
+    await h.compactor.check(); await h.compactor.check();
+    check("after compacting, the stale size is forgotten (no second compaction)", h.calls.length === 1);
+  }
+  {
+    const h = make({ compact: async () => { throw new Error("boom"); } });
+    let threw = false;
+    try { await h.compactor.check(); } catch { threw = true; }
+    check("a failing compaction never throws into the bridge", !threw);
+  }
+  const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("the quiet-period clock starts when the queue drains and when a turn nobody drives ends",
+    (bridgeSrc.match(/this\.idleCompact\.noteIdle\(\)/g) ?? []).length >= 2);
+  check("an inbound message or a new turn cancels the pending check",
+    /async enqueueMessage\([^)]*\)[^{]*\{\s*this\.idleCompact\.noteActivity\(\)/.test(bridgeSrc)
+      && /"turn\/start"\) this\.idleCompact\.noteActivity\(\)/.test(bridgeSrc));
+  check("it runs the host's own /compact through the command registry",
+    /commands\.execute\(agent, "\/compact", \[\], signal\)/.test(bridgeSrc));
+  check("the request size is the provider-reported usage", /usage\?: \{ totalTokens\?/.test(bridgeSrc));
+  const clientSrc = readFileSync(join(ROOT, "src/client.js"), "utf-8");
+  check("the settings card has the switch", /set\("idleCompaction", next\)/.test(clientSrc));
+  const cfgMod = await import(join(ROOT, "lib/config.js"));
+  check("idleCompaction is on by default and takes effect without a restart",
+    cfgMod.DEFAULT_CONFIG.idleCompaction === true && cfgMod.HOT_FIELDS.has("idleCompaction"));
+}
+
+// ------------------------------- 工作目录说明文件不进微信会话(可选,2026-10-04)
+// DSH 的 agent-instructions:工具碰过某个目录,就把那里的 CLAUDE.md / AGENTS.md 塞进对话,
+// 之后文件每改一次再塞一整份。一份常改的长说明文件,几次下来微信会话里就攒了好几份全文(~14 万字)。
+{
+  const { stripWorkspaceInstructions, registerWorkspaceInstructionsFilter, isWorkspaceInstructions } =
+    await import(join(ROOT, "lib/workspace-instructions.js"));
+  const instr = (id, scope) => ({ id, role: "user", content: [{ type: "text", text: "<system-reminder>…" }],
+    source: { kind: "agent-instructions", form: "instructions", changes: [{ action: "replace", scope }] } });
+  const userMsg = { id: "u1", role: "user", content: [{ type: "text", text: "[微信消息] 你好" }], source: { kind: "plugin:wechat-clawbot" } };
+  const makeAgent = (id, parked = []) => {
+    const nextStep = [...parked];
+    return { id, inbox: { get nextStep() { return [...nextStep]; }, remove: (mid) => { const i = nextStep.findIndex((m) => m.id === mid); if (i >= 0) nextStep.splice(i, 1); }, _list: nextStep } };
+  };
+  {
+    const agent = makeAgent("wechat-main", [instr("p1", "project\u0000CLAUDE.md")]);
+    const { decision, dropped } = stripWorkspaceInstructions(agent,
+      { kind: "continue", messages: [userMsg, instr("m1", "project\u0000CLAUDE.md")] });
+    check("instruction files spliced into the step are dropped", decision.messages.length === 1 && decision.messages[0] === userMsg);
+    check("instruction files parked in the next-step inbox are dropped", agent.inbox._list.length === 0);
+    check("the log names the files, not their content", dropped.length === 2 && dropped.every((s) => s === "project/CLAUDE.md"));
+  }
+  {
+    const d = { kind: "reject" };
+    check("a rejected step is left exactly as the host decided", stripWorkspaceInstructions(makeAgent("wechat-main"), d).decision === d);
+    const plain = { kind: "continue", messages: [userMsg] };
+    check("a step without instruction files keeps the same decision object", stripWorkspaceInstructions(makeAgent("wechat-main"), plain).decision === plain);
+    check("only agent-instructions messages count", isWorkspaceInstructions(instr("x", "a")) && !isWorkspaceInstructions(userMsg));
+  }
+  {
+    let registered;
+    const fakeCtx = { on(name, listener, options) { registered = { name, listener, options }; } };
+    let strip = true;
+    registerWorkspaceInstructionsFilter(fakeCtx, (id) => strip && id === "wechat-main");
+    check("the filter hooks agent/pre-step as the outermost listener (prepend)",
+      registered.name === "agent/pre-step" && registered.options?.prepend === true);
+    const hostDecision = () => Promise.resolve({ kind: "continue", messages: [userMsg, instr("m2", "project\u0000CLAUDE.md")] });
+    const mine = await registered.listener({ agent: makeAgent("wechat-main") }, hostDecision);
+    check("the WeChat session's step goes out without the instruction file", mine.messages.length === 1);
+    const web = await registered.listener({ agent: makeAgent("session-web-1") }, hostDecision);
+    check("any other session keeps it (web, subagents)", web.messages.length === 2);
+    strip = false;
+    const on = await registered.listener({ agent: makeAgent("wechat-main") }, hostDecision);
+    check("with workspaceInstructions on (the default) nothing is filtered", on.messages.length === 2);
+    strip = true;
+    const broken = await registered.listener({ agent: { id: "wechat-main", inbox: { get nextStep() { throw new Error("boom"); }, remove() {} } } }, hostDecision);
+    check("a surprise inside the filter leaves the host's decision untouched", broken.messages.length === 2);
+  }
+  const cfgMod2 = await import(join(ROOT, "lib/config.js"));
+  check("workspaceInstructions defaults to the host's behaviour and is hot",
+    cfgMod2.DEFAULT_CONFIG.workspaceInstructions === true && cfgMod2.HOT_FIELDS.has("workspaceInstructions"));
+  const indexSrc = readFileSync(join(ROOT, "src/index.ts"), "utf-8");
+  check("only the WeChat session is filtered, and only when the owner turned it off",
+    /config\.workspaceInstructions === false && \(bridge\?\.isWechatSession\(agentId\)/.test(indexSrc));
+  check("the settings card has the switch", /set\("workspaceInstructions", next\)/.test(readFileSync(join(ROOT, "src/client.js"), "utf-8")));
 }
 
 console.log(`宿主: dsh ${HOST_VERSION}  (${NPX})`);

@@ -408,6 +408,28 @@ window.__ModuleLoader__.load({
           }),
         }),
         Field({
+          label: "空闲时整理对话",
+          hint: "回复结束、安静 10 分钟后，上下文接近压缩阈值就趁空闲把旧对话整理成摘要。下一条消息来时不用再等压缩",
+          overridden: isSet("idleCompaction"), disabled,
+          onReset: () => clear("idleCompaction"),
+          inline: h(Switch, {
+            on: v.idleCompaction !== false, disabled,
+            label: "空闲时整理对话",
+            onChange: (next) => set("idleCompaction", next),
+          }),
+        }),
+        Field({
+          label: "把工作目录的说明文件交给 bot",
+          hint: "AGENTS.md / CLAUDE.md。关掉则微信会话里不再自动塞这些文件（DSH 每次改动都会重发整份），需要时让 bot 自己去读",
+          overridden: isSet("workspaceInstructions"), disabled,
+          onReset: () => clear("workspaceInstructions"),
+          inline: h(Switch, {
+            on: v.workspaceInstructions !== false, disabled,
+            label: "把工作目录的说明文件交给 bot",
+            onChange: (next) => set("workspaceInstructions", next),
+          }),
+        }),
+        Field({
           label: "允许回复里出现 emoji",
           hint: "关掉则剥掉 😊 这类符号。[捂脸] 这种方括号代码一律去掉，不受这个开关影响 —— 它们在微信里根本转换不出来",
           overridden: isSet("stripEmoji"), disabled,
