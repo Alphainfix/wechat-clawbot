@@ -140,16 +140,18 @@ test("history reads are paginated and legacy fallback only handles an unsupporte
   assert.deepEqual((await empty.read(ID_A)).turns, []);
 });
 
-test("standalone continuation requires opt-in; reads do not resume the thread", async () => {
-  const rpc = mockRpc([thread(ID_A, "/workspace/alpha", "notLoaded")]);
-  const peer = new CodexPeer(config("stdio"), new CodexProgressStore(), { rpc });
-  const read = await peer.read(ID_A);
-  assert.equal(read.status.type, "notLoaded");
-  assert.equal(rpc.calls.some((call) => call.method === "thread/resume"), false);
-  await assert.rejects(peer.send(ID_A, "Continue"), /先关闭原会话/);
-  assert.equal(rpc.calls.some((call) => call.method === "thread/resume"), false);
-  await peer.send(ID_A, "Continue", "/workspace/alpha", true);
-  assert.equal(rpc.calls.at(-1).method, "turn/start");
+test("unloaded continuation requires opt-in for both transports; reads do not resume", async () => {
+  for (const transport of ["stdio", "socket"]) {
+    const rpc = mockRpc([thread(ID_A, "/workspace/alpha", "notLoaded")]);
+    const peer = new CodexPeer(config(transport), new CodexProgressStore(), { rpc });
+    const read = await peer.read(ID_A);
+    assert.equal(read.status.type, "notLoaded");
+    assert.equal(rpc.calls.some((call) => call.method === "thread/resume"), false);
+    await assert.rejects(peer.send(ID_A, "Continue"), /先关闭原会话/);
+    assert.equal(rpc.calls.some((call) => call.method === "thread/resume"), false);
+    await peer.send(ID_A, "Continue", "/workspace/alpha", true);
+    assert.equal(rpc.calls.at(-1).method, "turn/start");
+  }
 });
 
 test("concurrent relays to one thread serialize and delivery is not completion", async () => {
