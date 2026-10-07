@@ -1,6 +1,6 @@
 {
   "name": "wechat-clawbot",
-  "version": "0.9.8",
+  "version": "0.9.9",
   "description": "Connect DeepSeek Harness to WeChat via the official WeChat ClawBot (Tencent iLink) bridge — a DSH plugin bundle.",
   "keywords": [
     "deepseek-harness",
@@ -76,7 +76,7 @@
     "@modelcontextprotocol/sdk": "^1.32.1",
     "qrcode-terminal": "^0.12.0",
     "ws": "^8.22.0",
-    "zod": "^3.25.76"
+    "zod": "^4.4.3"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",

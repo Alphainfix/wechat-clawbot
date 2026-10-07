@@ -1156,6 +1156,32 @@ function check(name, ok, detail) {
   check("the settings card has the switch", /set\("workspaceInstructions", next\)/.test(readFileSync(join(ROOT, "src/client.js"), "utf-8")));
 }
 
+// ----------------------------------------- Codex 联动默认关、关着不占 token(0.9.9)
+// PR #1 把 5 个 Codex 工具和一条 G14 规则无条件塞进每次微信请求(~3.35k 字),开关只拦调用。
+// 现在:默认关;关着时工具不注册、提示词里没有 Codex 规则;开关是冷字段(改动重启监听、重建工具表)。
+{
+  const cfgMod3 = await import(join(ROOT, "lib/config.js"));
+  check("codexPeer is off by default", cfgMod3.DEFAULT_CONFIG.codexPeer === false && cfgMod3.normalizeConfig({}).codexPeer === false);
+  check("codexPeer is a cold field (a flip rebuilds the tool list)", !cfgMod3.HOT_FIELDS.has("codexPeer"));
+  const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("Codex tools are registered only when the switch is on",
+    /const codex = this\.deps\.codexPeer !== undefined && this\.config\.codexPeer === true;\s*if \(codex\) registerCodexPeerTools/.test(bridgeSrc));
+  const promptSrc = readFileSync(join(ROOT, "src/prompt.ts"), "utf-8");
+  check("the system prompt carries no Codex rule (guidance lives in the tool descriptions)",
+    !/G14|codex_session|codex_progress|list_codex/.test(promptSrc));
+  const peerSrc = readFileSync(join(ROOT, "src/codex-peer.ts"), "utf-8");
+  check("the folded guidance is in the tool descriptions",
+    /never guess/.test(peerSrc) && /before reporting a result/.test(peerSrc) && /when each report was updated/.test(peerSrc));
+  check("the settings card shows the switch as default-off", /on: v\.codexPeer === true/.test(readFileSync(join(ROOT, "src/client.js"), "utf-8")));
+  const rpcSrc = readFileSync(join(ROOT, "src/codex-rpc.ts"), "utf-8");
+  check("ws is not a value import on the plugin's load path (a missing ws cannot take the bot down)",
+    !/^import WebSocket from "ws"/m.test(rpcSrc) && /import\("ws"\)/.test(rpcSrc));
+  const mcpSrc = readFileSync(join(ROOT, "src/mcp-server.ts"), "utf-8");
+  check("clawbot-mcp: driving a DSH session is marked destructive + open-world (Codex asks first)",
+    /const drives = \{[^}]*destructiveHint: true[^}]*openWorldHint: true/.test(mcpSrc) && /annotations: drives/.test(mcpSrc));
+  check("clawbot-mcp: the WeChat notification is marked open-world", /const messages = \{[^}]*openWorldHint: true/.test(mcpSrc) && /annotations: messages/.test(mcpSrc));
+}
+
 console.log(`宿主: dsh ${HOST_VERSION}  (${NPX})`);
 console.log(results.join("\n"));
 console.log(`\n${pass} 通过, ${fail} 失败`);

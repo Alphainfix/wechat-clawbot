@@ -4,7 +4,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { connect as connectUnix } from "node:net";
-import WebSocket from "ws";
+import type WebSocket from "ws";
+
+/**
+ * `ws` is loaded on first socket connection, not at import time: this module
+ * sits on the plugin's main load path, and a missing dependency there would
+ * keep the whole plugin — the WeChat bot included — from loading. Now it can
+ * only break Codex socket mode.
+ */
+let wsModule: Promise<typeof import("ws")> | undefined;
+const loadWs = (): Promise<typeof import("ws")> => (wsModule ??= import("ws"));
 
 export type RpcMessage = {
   id?: number | string;
@@ -128,7 +137,21 @@ export class CodexAppServer implements CodexRpc {
     if (!path.isAbsolute(socketPath)) {
       return Promise.reject(new Error("codexSocket must be an absolute IPC path"));
     }
-    const socket = new WebSocket("ws://localhost", {
+    const attempt: Promise<void> = loadWs().then(
+      ({ default: WebSocketImpl }) => this.openSocket(WebSocketImpl, socketPath),
+      () => {
+        wsModule = undefined;
+        if (this.connecting === attempt) this.connecting = undefined;
+        throw new Error("Codex socket mode needs the ws package: run npm install in the plugin directory");
+      },
+    );
+    this.connecting = attempt;
+    return attempt;
+  }
+
+  private openSocket(WebSocketImpl: typeof WebSocket, socketPath: string): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("Codex bridge was disposed"));
+    const socket = new WebSocketImpl("ws://localhost", {
       // The HTTP Upgrade goes over IPC, never TCP/DNS. This also preserves spaces in paths.
       createConnection: () => connectUnix({ path: socketPath }),
       handshakeTimeout: this.options.timeoutMs ?? 30_000,
@@ -178,8 +201,8 @@ export class CodexAppServer implements CodexRpc {
 
   private write(connection: ChildProcessWithoutNullStreams | WebSocket, message: RpcMessage): void {
     const data = JSON.stringify(message);
-    if (connection instanceof WebSocket) connection.send(data);
-    else connection.stdin.write(`${data}\n`);
+    if ("stdin" in connection) connection.stdin.write(`${data}\n`);
+    else connection.send(data);
   }
 
   private receive(connection: ChildProcessWithoutNullStreams | WebSocket, message: RpcMessage): void {

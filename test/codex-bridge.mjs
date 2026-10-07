@@ -182,7 +182,9 @@ test("disable switch prevents new RPC operations; invalid messages do not mutate
   assert.equal(normalized.codexPeer, false);
   assert.equal(normalized.codexTransport, "stdio");
   assert.equal(normalizeConfig({ codexTransport: "unknown" }).codexTransport, "socket");
-  assert.ok(HOT_FIELDS.has("codexPeer"));
+  // Off by default, and cold: a flip restarts the listener, which rebuilds the tool list.
+  assert.equal(normalizeConfig({}).codexPeer, false);
+  assert.equal(HOT_FIELDS.has("codexPeer"), false);
   assert.equal(HOT_FIELDS.has("codexTransport"), false);
 });
 
@@ -485,7 +487,17 @@ test("MCP stdio exposes WeChat session, owner-only notification and authenticate
     await mcp.connect(new StdioClientTransport({ command: process.execPath, args: ["lib/mcp-cli.js"], env, stderr: "pipe" }));
     const listed = await mcp.listTools();
     assert.equal(listed.tools.length, 7);
-    assert.equal(listed.tools.find((tool) => tool.name === "dsh_notify_wechat").annotations.readOnlyHint, false);
+    // Codex asks before a call only when the hints say so: driving a DSH agent
+    // and messaging the owner must never be marked closed-world/non-destructive.
+    const hints = (name) => listed.tools.find((tool) => tool.name === name).annotations;
+    assert.equal(hints("dsh_send_to_session").destructiveHint, true);
+    assert.equal(hints("dsh_send_to_session").openWorldHint, true);
+    assert.equal(hints("dsh_notify_wechat").readOnlyHint, false);
+    assert.equal(hints("dsh_notify_wechat").openWorldHint, true);
+    assert.equal(hints("dsh_report_codex_progress").openWorldHint, false);
+    for (const name of ["dsh_list_sessions", "dsh_get_wechat_session", "dsh_read_session", "dsh_read_codex_progress"]) {
+      assert.equal(hints(name).readOnlyHint, true, name);
+    }
     const resource = await mcp.readResource({ uri: "clawbot://wechat-session" });
     assert.equal(JSON.parse(resource.contents[0].text).sessionId, "wechat-test");
     const session = await mcp.callTool({ name: "dsh_get_wechat_session", arguments: {} });

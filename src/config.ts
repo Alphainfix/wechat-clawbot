@@ -149,7 +149,15 @@ export interface ClawbotConfig {
    */
   mcpBridge: boolean;
 
-  /** Lazy Codex peer connection. Socket shares a running server; stdio is opt-in. */
+  /**
+   * Codex peer tools for the WeChat bot (list/read/relay/progress). Off by
+   * default: while off, neither the five tools nor any Codex guidance reaches
+   * the model, so the feature costs nothing per request. Cold on purpose —
+   * flipping it restarts the WeChat listener, which rebuilds the tool list,
+   * so the tools and prompt stay byte-stable between flips (prompt cache).
+   * The connection itself is lazy: socket shares a running App Server, stdio
+   * (opt-in) starts a private one.
+   */
   codexPeer: boolean;
   codexTransport: "socket" | "stdio";
   codexBinary?: string;
@@ -222,7 +230,7 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   idleCompaction: true,
   workspaceInstructions: true,
   mcpBridge: true,
-  codexPeer: true,
+  codexPeer: false,
   codexTransport: "socket",
   imageQuality: 80,
   compressThresholdBytes: 1024 * 1024,
@@ -373,8 +381,8 @@ export const BaseConfig = Schema.object({
     .default(true)
     .description("开放 MCP 桥(/plugins/clawbot/mcp/*):让 Claude Code / Codex 列出/读取/驱动 DSH 会话,并通过 bot 给你发微信。只监听本机,而且每个请求都要 token"),
   codexPeer: Schema.boolean()
-    .default(true)
-    .description("让微信 bot 查看 Codex 项目/会话、转发消息和查询进度。按需连接,关闭后立刻停止接受新的会话操作"),
+    .default(false)
+    .description("【改动会重启微信监听】让微信 bot 查看 Codex 项目/会话、转发消息和查询进度(默认关)。关着时这几个工具不发给模型,不占 token"),
   codexTransport: Schema.union(["socket", "stdio"] as const)
     .default("socket")
     .description("【改动会重启微信监听】socket 通过 WebSocket 连接共享 Codex App Server;stdio 启动独立后台服务,只能在明确允许续聊后执行历史任务"),
@@ -474,7 +482,6 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "workspaceInstructions",
   "stripEmoji",
   "mcpBridge",
-  "codexPeer",
   "maxImageEdge",
   "imageQuality",
   "compressThresholdBytes",

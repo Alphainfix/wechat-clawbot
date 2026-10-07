@@ -59,7 +59,7 @@ Open **Plugins → wechat-clawbot → 微信 Bot** in the DSH web sidebar. Chang
 - **空闲时整理对话** (tidy up while idle): on by default. Off leaves only DSH's own compaction, which runs right before a reply and makes that reply wait.
 - **把工作目录的说明文件交给 bot** (workspace instruction files): on by default (DSH's own behaviour: once the bot works in a project, its AGENTS.md / CLAUDE.md is put into the chat, and the whole file again after every edit). Off keeps them out of the WeChat session, which helps when those files are long and change often; the bot can still read them when it needs to.
 - **开放 MCP 桥（Claude / Codex）** (MCP bridge): see the integrations below.
-- **Codex 会话联动**: select a Codex project and conversation, relay a message, or query progress.
+- **Codex 会话联动**: select a Codex project and conversation, relay a message, or query progress. Off by default; when on, every request carries 5 more tools (about 1k tokens). Changing it restarts the WeChat listener.
 
 A few options (the session id, the working directory, whether to start with DSH) live in the `- id: clawbot` entry of
 `~/.dsh/profiles/web/cordis.patch.yml`. Changing them restarts the WeChat listener automatically.
@@ -135,6 +135,7 @@ Codex can read `clawbot://wechat-session` or call `dsh_get_wechat_session` to se
 `dsh_notify_wechat({text: "…"})` sends only to the QR-linked owner and records a `[Codex 发给用户的]` copy in DSH history;
 it does not start another bot turn. `dsh_send_to_session` drives a selected DSH conversation without automatically
 forwarding its replies to WeChat. Use the notification tool when you want a phone update.
+Both tools are marked as having outside effects, so with Codex's default approval settings it asks you before each call.
 
 ### Choose the Codex project and conversation from WeChat
 
@@ -142,7 +143,8 @@ The default `codexTransport: socket` connects to an existing shared App Server u
 The default socket is `$CODEX_HOME/app-server-control/app-server-control.sock` (`CODEX_HOME` defaults to `~/.codex`).
 Set `codexSocket` to use a specific shared server's socket. Set `codexBinary` to select the CLI for standalone mode.
 These fields belong in the `clawbot` row of
-your local DSH `cordis.patch.yml`; changing them restarts the plugin. `codexPeer` is a live switch in the settings card.
+your local DSH `cordis.patch.yml`; changing them restarts the plugin. `codexPeer` is the switch in the settings card. It is off by default,
+and while it is off none of these tools is sent to the model; changing it also restarts the WeChat listener.
 
 The server must be the one executing the selected conversations and support the documented Unix socket WebSocket transport.
 You can start a local shared service with `codex app-server --listen unix://` or `--listen unix:///path/to/rpc.sock`.
@@ -175,6 +177,9 @@ close its original client and explicitly permit background continuation (`allowR
 No model, sandbox, or approval policy is overridden. Command/file approval requests and user questions from
 this independent runner go to WeChat; unsupported permission grants are declined. Shared-server approvals remain
 with the existing Codex client.
+**stdio mode is experimental**: the approval prompts it forwards to WeChat do not yet show full details (exact
+changes, extra permissions), and they go to whoever is chatting with the bot at the time. Use it only when you are the
+bot's only allowed sender. The default socket mode is not affected.
 
 ### Let clawbot report progress
 
@@ -196,6 +201,10 @@ The progress HTTP routes are `POST /plugins/clawbot/mcp/codex/report` and
 the existing session/notification routes. The MCP client accepts loopback origins only and refuses redirects.
 No login data, conversation snapshots, preferences, project inventories, or local workspace indexes are bundled in the package.
 Protocol reference: [Codex App Server](https://learn.chatgpt.com/docs/app-server).
+
+## Contributors
+
+- [@MistyHuang03](https://github.com/MistyHuang03): Codex integration ([#1](https://github.com/Alphainfix/wechat-clawbot/pull/1))
 
 ## Development
 

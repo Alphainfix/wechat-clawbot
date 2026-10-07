@@ -559,11 +559,11 @@ window.__ModuleLoader__.load({
         }),
         Field({
           label: "Codex 会话联动",
-          hint: "按需连接共享 App Server,可选择项目和会话转发微信消息、查询进度。连接方式和 CLI 路径在 clawbot 配置里设置",
+          hint: "默认关。打开后 bot 可以选择 Codex 项目和会话、转发微信消息、查询进度,但每次请求要多带 5 个工具(约 1k token)。改动会重启微信监听。连接方式和 CLI 路径在 clawbot 配置里设置",
           overridden: isSet("codexPeer"), disabled,
           onReset: () => clear("codexPeer"),
           inline: h(Switch, {
-            label: "Codex 会话联动", on: v.codexPeer !== false, disabled,
+            label: "Codex 会话联动", on: v.codexPeer === true, disabled,
             onChange: (next) => set("codexPeer", next),
           }),
         }),

@@ -56,7 +56,13 @@ export function createClawbotMcpServer(client = new ClawbotMcpClient()): McpServ
   const text = z.string().trim().min(1).max(32_000);
   const sessionId = z.string().trim().min(1).max(256);
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
-  const writes = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+  // Honest hints matter here: Codex decides from them whether to ask before a
+  // call. Driving a DSH agent can run commands outside Codex's sandbox, and a
+  // notification leaves the machine, so both must prompt. Only the progress
+  // report is a local, additive write.
+  const drives = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
+  const messages = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
+  const records = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
   const call = async (operation: () => Promise<Record<string, unknown>>) => {
     try {
       const result = await operation();
@@ -82,18 +88,18 @@ export function createClawbotMcpServer(client = new ClawbotMcpClient()): McpServ
     description: "Send a user-authorized message to a selected live DSH conversation. This drives that conversation; it does not send a WeChat notification. List sessions first.",
     inputSchema: {
       sessionId, text, waitForReply: z.boolean().optional(), waitMs: z.number().int().min(1_000).max(600_000).optional(),
-    }, annotations: writes,
+    }, annotations: drives,
   }, (args) => call(() => client.request("send", args)));
   server.registerTool("dsh_notify_wechat", {
     description: "Send one user-authorized text notification to the QR-linked WeChat owner. The recipient is fixed. A Codex-labelled copy is recorded in the DSH WeChat conversation.",
-    inputSchema: { text }, annotations: writes,
+    inputSchema: { text }, annotations: messages,
   }, (args) => call(() => client.request("notify", { ...args, source: "Codex" })));
   server.registerTool("dsh_report_codex_progress", {
     description: "Publish current Codex task progress for DSH/Clawbot to query. Call at meaningful milestones and completion; use the selected Codex thread id. This stores a timestamped report and does not notify WeChat by itself.",
     inputSchema: {
       threadId: sessionId, state: z.enum(CODEX_PROGRESS_STATES), summary: z.string().trim().min(1).max(4_000),
       cwd: z.string().min(1).max(4_096).optional(), turnId: sessionId.optional(),
-    }, annotations: writes,
+    }, annotations: records,
   }, (args) => call(() => client.request("codex/report", args)));
   server.registerTool("dsh_read_codex_progress", {
     description: "Read the latest timestamped Codex progress reports held by Clawbot. Reports are cached observations; check updatedAt before calling a task currently running.",

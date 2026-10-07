@@ -294,13 +294,13 @@ export function registerCodexPeerTools(ctx: Context, peer: CodexPeer): void {
     for (const thread of page.data) projects.set(thread.cwd, (projects.get(thread.cwd) ?? 0) + 1);
     return JSON.stringify({ projects: [...projects].map(([cwd, sessionsOnThisPage]) => ({ name: path.basename(cwd), cwd, sessionsOnThisPage })), nextCursor: page.nextCursor });
   });
-  register("list_codex_sessions", "List Codex conversations, titles, IDs, project directories and live states. notLoaded means runtime state is unknown; it must never be reported as idle. Use a project directory and full id for forwarding.", {
+  register("list_codex_sessions", "List Codex conversations, titles, IDs, project directories and live states. notLoaded means runtime state is unknown; it must never be reported as idle. Use a project directory and full id for forwarding. If several conversations could match, list them and let the user choose; never guess.", {
     project, cursor: { type: "string" }, limit: { type: "number" },
   }, async (args) => {
     const page = await peer.list(args.project as string | undefined, args.cursor as string | undefined, args.limit as number | undefined);
     return JSON.stringify({ sessions: page.data.map((thread) => ({ id: thread.id, title: thread.name, cwd: thread.cwd, state: stateLabel(thread.status) })), nextCursor: page.nextCursor });
   });
-  register("read_codex_session", "Read saved history without resuming the selected Codex conversation, including notLoaded conversations. notLoaded only means this server cannot observe live execution; it does not mean history is unreadable. Returns recent user/agent text and saved turn states, omitting reasoning and command outputs. Use the recorded timestamp when reporting cached progress.", {
+  register("read_codex_session", "Read saved history without resuming the selected Codex conversation, including notLoaded conversations. notLoaded only means this server cannot observe live execution; it does not mean history is unreadable. Returns recent user/agent text and saved turn states, omitting reasoning and command outputs. A finished status in saved history does not prove the original client has stopped. Use the recorded timestamp when reporting cached progress.", {
     session, project, limit: { type: "number" },
   }, async (args) => {
     const thread = await peer.read(String(args.session), args.project as string | undefined, args.limit as number | undefined);
@@ -313,10 +313,10 @@ export function registerCodexPeerTools(ctx: Context, peer: CodexPeer): void {
     }));
     return JSON.stringify({ session: describe(thread), turns, progressReports: peer.progress.list(thread.id) });
   });
-  register("send_to_codex_session", "Relay a user's WeChat message to the chosen project and Codex conversation. Active turns are steered; idle threads start a turn. Delivery is not completion. For an unloaded thread in either transport, allowResume requires the user to explicitly permit background continuation after closing the original client. Never set it just to bypass a refusal.", {
+  register("send_to_codex_session", "Relay a user's WeChat message to the chosen project and Codex conversation. Active turns are steered; idle threads start a turn. Delivery is not completion: check read_codex_session or read_codex_progress before reporting a result. For an unloaded thread in either transport, allowResume requires the user to explicitly permit background continuation after closing the original client. Never set it just to bypass a refusal.", {
     session, project, text: { type: "string", required: true }, allowResume: { type: "boolean" },
   }, async (args) => JSON.stringify(await peer.send(String(args.session), String(args.text), args.project as string | undefined, args.allowResume === true)));
-  register("read_codex_progress", "Read timestamped progress that Codex published through MCP or that the connected app-server emitted. Available even when no shared server is reachable. Reports are cached observations, not proof a task is still running.", {
+  register("read_codex_progress", "Read timestamped progress that Codex published through MCP or that the connected app-server emitted. Available even when no shared server is reachable. Reports are cached observations, not proof a task is still running; tell the user when each report was updated.", {
     threadId: { type: "string", description: "Omit to list recent reports; otherwise use the exact conversation id." },
   }, async (args) => JSON.stringify({ progress: peer.progress.list(args.threadId as string | undefined) }));
 }

@@ -1071,10 +1071,14 @@ export class WechatBridge {
       // sitting in front of. restrictTools below is a DENY list, so these three
       // are visible without needing to be named there.
       registerClaudePeerTools(agentCtx, this.config);
-      if (this.deps.codexPeer) registerCodexPeerTools(agentCtx, this.deps.codexPeer);
+      // Codex tools only when the owner switched them on: every registered tool
+      // rides along on every request. codexPeer is a cold field, so a flip
+      // restarts the listener and lands here again with the new value.
+      const codex = this.deps.codexPeer !== undefined && this.config.codexPeer === true;
+      if (codex) registerCodexPeerTools(agentCtx, this.deps.codexPeer!);
       this.restrictTools(agentCtx);
       this.toolsRegistered = true;
-      logger.info("ensureTools: WeChat tools registered");
+      logger.info(`ensureTools: WeChat tools registered (Codex tools ${codex ? "on" : "off"})`);
     } catch (err) {
       logger.warn(`ensureTools: registration failed (will retry): ${String(err)}`);
     }
