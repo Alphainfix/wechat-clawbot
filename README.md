@@ -154,6 +154,8 @@ Once connected, say, for example: "List Codex projects", "Show conversations in 
 "Send 'run the tests' to this conversation". Active turns receive `turn/steer` with the current turn ID;
 idle conversations receive `turn/start`. Both keep the selected conversation's identity and permissions.
 Delivery is reported immediately; completion must be checked separately.
+An unloaded conversation requires the original client to be closed and explicit `allowResume: true`,
+even in socket mode: another server's live execution cannot be inferred from stored history.
 
 For background continuation of stored conversations, explicitly configure `codexTransport: stdio`.
 That launches an independent `codex app-server --listen stdio://` using your existing Codex login/config.

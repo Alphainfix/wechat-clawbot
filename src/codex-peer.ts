@@ -194,10 +194,8 @@ export class CodexPeer {
         threadId: selected.id,
       });
       if (project && thread.cwd !== project) throw new Error("会话所属项目发生变化,没有发送");
-      if (thread.status.type === "notLoaded") {
-        if (this.config.codexTransport === "stdio" && !allowResume) {
-          throw new Error("独立服务无法判断另一个 Codex 客户端是否正在工作。先关闭原会话,明确允许后台续聊后设置 allowResume: true;实时转发请使用 socket");
-        }
+      if (thread.status.type === "notLoaded" && !allowResume) {
+        throw new Error("此服务未加载会话,无法判断另一个 Codex 客户端是否正在工作。先关闭原会话,明确允许后台续聊后设置 allowResume: true;实时转发需将原客户端连接到同一共享服务");
       }
       if (thread.status.type === "systemError") throw new Error("Codex 会话处于服务错误状态");
       // Resume also subscribes to events. No model, cwd, sandbox, or approval override.
@@ -313,7 +311,7 @@ export function registerCodexPeerTools(ctx: Context, peer: CodexPeer): void {
     }));
     return JSON.stringify({ session: describe(thread), turns, progressReports: peer.progress.list(thread.id) });
   });
-  register("send_to_codex_session", "Relay a user's WeChat message to the chosen project and Codex conversation. Active turns are steered; idle threads start a turn. Delivery is not completion. In standalone stdio mode, allowResume requires the user to explicitly permit background continuation after closing the original client. Never set it just to bypass a refusal.", {
+  register("send_to_codex_session", "Relay a user's WeChat message to the chosen project and Codex conversation. Active turns are steered; idle threads start a turn. Delivery is not completion. For an unloaded thread in either transport, allowResume requires the user to explicitly permit background continuation after closing the original client. Never set it just to bypass a refusal.", {
     session, project, text: { type: "string", required: true }, allowResume: { type: "boolean" },
   }, async (args) => JSON.stringify(await peer.send(String(args.session), String(args.text), args.project as string | undefined, args.allowResume === true)));
   register("read_codex_progress", "Read timestamped progress that Codex published through MCP or that the connected app-server emitted. Available even when no shared server is reachable. Reports are cached observations, not proof a task is still running.", {

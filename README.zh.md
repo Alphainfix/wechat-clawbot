@@ -145,6 +145,8 @@ Codex 可读取 `clawbot://wechat-session`，或调用 `dsh_get_wechat_session` 
 连接好后，可以在微信里说「列出 Codex 项目」「看看这个项目的对话」，选定目标后说「把运行测试这句话发给这个对话」。
 运行中的任务通过带有当前 turn id 的 `turn/steer` 接收消息；空闲对话通过 `turn/start` 开始下一轮。
 会话身份和权限沿用原设置。工具报告消息已投递时，工作未必已经完成，需要另查进度。
+未加载的对话在 socket 模式下同样需要先关闭原客户端，并显式设置 `allowResume: true`；
+历史记录不能证明别的服务里没有正在执行的任务。
 
 如果需要对历史对话做后台续聊，显式设置 `codexTransport: stdio`。
 它用已有的 Codex 登录和配置启动独立的 `codex app-server --listen stdio://`，无法判断另一个客户端是否仍在工作。
