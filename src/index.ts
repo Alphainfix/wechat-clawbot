@@ -24,6 +24,8 @@ import { registerWechatGuidanceGlobal } from "./prompt.js";
 import { registerSubagentModelPolicy } from "./subagent-model.js";
 import { registerModelsRoute } from "./models-route.js";
 import { registerMcpRoutes } from "./mcp-route.js";
+import { CodexPeer } from "./codex-peer.js";
+import { CodexProgressStore } from "./codex-progress.js";
 import { ensureMemoryFile } from "./memory.js";
 import { isHostSchedule, migrateLegacyReminders, type HostSchedule } from "./schedule-migrate.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
@@ -176,6 +178,10 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   const pending = new PendingRegistry();
 
   let bridge: WechatBridge | null = null;
+  const codexProgress = new CodexProgressStore();
+  const codexPeer = new CodexPeer(config, codexProgress, {
+    askWechat: (question, signal) => bridge?.askWechat(question, 300_000, signal) ?? Promise.resolve(null),
+  });
   let router: InboundRouter | null = null;
   let monitorTask: Promise<void> | null = null;
   let currentAccount: ResolvedWeixinAccount | null = null;
@@ -254,7 +260,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // one WeChat message to the owner. Registered here rather than beside
   // registerModelsRoute because it needs `sendText` and the account getter,
   // both defined just above.
-  registerMcpRoutes(ctx, { config, sendText, getAccount: () => currentAccount });
+  registerMcpRoutes(ctx, { config, sendText, getAccount: () => currentAccount, codexProgress });
 
   /** Pick the first bound account (v1 supports a single account). */
   const pickAccount = (): ResolvedWeixinAccount | null => {
@@ -282,6 +288,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     }
     currentAccount = account;
     bridge = new WechatBridge(ctx, config, sendText, {
+      codexPeer,
       getAccount: () => currentAccount,
       getContextToken: (sender) => router?.contextTokenFor(sender) ?? "",
       pending,
@@ -397,6 +404,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   return async () => {
     logger.info("plugin unload: stopping clawbot");
     watcher.close();
+    codexPeer.close();
     await stopMonitor("plugin unload");
   };
 }
