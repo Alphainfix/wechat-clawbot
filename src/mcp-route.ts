@@ -1,6 +1,6 @@
 /**
  * `/plugins/clawbot/mcp/*` — the HTTP surface a local MCP server calls, so
- * Claude Code can see what DSH is doing, drive a session, and reach the owner
+ * Claude Code / Codex can see what DSH is doing, drive a session, and reach the owner
  * on WeChat.
  *
  * ## Why the privileged half lives here and not in the MCP server
@@ -39,6 +39,7 @@ import { SessionId } from "@deepseek-ai/dsh-session";
 import type { ResolvedWeixinAccount } from "./ilink/auth/accounts.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import { logger } from "./ilink/util/logger.js";
+import { CodexProgressStore, type CodexProgressState } from "./codex-progress.js";
 
 /** The one method this file uses, structurally — see models-route.ts. */
 type WebServerLike = {
@@ -65,6 +66,8 @@ export type McpRouteDeps = {
   sendText: (to: string, text: string) => Promise<void>;
   /** The currently bound account, or null before `clawbot login`. */
   getAccount: () => ResolvedWeixinAccount | null;
+  /** Shared with the DSH Codex tools. Process-local, never a workspace index. */
+  codexProgress?: CodexProgressStore;
 };
 
 /** Largest request body accepted, so a stray POST cannot balloon memory. */
@@ -119,7 +122,7 @@ function secretEquals(a: string, b: string): boolean {
 // ---------------------------------------------------------------- observation
 
 /**
- * What the settings card shows. Kept in memory on purpose: this is "has Claude
+ * What the settings card shows. Kept in memory on purpose: this is "has an MCP client
  * actually talked to us", which is a fact about the current process. Persisting
  * it would answer a different, less useful question.
  */
@@ -195,7 +198,7 @@ function eventText(event: { type: string; data?: unknown }): string {
 /**
  * Put a copy of an outbound notify into the WeChat session's history.
  *
- * Without this the bot is blind to whatever Claude told the user: reply "那怎么办"
+ * Without this the bot is blind to whatever the coding agent told the user: reply "那怎么办"
  * to one of these messages and the bot has no idea what "那" refers to. The copy
  * closes that gap.
  *
@@ -224,12 +227,12 @@ function eventText(event: { type: string; data?: unknown }): string {
  * this runs, so a mirroring failure must never turn a delivered notify into a
  * reported failure.
  */
-function mirrorIntoSession(ctx: Context, sessionId: string, text: string): boolean {
+function mirrorIntoSession(ctx: Context, sessionId: string, text: string, source: "Claude" | "Codex" = "Claude"): boolean {
   try {
     const agent = ctx.agents.get(SessionId(sessionId));
     if (agent === undefined) return false;
     const message = createUserMessage({
-      content: [{ type: "text", text: `[Claude 发给用户的] ${text}` }],
+      content: [{ type: "text", text: `[${source} 发给用户的] ${text}` }],
       // v4 refuses the retired `plugin` wrapper; this is the kind the v3→v4
       // converter assigns this producer, so migrated history matches.
       source: { kind: "plugin:clawbot-mcp" } as never,
@@ -250,6 +253,8 @@ type Handlers = {
   read: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
   sendMessage: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
   notify: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  reportProgress: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  readProgress: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 };
 
 /**
@@ -275,6 +280,7 @@ type SessionQueryLike = {
 };
 
 function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
+  const progress = deps.codexProgress ?? new CodexProgressStore();
   const sessionQuery = (): SessionQueryLike | undefined =>
     ctx.get("sessionQuery") as SessionQueryLike | undefined;
 
@@ -289,6 +295,7 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
         // Degraded: no corpus, so only the agents currently in memory.
         send(res, 200, {
           ok: true,
+          wechatSessionId: deps.config.sessionId,
           degraded: "no sessionQuery service; listing live agents only",
           sessions: [...live.values()].map((a) => ({
             id: String(a.session.id),
@@ -326,7 +333,7 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
           running: agent?.status === "running",
         };
       });
-      send(res, 200, { ok: true, sessions });
+      send(res, 200, { ok: true, wechatSessionId: deps.config.sessionId, sessions });
     },
 
     /** The tail of one conversation, as plain text. */
@@ -437,6 +444,9 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
     async notify(req, res) {
       const body = await readJsonBody(req);
       const text = requireString(body, "text");
+      if (body.source !== undefined && body.source !== "Claude" && body.source !== "Codex") {
+        throw new Error('"source" must be Claude or Codex');
+      }
       const account = deps.getAccount();
       if (account === null || !account.configured) {
         send(res, 503, { ok: false, message: "no bound WeChat account — run `clawbot login` first" });
@@ -452,17 +462,35 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
       }
       await deps.sendText(owner, text);
       logger.info(`mcp notify: sent ${text.length} chars to the owner`);
-      const mirrored = mirrorIntoSession(ctx, deps.config.sessionId, text);
+      const mirrored = mirrorIntoSession(ctx, deps.config.sessionId, text, body.source === "Codex" ? "Codex" : "Claude");
       // Echo the recipient back so a wrong destination would be visible at the
       // call site instead of only in the recipient's chat. `mirrored` says
       // whether the bot's own history now contains a copy.
       send(res, 200, { ok: true, to: owner, chars: text.length, mirrored });
     },
+
+    async reportProgress(req, res) {
+      const body = await readJsonBody(req);
+      const entry = progress.report({
+        threadId: requireString(body, "threadId"),
+        state: requireString(body, "state") as CodexProgressState,
+        summary: requireString(body, "summary"),
+        ...(body.cwd === undefined ? {} : { cwd: requireString(body, "cwd") }),
+        ...(body.turnId === undefined ? {} : { turnId: requireString(body, "turnId") }),
+        source: "codex-mcp",
+      });
+      send(res, 200, { ok: true, progress: entry });
+    },
+
+    async readProgress(req, res) {
+      const threadId = new URL(req.url ?? "/", "http://localhost").searchParams.get("threadId") ?? undefined;
+      send(res, 200, { ok: true, progress: progress.list(threadId) });
+    },
   };
 }
 
 /**
- * Register the four routes.
+ * Register session, notification, and Codex progress routes.
  *
  * `webServer` goes through `ctx.inject` so a headless composition without it
  * simply has no bridge, rather than failing the whole plugin tree.
@@ -475,6 +503,8 @@ export function registerMcpRoutes(ctx: Context, deps: McpRouteDeps): void {
     { path: "/plugins/clawbot/mcp/read", method: "POST", run: handlers.read },
     { path: "/plugins/clawbot/mcp/send", method: "POST", run: handlers.sendMessage },
     { path: "/plugins/clawbot/mcp/notify", method: "POST", run: handlers.notify },
+    { path: "/plugins/clawbot/mcp/codex/report", method: "POST", run: handlers.reportProgress },
+    { path: "/plugins/clawbot/mcp/codex/progress", method: "GET", run: handlers.readProgress },
   ];
 
   ctx.inject(["webServer"], (scoped) => {
@@ -530,7 +560,7 @@ export function registerMcpRoutes(ctx: Context, deps: McpRouteDeps): void {
               if (deps.config.mcpBridge !== true) {
                 send(res, 403, {
                   ok: false,
-                  message: "Claude 桥已在设置里关闭(微信 Bot → 开放 Claude 桥)",
+                  message: "MCP 桥已在设置里关闭(微信 Bot → 开放 MCP 桥)",
                 });
                 return;
               }

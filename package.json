@@ -37,7 +37,8 @@
     "./client": "./lib/client.js"
   },
   "bin": {
-    "clawbot": "lib/cli.js"
+    "clawbot": "lib/cli.js",
+    "clawbot-mcp": "lib/mcp-cli.js"
   },
   "files": [
     "lib",
@@ -54,6 +55,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && cp -f src/client.js lib/client.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:codex": "npm run build && node --test test/codex-bridge.mjs",
     "clean": "rm -rf lib",
     "test:memory": "npm run build && node test/memory-eval-run.mjs"
   },
@@ -71,7 +73,10 @@
   },
   "ilink_appid": "bot",
   "dependencies": {
-    "qrcode-terminal": "^0.12.0"
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.22.0",
+    "zod": "^3.25.76"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.4",
@@ -94,6 +99,7 @@
     "@deepseek-ai/dsh-user-questions": "0.2.0-rc.2",
     "@deepseek-ai/schemastery": "3.18.4",
     "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.2",
     "typescript": "^5.8.0"
   }
 }
