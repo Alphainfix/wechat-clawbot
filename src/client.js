@@ -224,13 +224,13 @@ window.__ModuleLoader__.load({
     function bridgeHint(bridge) {
       if (bridge === null) return "读取状态…";
       if (bridge.unreachable === true) return "状态读不到（路由没注册？DSH 可能需要重启）";
-      if (bridge.enabled !== true) return "已关闭：四个路由都返回 403。开关立刻生效，不用重启";
+      if (bridge.enabled !== true) return "已关闭：MCP 路由都返回 403。开关立刻生效，不用重启";
       if (bridge.tokenReady !== true) return `token 还没生成（${bridge.tokenPath}）`;
       const rejected = bridge.rejected > 0 ? `；另有 ${bridge.rejected} 次 token 不对被拒` : "";
       if (!bridge.calls) {
-        return `已就绪，但 Claude 还没连过。先跑 dsh-mcp-bridge --check 验证${rejected}`;
+        return `已就绪，但 MCP 客户端还没连过。先跑 clawbot-mcp --check 验证${rejected}`;
       }
-      return `Claude 已调用 ${bridge.calls} 次，最近一次 ${ago(bridge.lastCallAt)}（${bridge.lastRoute}）${rejected}`;
+      return `MCP 客户端已调用 ${bridge.calls} 次，最近一次 ${ago(bridge.lastCallAt)}（${bridge.lastRoute}）${rejected}`;
     }
 
     function Switch(props) {
@@ -543,18 +543,28 @@ window.__ModuleLoader__.load({
           ),
         }),
         Field({
-          label: "开放 Claude 桥",
+          label: "开放 MCP 桥（Claude / Codex）",
           hint: bridgeHint(bridge),
           overridden: isSet("mcpBridge"), disabled,
           onReset: () => clear("mcpBridge"),
           inline: h(Switch, {
-            label: "开放 Claude 桥",
+            label: "开放 MCP 桥（Claude / Codex）",
             on: v.mcpBridge !== false,
             disabled,
             // Always writes an explicit value, like the other switches on this
             // card: flipping back to the default still shows 已覆盖, and 重置 is
             // the one thing that clears it. Uniform beats clever here.
             onChange: (next) => set("mcpBridge", next),
+          }),
+        }),
+        Field({
+          label: "Codex 会话联动",
+          hint: "按需连接共享 App Server,可选择项目和会话转发微信消息、查询进度。连接方式和 CLI 路径在 clawbot 配置里设置",
+          overridden: isSet("codexPeer"), disabled,
+          onReset: () => clear("codexPeer"),
+          inline: h(Switch, {
+            label: "Codex 会话联动", on: v.codexPeer !== false, disabled,
+            onChange: (next) => set("codexPeer", next),
           }),
         }),
       ];

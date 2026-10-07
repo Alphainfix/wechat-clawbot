@@ -149,6 +149,12 @@ export interface ClawbotConfig {
    */
   mcpBridge: boolean;
 
+  /** Lazy Codex peer connection. Socket shares a running server; stdio is opt-in. */
+  codexPeer: boolean;
+  codexTransport: "socket" | "stdio";
+  codexBinary?: string;
+  codexSocket?: string;
+
   /**
    * Only announce an outbound file before uploading it when it is at least
    * this many bytes. Below it the upload finishes fast enough that the typing
@@ -216,6 +222,8 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   idleCompaction: true,
   workspaceInstructions: true,
   mcpBridge: true,
+  codexPeer: true,
+  codexTransport: "socket",
   imageQuality: 80,
   compressThresholdBytes: 1024 * 1024,
   noticeMinBytes: 2 * 1024 * 1024,
@@ -286,6 +294,11 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
       typeof r.workspaceInstructions === "boolean" ? r.workspaceInstructions : DEFAULT_CONFIG.workspaceInstructions,
     mcpBridge:
       typeof r.mcpBridge === "boolean" ? r.mcpBridge : DEFAULT_CONFIG.mcpBridge,
+    codexPeer:
+      typeof r.codexPeer === "boolean" ? r.codexPeer : DEFAULT_CONFIG.codexPeer,
+    codexTransport: r.codexTransport === "stdio" ? "stdio" : "socket",
+    codexBinary: typeof r.codexBinary === "string" && r.codexBinary.trim() ? r.codexBinary.trim() : undefined,
+    codexSocket: typeof r.codexSocket === "string" && r.codexSocket.trim() ? r.codexSocket.trim() : undefined,
     noticeMinBytes:
       typeof r.noticeMinBytes === "number" && Number.isFinite(r.noticeMinBytes)
         ? Math.max(0, r.noticeMinBytes)
@@ -358,7 +371,17 @@ export const BaseConfig = Schema.object({
     ),
   mcpBridge: Schema.boolean()
     .default(true)
-    .description("开放 Claude 桥(/plugins/clawbot/mcp/*):让 Claude Code 列出/读取/驱动 DSH 会话,并通过 bot 给你发微信。只监听本机,而且每个请求都要 token"),
+    .description("开放 MCP 桥(/plugins/clawbot/mcp/*):让 Claude Code / Codex 列出/读取/驱动 DSH 会话,并通过 bot 给你发微信。只监听本机,而且每个请求都要 token"),
+  codexPeer: Schema.boolean()
+    .default(true)
+    .description("让微信 bot 查看 Codex 项目/会话、转发消息和查询进度。按需连接,关闭后立刻停止接受新的会话操作"),
+  codexTransport: Schema.union(["socket", "stdio"] as const)
+    .default("socket")
+    .description("【改动会重启微信监听】socket 通过 WebSocket 连接共享 Codex App Server;stdio 启动独立后台服务,只能在明确允许续聊后执行历史任务"),
+  codexBinary: Schema.string()
+    .description("【改动会重启微信监听】Codex CLI 路径,留空自动查找"),
+  codexSocket: Schema.string()
+    .description("【改动会重启微信监听】共享 App Server 的 socket 路径,留空使用 Codex 默认路径"),
   maxImageEdge: Schema.number()
     .default(2048)
     .min(64)
@@ -451,6 +474,7 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "workspaceInstructions",
   "stripEmoji",
   "mcpBridge",
+  "codexPeer",
   "maxImageEdge",
   "imageQuality",
   "compressThresholdBytes",

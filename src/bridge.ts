@@ -23,6 +23,7 @@ import { createUserMessage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import { zonedStamp } from "./localtime.js";
 import { compressForUpload } from "./image-compress.js";
 import { registerClaudePeerTools } from "./claude-peer.js";
+import { registerCodexPeerTools, type CodexPeer } from "./codex-peer.js";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 // `@deepseek-ai/dsh-agent-presets` (and its `ctx.agentPresets` type
 // augmentation) is gone in DSH 0.1.7; the service keeps its name
@@ -50,6 +51,7 @@ export type BridgeDeps = {
   getContextToken: (sender: string) => string;
   /** Pending WeChat interactions (approvals + questions). */
   pending: PendingRegistry;
+  codexPeer?: CodexPeer;
 };
 
 /**
@@ -1069,6 +1071,7 @@ export class WechatBridge {
       // sitting in front of. restrictTools below is a DENY list, so these three
       // are visible without needing to be named there.
       registerClaudePeerTools(agentCtx, this.config);
+      if (this.deps.codexPeer) registerCodexPeerTools(agentCtx, this.deps.codexPeer);
       this.restrictTools(agentCtx);
       this.toolsRegistered = true;
       logger.info("ensureTools: WeChat tools registered");

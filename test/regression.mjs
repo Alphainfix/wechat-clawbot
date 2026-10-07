@@ -109,7 +109,7 @@ function check(name, ok, detail) {
   // absence, which is the check working: a field can only be called hot if some
   // file here reads it live.
   const sources = ["src/index.ts", "src/bridge.ts", "src/inbound.ts", "src/tool.ts", "src/approvals.ts",
-    "src/prompt.ts", "src/mcp-route.ts", "src/claude-peer.ts"]
+    "src/prompt.ts", "src/mcp-route.ts", "src/claude-peer.ts", "src/codex-peer.ts"]
     .filter((f) => existsSync(join(ROOT, f)))
     .map((f) => readFileSync(join(ROOT, f), "utf-8")).join("\n");
   for (const field of HOT_FIELDS) {
@@ -424,7 +424,7 @@ function check(name, ok, detail) {
     /tokenPath\(\)/.test(statusBody) && !/\btoken,/.test(statusBody) && !/token:\s*token\b/.test(statusBody),
     "an unauthenticated route must not echo the secret");
   check("status is outside the mcpBridge gate",
-    statusAt >= 0 && statusAt < routeSrc.indexOf("Claude 桥已在设置里关闭"),
+    statusAt >= 0 && statusAt < routeSrc.indexOf("deps.config.mcpBridge !== true"),
     "\"is it off?\" is the question you ask when it is off, so the gate must not hide it");
 
   check("every bridge route is behind the bearer check",
