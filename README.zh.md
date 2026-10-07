@@ -148,6 +148,16 @@ Codex 可读取 `clawbot://wechat-session`，或调用 `dsh_get_wechat_session` 
 未加载的对话在 socket 模式下同样需要先关闭原客户端，并显式设置 `allowResume: true`；
 历史记录不能证明别的服务里没有正在执行的任务。
 
+`notLoaded` 只表示这个服务没有加载该会话，不妨碍用 `read_codex_session` 读取已保存的历史。
+读取使用摘要分页，避免长任务的命令输出和工具结果撑大响应；若遇到 8 MiB 响应限制，可把 `limit` 降为 1。
+读取历史不会恢复任务，也无法保证包含另一个客户端当前尚未保存的消息。
+
+转发消息属于投递结果中 `threadId` 对应的对话，不会复制到 App 中当前打开的其他对话。
+普通本机 CLI 可用 `/app` 在桌面端打开同一个已保存的对话；共享服务中的实时执行仍要求客户端连接同一服务。
+已知本机会话 id 时，也可以用 `codex://threads/<thread-id>` 打开，参见
+[桌面端深链接说明](https://learn.chatgpt.com/docs/reference/commands)和
+[CLI 命令说明](https://learn.chatgpt.com/docs/developer-commands)。
+
 如果需要对历史对话做后台续聊，显式设置 `codexTransport: stdio`。
 它用已有的 Codex 登录和配置启动独立的 `codex app-server --listen stdio://`，无法判断另一个客户端是否仍在工作。
 未加载的历史对话必须先关闭原客户端，并明确允许后台续聊（`allowResume: true`）才会继续执行。

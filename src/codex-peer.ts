@@ -171,7 +171,9 @@ export class CodexPeer {
     const count = Math.min(30, Math.max(1, Math.trunc(limit) || 10));
     try {
       const page = await this.rpc.request<{ data: Turn[] }>("thread/turns/list", {
-        threadId, limit: count, sortDirection: "desc", itemsView: "full",
+        // Full items include command output and tool results that can exceed the
+        // RPC frame limit in long tasks. Summaries retain the text we report.
+        threadId, limit: count, sortDirection: "desc", itemsView: "summary",
       });
       return [...page.data].reverse();
     } catch (error) {
@@ -298,7 +300,7 @@ export function registerCodexPeerTools(ctx: Context, peer: CodexPeer): void {
     const page = await peer.list(args.project as string | undefined, args.cursor as string | undefined, args.limit as number | undefined);
     return JSON.stringify({ sessions: page.data.map((thread) => ({ id: thread.id, title: thread.name, cwd: thread.cwd, state: stateLabel(thread.status) })), nextCursor: page.nextCursor });
   });
-  register("read_codex_session", "Read the selected Codex conversation and current task progress without resuming it. Returns recent user/agent text and turn states, omitting reasoning and command outputs. Use the recorded timestamp when reporting cached progress.", {
+  register("read_codex_session", "Read saved history without resuming the selected Codex conversation, including notLoaded conversations. notLoaded only means this server cannot observe live execution; it does not mean history is unreadable. Returns recent user/agent text and saved turn states, omitting reasoning and command outputs. Use the recorded timestamp when reporting cached progress.", {
     session, project, limit: { type: "number" },
   }, async (args) => {
     const thread = await peer.read(String(args.session), args.project as string | undefined, args.limit as number | undefined);

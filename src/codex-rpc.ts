@@ -149,7 +149,11 @@ export class CodexAppServer implements CodexRpc {
         // Always settle this connection's promise without touching a newer one.
         reject(this.closed ? new Error("Codex bridge was disposed") : error);
       };
-      socket.on("error", () => failed(new Error("Cannot connect to the shared Codex App Server. Start the correct server or configure codexSocket.")));
+      socket.on("error", (error: Error & { code?: string }) => failed(new Error(
+        error.code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH"
+          ? "Codex RPC frame exceeds 8 MiB; reduce the history page size or use summarized items"
+          : "Cannot connect to the shared Codex App Server. Start the correct server or configure codexSocket.",
+      )));
       socket.on("close", () => failed(new Error("Shared Codex App Server disconnected; delivery of pending messages is unknown")));
       socket.on("message", (data, isBinary) => {
         try {

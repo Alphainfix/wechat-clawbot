@@ -120,6 +120,7 @@ test("history reads are paginated and legacy fallback only handles an unsupporte
   const rpc = mockRpc([record]);
   const peer = new CodexPeer(config(), new CodexProgressStore(), { rpc });
   assert.equal((await peer.read(ID_A, undefined, 1)).turns[0].id, "recent");
+  assert.equal(rpc.calls.find((call) => call.method === "thread/turns/list").params.itemsView, "summary");
   assert.equal(rpc.calls.some((call) => call.params.includeTurns === true), false);
   const legacyRpc = mockRpc([record], (method) => {
     if (method === "thread/turns/list") throw new CodexRpcError("method not found", -32601);
@@ -142,10 +143,13 @@ test("history reads are paginated and legacy fallback only handles an unsupporte
 
 test("unloaded continuation requires opt-in for both transports; reads do not resume", async () => {
   for (const transport of ["stdio", "socket"]) {
-    const rpc = mockRpc([thread(ID_A, "/workspace/alpha", "notLoaded")]);
+    const record = thread(ID_A, "/workspace/alpha", "notLoaded");
+    record.turns = [{ id: "saved", status: "completed", items: [{ type: "agentMessage", text: "Saved task summary" }] }];
+    const rpc = mockRpc([record]);
     const peer = new CodexPeer(config(transport), new CodexProgressStore(), { rpc });
     const read = await peer.read(ID_A);
     assert.equal(read.status.type, "notLoaded");
+    assert.equal(read.turns[0].items[0].text, "Saved task summary");
     assert.equal(rpc.calls.some((call) => call.method === "thread/resume"), false);
     await assert.rejects(peer.send(ID_A, "Continue"), /先关闭原会话/);
     assert.equal(rpc.calls.some((call) => call.method === "thread/resume"), false);
@@ -289,6 +293,51 @@ test("shared socket uses WebSocket Upgrade and closing the bridge leaves the oth
     assert.equal(methods.filter((method) => method === "initialize").length, 2);
   } finally {
     peer.close(); observer.close();
+    for (const client of ws.clients) client.terminate();
+    await new Promise((resolve) => ws.close(resolve));
+    await new Promise((resolve) => http.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("large saved histories use summaries and oversized frames report the payload limit", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "clawbot-codex-history-"));
+  const socketPath = join(dir, "rpc.sock");
+  const http = createServer();
+  const ws = new WebSocketServer({ server: http });
+  const record = thread(ID_A, "/workspace/alpha", "notLoaded");
+  const methods = [];
+  ws.on("connection", (connection) => {
+    connection.on("error", () => {}); // The oversized diagnostic intentionally closes this client.
+    connection.on("message", (frame) => {
+      const { id, method, params } = JSON.parse(frame.toString());
+      methods.push(method);
+      const write = (result) => connection.send(JSON.stringify({ id, result }));
+      if (method === "initialize") write({});
+      if (method === "thread/read") write({ thread: record });
+      if (method === "thread/turns/list") write({
+        data: [{ id: "saved", status: "completed", items: [
+          { type: "agentMessage", text: "Tests passed" },
+          { type: "commandExecution", aggregatedOutput: params.itemsView === "full" ? "x".repeat(9 * 1024 * 1024) : null },
+        ] }], nextCursor: null,
+      });
+    });
+  });
+  const rpc = new CodexAppServer({ socketPath, timeoutMs: 5_000 });
+  const peer = new CodexPeer(config(), new CodexProgressStore(), { rpc });
+  try {
+    await new Promise((resolve, reject) => { http.once("error", reject); http.listen(socketPath, resolve); });
+    await assert.rejects(rpc.request("thread/turns/list", { threadId: ID_A, limit: 10, itemsView: "full" }), /frame exceeds 8 MiB/);
+    const tools = new Map();
+    registerCodexPeerTools({ tools: { register: (tool) => tools.set(tool.name, tool) } }, peer);
+    const read = await tools.get("read_codex_session").execute({ session: ID_A });
+    assert.equal(read.ok, true);
+    const result = JSON.parse(read.summary);
+    assert.match(result.session, /实时状态未知/);
+    assert.deepEqual(result.turns[0].messages, [{ role: "assistant", text: "Tests passed" }]);
+    assert.equal(methods.includes("thread/resume"), false);
+  } finally {
+    peer.close();
     for (const client of ws.clients) client.terminate();
     await new Promise((resolve) => ws.close(resolve));
     await new Promise((resolve) => http.close(resolve));
