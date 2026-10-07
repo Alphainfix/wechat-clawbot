@@ -157,6 +157,17 @@ Delivery is reported immediately; completion must be checked separately.
 An unloaded conversation requires the original client to be closed and explicit `allowResume: true`,
 even in socket mode: another server's live execution cannot be inferred from stored history.
 
+`notLoaded` only means this server has not loaded the conversation. Use `read_codex_session` to read its saved history.
+Reads use summarized pages to avoid pulling large command outputs and tool results. If a response still hits the
+8 MiB limit, reduce `limit` to 1. Reading history does not resume execution and may omit another client's unsaved messages.
+
+A relayed message belongs to the conversation identified by the delivery result's `threadId`; it is not copied
+into other conversations open in the app. In a regular local CLI, `/app` opens the same saved conversation in the
+desktop app. Live execution on a shared server still requires the clients to connect to that same server.
+You can also open a known local conversation with `codex://threads/<thread-id>`; see the
+[desktop deep-link reference](https://learn.chatgpt.com/docs/reference/commands) and
+[CLI command reference](https://learn.chatgpt.com/docs/developer-commands).
+
 For background continuation of stored conversations, explicitly configure `codexTransport: stdio`.
 That launches an independent `codex app-server --listen stdio://` using your existing Codex login/config.
 It cannot inspect another client's live execution. A stored, unloaded conversation will only resume after you
