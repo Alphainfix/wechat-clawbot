@@ -1182,6 +1182,49 @@ function check(name, ok, detail) {
   check("clawbot-mcp: the WeChat notification is marked open-world", /const messages = \{[^}]*openWorldHint: true/.test(mcpSrc) && /annotations: messages/.test(mcpSrc));
 }
 
+// ------------------------------- 同一进程只留一个 clawbot 实例(2026-10-08)
+// DSH 就地重载插件(改冷字段 / 热重载代码)时从来没调用过我们的卸载函数:10-07 改了两次设置,
+// 三套微信长轮询同时在跑,每条消息被处理三遍,旧实例的「正在输入」永远停不下来。
+{
+  const { claimInstance } = await import(join(ROOT, "lib/instance-guard.js"));
+  claimInstance(async () => {}).release(); // start from an empty slot
+  const stopped = [];
+  const first = claimInstance(async (reason) => { stopped.push(["first", reason]); });
+  await first.ready;
+  check("the first instance starts without waiting for anyone", stopped.length === 0 && first.isCurrent());
+  let releaseThirdStop;
+  const slowStop = new Promise((resolve) => { releaseThirdStop = resolve; });
+  const second = claimInstance(async (reason) => { stopped.push(["second", reason]); });
+  check("a newer instance takes the slot at once", second.isCurrent() && !first.isCurrent());
+  await second.ready;
+  check("…and retires the older one before it may start", stopped.length === 1 && stopped[0][0] === "first"
+    && stopped[0][1] === `superseded by instance #${second.id}`);
+  const third = claimInstance(async () => { await slowStop; throw new Error("boom"); });
+  const fourth = claimInstance(async () => {});
+  let fourthReady = false;
+  void fourth.ready.then(() => { fourthReady = true; });
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
+  check("the second one was retired too", stopped.length === 2 && stopped[1][0] === "second");
+  check("a newer instance waits until the older one has actually stopped", fourthReady === false);
+  releaseThirdStop();
+  await fourth.ready;
+  check("a stop that throws still lets the new instance start", fourthReady === true && third.id < fourth.id);
+  third.release();
+  check("releasing a slot you no longer hold changes nothing", fourth.isCurrent());
+  fourth.release();
+  const fifth = claimInstance(async () => {});
+  await fifth.ready;
+  check("after our own unload the next instance starts fresh", fifth.isCurrent());
+  fifth.release();
+  const indexSrc = readFileSync(join(ROOT, "src/index.ts"), "utf-8");
+  check("the monitor starts only after the older instance stopped, and only while current",
+    /void claim\.ready\.then\(\(\) => \{\s*if \(claim\.isCurrent\(\)\) startMonitor\(\);/.test(indexSrc));
+  check("a retired or unloaded instance never starts a monitor again", /if \(monitorTask \|\| superseded\) return;/.test(indexSrc));
+  check("retiring stops the monitor, the Codex peer and the account watcher",
+    /claimInstance\(async \(reason\) => \{\s*superseded = true;[\s\S]{0,200}watcher\.close\(\);\s*codexPeer\.close\(\);\s*await stopMonitor\(reason\);/.test(indexSrc));
+  check("our own unload gives the slot up", /claim\.release\(\);/.test(indexSrc));
+}
+
 console.log(`宿主: dsh ${HOST_VERSION}  (${NPX})`);
 console.log(results.join("\n"));
 console.log(`\n${pass} 通过, ${fail} 失败`);
