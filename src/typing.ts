@@ -6,6 +6,14 @@
  * and the per-user typing ticket comes from getconfig and is cached for up to a
  * day. Everything here is best effort — a failed indicator must never delay or
  * break the reply itself, so nothing in this class throws or blocks a caller.
+ *
+ * After a reply reaches the phone the indicator goes down at once (CANCEL), and
+ * stays down unless the bot is evidently still working: a new tool call
+ * (noteWorking), a new message from the user (start), or the quiet window
+ * running out. Every turn ends with one more model call after the last reply —
+ * 2.4 s median, 6.8 s at most over 60 turns measured on 2026-10-10 — and that
+ * wrap-up used to keep 「正在输入」 on screen, or bring it back, after the
+ * answer was already there.
  */
 import { getConfig, sendTyping } from "./ilink/api/api.js";
 import { TypingStatus } from "./ilink/api/types.js";
@@ -23,11 +31,20 @@ export type TypingDeps = {
    */
   isWaitingFor: (sender: string) => boolean;
   keepaliveMs?: number;
+  /** Quiet window after a reply (see QUIET_AFTER_REPLY_MS). */
+  quietMs?: number;
   /** The two iLink calls; injectable so tests run without the network. */
   api?: { getConfig: typeof getConfig; sendTyping: typeof sendTyping };
 };
 
 const KEEPALIVE_MS = 5_000;
+/**
+ * How long the indicator stays down after a reply when nothing says the bot is
+ * still working. Longer than the slowest wrap-up step measured (6.8 s), so a
+ * finished turn never flashes it again; a long think before more output still
+ * gets it back.
+ */
+const QUIET_AFTER_REPLY_MS = 8_000;
 const TICKET_TTL_MS = 24 * 60 * 60 * 1000;
 const TICKET_RETRY_MS = 60_000;
 /** Consecutive failures after which a turn stops trying (the account is likely offline). */
@@ -36,6 +53,7 @@ const MAX_FAILURES = 3;
 export class TypingIndicator {
   private readonly deps: TypingDeps;
   private readonly keepaliveMs: number;
+  private readonly quietMs: number;
   private readonly api: { getConfig: typeof getConfig; sendTyping: typeof sendTyping };
   private readonly tickets = new Map<string, { ticket: string; nextFetchAt: number }>();
   /** Whom the indicator is currently running for. */
@@ -46,37 +64,67 @@ export class TypingIndicator {
   private failures = 0;
   /** A tick's requests are in flight (its timer has already fired). */
   private busy = false;
+  /** Down after a reply, waiting for a sign of more work (or the quiet window). */
+  private quiet = false;
+  /** Replies delivered so far: tells a TYPING that was in flight across one to take itself back. */
+  private deliveries = 0;
 
   constructor(deps: TypingDeps) {
     this.deps = deps;
     this.keepaliveMs = deps.keepaliveMs ?? KEEPALIVE_MS;
+    this.quietMs = deps.quietMs ?? QUIET_AFTER_REPLY_MS;
     this.api = deps.api ?? { getConfig, sendTyping };
   }
 
-  /** Show typing to `sender` until stop(). Already running for them = no-op. */
+  /**
+   * Show typing to `sender` until stop(). Already running for them = no-op,
+   * except right after a reply: a new message from them means more work, so
+   * the indicator comes back at once.
+   */
   start(sender: string): void {
-    if (this.sender === sender && (this.timer !== undefined || this.busy)) return;
+    if (this.sender === sender && (this.timer !== undefined || this.busy)) {
+      this.noteWorking(sender);
+      return;
+    }
     if (this.sender !== undefined && this.sender !== sender) this.stop();
     this.sender = sender;
     this.failures = 0;
+    this.quiet = false;
     this.schedule(0);
   }
 
   /**
-   * A message just reached the phone. WeChat clears the indicator by itself on
-   * arrival, so wait a whole interval before showing it again: the reply that
-   * ends a turn would otherwise be followed by a flash of 「正在输入」.
+   * A message just reached the phone: take the indicator down now. Waiting for
+   * WeChat to clear it on arrival left it up until the turn ended, and the turn
+   * always has one more model call to go. It stays down for the quiet window
+   * unless noteWorking/start says the bot is busy again.
    */
   noteDelivered(sender: string): void {
     if (this.sender !== sender) return;
-    this.shown = false;
-    this.schedule(this.keepaliveMs);
+    this.deliveries += 1;
+    this.quiet = true;
+    if (this.shown) {
+      this.shown = false;
+      void this.send(sender, TypingStatus.CANCEL);
+    }
+    this.schedule(this.quietMs);
+  }
+
+  /**
+   * The bot started real work after a reply (a tool call other than talking to
+   * the user): show typing again now instead of after the quiet window.
+   */
+  noteWorking(sender: string): void {
+    if (this.sender !== sender || !this.quiet) return;
+    this.quiet = false;
+    if (!this.busy) this.schedule(0);
   }
 
   stop(): void {
     const sender = this.sender;
     this.clearTimer();
     this.sender = undefined;
+    this.quiet = false;
     if (sender !== undefined && this.shown) void this.send(sender, TypingStatus.CANCEL);
     this.shown = false;
   }
@@ -124,13 +172,23 @@ export class TypingIndicator {
         await this.send(sender, TypingStatus.CANCEL);
       }
     } else {
+      const before = this.deliveries;
       const ok = await this.send(sender, TypingStatus.TYPING);
       // stop() may have run while the request was in flight: take it back down.
       if (this.sender !== sender) {
         if (ok) void this.send(sender, TypingStatus.CANCEL);
         return;
       }
-      if (ok) this.shown = true;
+      // A reply landed while it was in flight: the TYPING may reach WeChat after
+      // the reply's CANCEL, so cancel once more.
+      if (ok && this.deliveries !== before) {
+        void this.send(sender, TypingStatus.CANCEL);
+        return;
+      }
+      if (ok) {
+        this.shown = true;
+        this.quiet = false;
+      }
     }
   }
 

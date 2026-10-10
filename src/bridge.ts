@@ -35,6 +35,12 @@ import type { ClawbotConfig } from "./config.js";
 import { markSessionCreated, wasSessionCreated } from "./state.js";
 import { PendingRegistry, type PendingAnswer } from "./pending.js";
 import { TypingIndicator } from "./typing.js";
+
+/**
+ * Tool calls that are the bot talking to the user, not working: they must not
+ * bring 「正在输入」 back after a reply (see TypingIndicator.noteWorking).
+ */
+const REPLY_TOOLS = new Set(["send_wechat_text", "send_wechat_file", "ask_user_question"]);
 import { IdleCompactor, IDLE_COMPACT_RATIO, hostCompactionThreshold } from "./idle-compact.js";
 import { registerSendFileTool } from "./tool.js";
 import { randomUUID } from "node:crypto";
@@ -945,6 +951,12 @@ export class WechatBridge {
     if (event.type === "assistant/message") {
       const tokens = (event.data as { usage?: { totalTokens?: unknown } } | undefined)?.usage?.totalTokens;
       if (typeof tokens === "number" && tokens > 0) this.lastRequestTokens = tokens;
+    }
+    // Real work after a reply (search, shell, files…): 「正在输入」 comes back now
+    // instead of after the quiet window. A reply tool is the answer itself.
+    if (event.type === "tool/call" && this.currentSender) {
+      const name = (event.data as { name?: unknown } | undefined)?.name;
+      if (typeof name === "string" && !REPLY_TOOLS.has(name)) this.typing.noteWorking(this.currentSender);
     }
     if (event.type === "turn/start") this.idleCompact.noteActivity();
     if (event.type === "turn/end" && !this.worker) {

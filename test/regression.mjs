@@ -786,14 +786,56 @@ function check(name, ok, detail) {
     check("nothing is sent after stop", h.calls.length === n);
   }
   {
-    const h = make();
+    // 2026-10-10: a reply takes the indicator down at once; the wrap-up model
+    // call that follows every reply must not keep it up or bring it back.
+    const h = make({ quietMs: 120 });
     h.typing.start("u1"); await sleep(10);
-    h.typing.noteDelivered("u1");
-    const n = h.calls.length; await sleep(25);
-    check("a delivered reply is not followed by a flash of typing", h.calls.length === n, h.calls.join());
-    await sleep(40);
-    check("typing resumes after a full interval if the turn goes on", h.calls.length > n);
+    h.typing.noteDelivered("u1"); await sleep(5);
+    check("a reply takes typing down at once", h.calls.at(-1) === "u1:2", h.calls.join());
+    const n = h.calls.length; await sleep(70);
+    check("…and keeps it down through a short wrap-up (no flash after the answer)", h.calls.length === n, h.calls.join());
+    await sleep(80);
+    check("a long think after a reply brings it back once the quiet window ends", h.calls.slice(n).includes("u1:1"), h.calls.join());
     h.typing.stop();
+  }
+  {
+    const h = make({ quietMs: 500 });
+    h.typing.start("u1"); await sleep(10);
+    h.typing.noteDelivered("u1"); await sleep(5);
+    const n = h.calls.length;
+    h.typing.noteWorking("u1"); await sleep(10);
+    check("real work after a reply (a tool call) brings typing back right away", h.calls.slice(n).join() === "u1:1", h.calls.join());
+    h.typing.noteDelivered("u1"); await sleep(5);
+    const m = h.calls.length;
+    h.typing.start("u1"); await sleep(10);
+    check("a new message from the user after a reply brings it back right away", h.calls.slice(m).join() === "u1:1", h.calls.join());
+    h.typing.noteWorking("u1"); await sleep(10);
+    check("noteWorking while typing already shows sends nothing extra", h.calls.slice(m).join() === "u1:1", h.calls.join());
+    h.typing.stop();
+  }
+  {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const calls = [];
+    const typing = new TypingIndicator({
+      getAccount: () => ({ baseUrl: "http://127.0.0.1:9", token: "t" }),
+      getContextToken: () => "ctx",
+      isWaitingFor: () => false,
+      keepaliveMs: 40,
+      quietMs: 500,
+      api: {
+        getConfig: async () => ({ ret: 0, typing_ticket: "ticket" }),
+        sendTyping: async ({ body }) => {
+          if (body.status === 1) await gate;
+          calls.push(`${body.ilink_user_id}:${body.status}`);
+        },
+      },
+    });
+    typing.start("u1"); await sleep(10);
+    typing.noteDelivered("u1");
+    release(); await sleep(10);
+    check("a TYPING still in flight when the reply lands is taken back down", calls.at(-1) === "u1:2", calls.join());
+    typing.stop();
   }
   {
     const h = make();
@@ -831,6 +873,10 @@ function check(name, ok, detail) {
   const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
   check("typing starts for queued turns, steered messages and reminder turns",
     (bridgeSrc.match(/this\.typing\.start\(/g) ?? []).length >= 3);
+  check("a tool call other than a reply brings typing back (noteWorking)",
+    /event\.type === "tool\/call" && this\.currentSender[\s\S]{0,200}!REPLY_TOOLS\.has\(name\)\) this\.typing\.noteWorking/.test(bridgeSrc));
+  check("talking to the user is not work: text, files and questions keep typing down",
+    /REPLY_TOOLS = new Set\(\["send_wechat_text", "send_wechat_file", "ask_user_question"\]\)/.test(bridgeSrc));
   check("typing stops when the queue drains and when a turn nobody drives ends",
     /if \(this\.queue\.length === 0\) \{?\s*this\.typing\.stop\(\)/.test(bridgeSrc)
       && /event\.type === "turn\/end" && !this\.worker\) \{?\s*this\.typing\.stop\(\)/.test(bridgeSrc));
