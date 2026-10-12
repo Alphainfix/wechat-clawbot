@@ -13,7 +13,7 @@
  *
  * Exits non-zero when any check fails, so it can gate a build.
  */
-import { readFileSync, mkdirSync, existsSync, unlinkSync, statSync, lstatSync, readdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, lstatSync, readdirSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1033,7 +1033,7 @@ function check(name, ok, detail) {
         const router = new InboundRouter({
           config: { allowFrom: [] },
           account: { accountId: "acc", userId: "u1", cdnBaseUrl: "http://127.0.0.1:9" },
-          bridge: { enqueueMessage: async (...args) => { enqueued.push(args); } },
+          bridge: { enqueueMessage: async (...args) => { enqueued.push(args); }, noteIncoming: () => {} },
           pending,
           sendText: async (_to, text) => { notices.push(text); },
         });
@@ -1269,6 +1269,663 @@ function check(name, ok, detail) {
   check("retiring stops the monitor, the Codex peer and the account watcher",
     /claimInstance\(async \(reason\) => \{\s*superseded = true;[\s\S]{0,200}watcher\.close\(\);\s*codexPeer\.close\(\);\s*await stopMonitor\(reason\);/.test(indexSrc));
   check("our own unload gives the slot up", /claim\.release\(\);/.test(indexSrc));
+}
+
+// ----------------------------- 连着发的几条一起回复(机主选的混合方式,参照 Claude Code)
+// 2026-10-12:机主先发图再打字,bot 4 秒内就回了图(字一般 7 秒后才到),再单独回字。机主定的:图片马上处理、
+// 不等;bot 还在第一次思考(没调工具、没发东西)时来了新消息,立刻打断重想(Claude Code 的 Ctrl+Enter);
+// 已经在干活就等这一步做完再读(Claude Code 的回车);要发回复时先读完新消息。
+{
+  const { mayRestartTurn, shouldHoldReply, MAX_RESTARTS, MAX_HOLDS, TOGETHER_HINT, HOLD_MESSAGE } = await import(join(ROOT, "lib/coalesce.js"));
+  const base = { wechatTurn: true, turnSender: "u1", sender: "u1", recorded: true, toolCalls: 0, restarts: 0 };
+  check("still on its first thought: a newer message restarts the turn", mayRestartTurn(base));
+  check("…only once the host has written the first message into the history (else it is lost)", !mayRestartTurn({ ...base, recorded: false }));
+  check("once the bot has called a tool (work or a reply) it is steered in instead", !mayRestartTurn({ ...base, toolCalls: 1 }));
+  check("a message from someone else never restarts the turn", !mayRestartTurn({ ...base, sender: "u2" }));
+  check("reminder and web-UI turns are never restarted", !mayRestartTurn({ ...base, wechatTurn: false }));
+  check("restarts are capped so a long burst still gets answered", !mayRestartTurn({ ...base, restarts: MAX_RESTARTS }));
+  check("a reply waits while the recipient has a message the next step will read", shouldHoldReply({ unread: true, holds: 0 }));
+  check("nothing unread: the reply goes out", !shouldHoldReply({ unread: false, holds: 0 }));
+  check("holds are capped too", !shouldHoldReply({ unread: true, holds: MAX_HOLDS }));
+  check("the hint asks for one answer; a held reply says not to resend it as is",
+    /一次回复/.test(TOGETHER_HINT) && /别把这条原样重发/.test(HOLD_MESSAGE));
+  const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  const toolSrc = readFileSync(join(ROOT, "src/tool.ts"), "utf-8");
+  const cancelAt = bridgeSrc.indexOf("live.cancel({ kind: \"hook\"");
+  const followAt = bridgeSrc.indexOf("live.followup(restart)");
+  check("restart cancels with the inbox kept, as a plugin (hook) cancellation",
+    cancelAt > 0 && /keepInbox: true/.test(bridgeSrc.slice(cancelAt, cancelAt + 200)));
+  check("…and follows up only after cancelling (the other order leaves the message unwoken)", followAt > cancelAt);
+  check("merge into a waiting message is tried before a restart",
+    bridgeSrc.indexOf("this.mergeIntoWaitingTurn(live, sender, parts, text)") > 0
+      && bridgeSrc.indexOf("this.mergeIntoWaitingTurn(live, sender, parts, text)") < bridgeSrc.indexOf("mayRestartTurn({"));
+  check("the turn's message counts as recorded only when the host writes it, pinned to that turn and step",
+    /event\.type === "user\/message" && this\.turnMessage !== undefined[\s\S]{0,120}=== this\.turnMessage\.id\)/.test(bridgeSrc)
+      && /recordedAt: \{ turn: this\.hostTurn, step: this\.hostStep \}/.test(bridgeSrc)
+      && /this\.turnMessage\.recordedAt\.turn === this\.hostTurn && this\.turnMessage\.recordedAt\.step === this\.hostStep/.test(bridgeSrc));
+  check("no waiting for a caption any more", !/CaptionHold|mediaCaptionWaitMs|mediaOnly/.test(bridgeSrc)
+    && !/mediaOnly/.test(readFileSync(join(ROOT, "src/inbound.ts"), "utf-8"))
+    && !/mediaCaptionWaitMs/.test(readFileSync(join(ROOT, "src/config.ts"), "utf-8")));
+  check("all three reply tools read before replying",
+    (toolSrc.match(/if \(await bridge\.holdReply\(sender, exec\?\.signal\)\) return \{ ok: false, held: true, message: bridge\.holdMessage \};/g) ?? []).length === 2
+      && /if \(recipient && await bridge\.holdReply\(recipient, exec\.signal\)\) return \{ ok: false, message: bridge\.holdMessage \};/.test(toolSrc));
+  check("…and send nothing once the turn has been stopped while they waited",
+    (toolSrc.match(/if \(exec\?\.signal\?\.aborted\) return \{ ok: false, message: "这一轮已经停止/g) ?? []).length === 2
+      && /if \(exec\.signal\?\.aborted\) return \{ ok: false, message: "这一轮已经停止，没有提问。" \};/.test(toolSrc));
+  check("unread = waiting for the next step (a message queued for a later turn does not hold a reply)",
+    /const waiting = new Set<string>\(\(inbox\?\.nextStep \?\? \[\]\)\.map\(\(m\) => m\.id\)\);/.test(bridgeSrc));
+  check("queued messages from one sender go into one turn",
+    /while \(this\.queue\.length > 0 && this\.queue\[0\]\.sender === first\.sender\) batch\.push/.test(bridgeSrc));
+  // The host behaviour this relies on, read from dsh-agent-loop / dsh-agent.
+  const loopPath = join(NPX, "@deepseek-ai/dsh-agent-loop/lib/index.js");
+  const loopSrc = existsSync(loopPath) ? readFileSync(loopPath, "utf-8") : "";
+  check("host: a wake after an abort opens the next turn (cancel → followup restarts)",
+    /wakingAfterAbort/.test(loopSrc) && /keepInbox/.test(loopSrc) && /wakeRequested = true/.test(loopSrc));
+  check("host: a claimed message is written into the history only when its step starts (why a restart waits)",
+    /this\.inbox\.claim\(target, position\.turn\)/.test(loopSrc) && /if \(firstAttempt\) for \(const message of decision\.messages\)/.test(loopSrc));
+  check("host: steer goes to the next step, and a step boundary takes every steered message at once",
+    /steer\(input\) \{\s*this\.send\(input, "next-step", true\);/.test(loopSrc)
+      && /const claimed = this\.mutate\("next-step", 0, this\.nextStep\.length, \[\], false\);/.test(loopSrc));
+  check("host: a turn goes on while steered input waits (it does not end with it unread)",
+    /if \(turnEnds && this\.inbox\.nextStep\.length === 0\) break;/.test(loopSrc));
+  const agentTypesPath = join(NPX, "@deepseek-ai/dsh-agent/lib/types/runtime-types.d.ts");
+  const agentTypes = existsSync(agentTypesPath) ? readFileSync(agentTypesPath, "utf-8") : "";
+  check("host: agents expose the inbox (nextStep, replace)",
+    /readonly inbox: Inbox;/.test(agentTypes) && /readonly nextStep: readonly UserMessage\[\];/.test(agentTypes)
+      && /replace\(messageId: MessageId, newMessage: UserMessage\): boolean;/.test(agentTypes));
+}
+
+// ------------------------- 同一套路由,接一个照宿主语义写的假 agent 整条跑一遍
+// 宿主 0.2.0 的 agent-loop:一轮开始就把消息从 inbox 里取走,到这一步真正开始才写进历史;steer 进 next-step,
+// 下一步开始时连同其他 steer 一起取走;cancel 中止当前活动,中止后再 wake 的消息排到下一轮并被记住;whenIdle
+// 跟到接替的那一轮;维护任务(压缩)期间 wake 进来的消息先等着。假 agent 的「回复」走真 bridge 的 holdReply。
+{
+  const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+  const { Backlog } = await import(join(ROOT, "lib/backlog.js"));
+  const { setLogLevel } = await import(join(ROOT, "lib/ilink/util/logger.js"));
+  const { DEFAULT_CONFIG } = await import(join(ROOT, "lib/config.js"));
+  const { TOGETHER_HINT, MAX_HOLDS, MAX_RESTARTS } = await import(join(ROOT, "lib/coalesce.js"));
+  setLogLevel("error");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const abortableSleep = (ms, signal) => new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  const textOf = (m) => m.content.filter((b) => b.type === "text").map((b) => b.text.replace(/^\[微信消息 [^\]]*\] /, "")).join(" ");
+
+  class HostLikeAgent {
+    constructor(bridge, sessionId, { recordDelayMs = 5, thinkMs = 80, workMs = 0, sender = "u1", failAfterWork = false, textOnlyFirstStep = false } = {}) {
+      Object.assign(this, { bridge, sessionId, recordDelayMs, thinkMs, workMs, sender, failAfterWork, textOnlyFirstStep });
+      this.turnNo = 0;
+      this.failNext = false;
+      this.phase = { kind: "idle" };
+      this.lists = { "next-turn": [], "next-step": [] };
+      this.activityDone = Promise.resolve();
+      this.recorded = [];
+      this.replies = [];
+      this.unread = [];
+      this.held = 0;
+      this.aborts = 0;
+      this.sentTo = [];
+      this.onReply = undefined;
+      const lists = this.lists;
+      this.inbox = {
+        get nextStep() { return lists["next-step"]; },
+        get nextTurn() { return lists["next-turn"]; },
+        replace(id, message) {
+          for (const list of Object.values(lists)) {
+            const i = list.findIndex((m) => m.id === id);
+            if (i >= 0) { list[i] = message; return true; }
+          }
+          return false;
+        },
+        remove(id) {
+          for (const list of Object.values(lists)) {
+            const i = list.findIndex((m) => m.id === id);
+            if (i >= 0) { list.splice(i, 1); return true; }
+          }
+          return false;
+        },
+      };
+    }
+    get status() { return this.phase.kind === "running" ? "running" : "idle"; }
+    get hasPending() { return this.lists["next-turn"].length + this.lists["next-step"].length > 0; }
+    emit(type, data) { this.bridge.onSessionEvent({ id: this.sessionId }, { type, data, seq: 0 }); }
+    followup(m) { this.send(m, "next-turn", true); }
+    steer(m) { this.send(m, "next-step", true); }
+    inject(m) { this.send(m, "next-step", false); }
+    send(m, target, wake) {
+      const afterAbort = wake && this.phase.kind === "running" && this.phase.abort.signal.aborted;
+      this.lists[afterAbort ? "next-turn" : target].push(m);
+      if (wake) this.wakeDriver(afterAbort);
+    }
+    cancel(cause, opts = {}) {
+      if (!opts.keepInbox) {
+        this.lists["next-turn"].length = 0;
+        this.lists["next-step"].length = 0;
+        if (this.phase.kind !== "idle") this.phase.wakeRequested = false;
+      }
+      if (this.phase.kind !== "idle") this.phase.abort.abort(cause);
+    }
+    wakeDriver(afterAbort = false) {
+      if (this.phase.kind !== "idle") {
+        if (this.phase.kind === "maintenance" || afterAbort) this.phase.wakeRequested = true;
+        return;
+      }
+      const driver = Promise.withResolvers();
+      this.activityDone = driver.promise;
+      this.phase = { kind: "running", abort: new AbortController(), wakeRequested: false };
+      this.kick().then(driver.resolve, driver.reject);
+    }
+    async whenIdle() { let a; do await (a = this.activityDone); while (a !== this.activityDone); }
+    /** A between-turn task (compaction) holding the agent for `ms`. */
+    maintain(ms) {
+      const done = Promise.withResolvers();
+      const phase = { kind: "maintenance", abort: new AbortController(), wakeRequested: false };
+      this.phase = phase;
+      this.activityDone = done.promise;
+      setTimeout(() => {
+        this.phase = { kind: "idle" };
+        if (phase.wakeRequested && this.hasPending) this.wakeDriver();
+        done.resolve();
+      }, ms);
+    }
+    async kick() {
+      try { while (await this.turn()); } catch { /* contained, like the host */ } finally {
+        const { wakeRequested } = this.phase;
+        this.phase = { kind: "idle" };
+        if (wakeRequested && this.hasPending) this.wakeDriver();
+      }
+    }
+    async turn() {
+      const phase = this.phase;
+      const { signal } = phase.abort;
+      signal.throwIfAborted();
+      const turnNo = ++this.turnNo;
+      this.emit("turn/start", { turn: turnNo });
+      let claimed = [...this.lists["next-step"].splice(0), ...this.lists["next-turn"].splice(0, 1)];
+      let worked = false;
+      let step = 0;
+      try {
+        while (true) {
+          step += 1;
+          this.emit("step/start", { turn: turnNo, step });
+          await abortableSleep(this.recordDelayMs, signal); // pre-step hooks, request preparation
+          for (const m of claimed) { this.recorded.push(textOf(m)); this.unread.push(textOf(m)); this.emit("user/message", m); }
+          await abortableSleep(this.thinkMs, signal); // the model's request
+          if (this.failNext) { this.failNext = false; throw new Error("llm request failed"); }
+          if (step === 1 && this.textOnlyFirstStep) {
+            // The model answered in plain text, no tool call: the step ends, and
+            // the host goes on only because steered input is waiting.
+            if (this.lists["next-step"].length === 0) break;
+          } else if (this.unread.length > 0 && this.workMs > 0 && !worked) {
+            this.emit("tool/call", { name: "read" }); // work the model chose: it runs to the end
+            await sleep(this.workMs);
+            this.emit("tool/result", {});
+            worked = true;
+            if (this.failAfterWork) { this.failAfterWork = false; throw new Error("llm request failed"); }
+          } else if (this.unread.length > 0) {
+            this.emit("tool/call", { name: "send_wechat_text" });
+            const to = this.bridge.activeSender ?? this.sender; // how the reply tools address it
+            if (await this.bridge.holdReply(to)) {
+              this.held += 1; // not sent; the next step reads what came in
+            } else {
+              const text = this.unread.splice(0).join(" + ");
+              this.replies.push(text);
+              this.sentTo.push({ to, text });
+              this.bridge.noteAnswered(); // what send_wechat_text's sendTextTo does
+              this.onReply?.(text);
+            }
+            this.emit("tool/result", {});
+          } else if (this.lists["next-step"].length === 0) break;
+          claimed = this.lists["next-step"].splice(0);
+        }
+      } catch (error) {
+        if (signal.aborted) this.aborts += 1;
+        this.emit("turn/end", {});
+        throw error;
+      }
+      this.emit("turn/end", {});
+      if (!this.hasPending) return false;
+      phase.abort = new AbortController();
+      phase.wakeRequested = false;
+      return true;
+    }
+  }
+
+  const setup = (agentOpts, { sendText = async () => {}, backlog } = {}) => {
+    const config = { ...DEFAULT_CONFIG, sessionId: "sim-wechat", autoMemory: false, idleCompaction: false };
+    let agent;
+    const deps = { getAccount: () => null, getContextToken: () => "", pending: { hasFor: () => false, size: 0, popFor: () => undefined }, backlog };
+    const bridge = new WechatBridge({ agents: { get: () => agent } }, config, sendText, deps);
+    agent = new HostLikeAgent(bridge, "sim-wechat", agentOpts);
+    bridge.ensureAgent = async () => agent;
+    const settle = async () => {
+      for (let i = 0; i < 400; i++) {
+        await sleep(10);
+        if (agent.phase.kind === "idle" && bridge.worker === null) return;
+      }
+    };
+    const say = (text, sender = "u1") => bridge.enqueueMessage(sender, text, undefined);
+    return { bridge, agent, settle, say };
+  };
+  const show = (a) => JSON.stringify({ replies: a.replies, recorded: a.recorded, held: a.held, aborts: a.aborts });
+  const covers = (reply, ...parts) => reply !== undefined && parts.every((p) => reply.includes(p));
+
+  {
+    const { agent, settle, say, bridge } = setup();
+    await say("[图1]");
+    await sleep(40);
+    await say("这是什么");
+    await settle();
+    check("flow: a photo is taken up at once; its text arrives during the first thought → restarted, one reply",
+      agent.replies.length === 1 && covers(agent.replies[0], "图1", "这是什么") && agent.aborts === 1 && agent.held === 0, show(agent));
+    check("flow: …and the text is marked to be answered together", agent.recorded.some((t) => /这是什么/.test(t) && t.includes(TOGETHER_HINT)), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup();
+    const t0 = Date.now();
+    await say("[图1]");
+    await settle();
+    check("flow: a lone photo is answered without waiting for a caption",
+      agent.replies.length === 1 && agent.aborts === 0 && Date.now() - t0 < 600, show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ recordDelayMs: 60 });
+    await say("问题一");
+    await sleep(20);
+    await say("补充二");
+    await settle();
+    check("flow: a message before the host recorded the first → no cancel (nothing lost), read before the reply",
+      agent.aborts === 0 && agent.held === 1 && agent.replies.length === 1 && covers(agent.replies[0], "问题一", "补充二"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup();
+    await say("问题一");
+    await sleep(40);
+    void say("补充二");
+    void say("补充三");
+    await settle();
+    check("flow: two arriving together during the first thought → one restart, merged, one reply covering all",
+      agent.aborts === 1 && agent.replies.length === 1 && covers(agent.replies[0], "问题一", "补充二", "补充三"), show(agent));
+    check("flow: …with the hint once", agent.recorded.join(" ").split("一次回复").length === 2, show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup();
+    agent.maintain(150);
+    await say("问题一");
+    await sleep(40);
+    await say("补充二");
+    await settle();
+    check("flow: compaction holding the agent → the next message merges into the waiting one, one reply",
+      agent.aborts === 0 && agent.replies.length === 1 && agent.recorded.length === 1 && covers(agent.replies[0], "问题一", "补充二"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ workMs: 120 });
+    await say("[文件 report.pdf]");
+    await sleep(110);
+    await say("帮我看看第三页");
+    await settle();
+    check("flow: a message while the bot's own work runs is not cut short: read after that tool, one reply",
+      agent.aborts === 0 && agent.replies.length === 1 && covers(agent.replies[0], "report.pdf", "第三页"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ workMs: 40, thinkMs: 80 });
+    await say("[文件 report.pdf]");
+    await sleep(150);
+    await say("还有第五页");
+    await settle();
+    check("flow: after the work, while the bot is thinking up its reply → read before replying, one reply",
+      agent.aborts === 0 && agent.held === 1 && agent.replies.length === 1 && covers(agent.replies[0], "report.pdf", "第五页"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ thinkMs: 60 });
+    await say("问题一");
+    await sleep(100);
+    await say("补充二");
+    await settle();
+    check("flow: after the bot has replied, a newer message is a follow-up: no hint, its own reply",
+      agent.aborts === 0 && agent.replies.length === 2 && covers(agent.replies[0], "问题一") && covers(agent.replies[1], "补充二")
+        && !agent.recorded.some((t) => t.includes(TOGETHER_HINT)), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup();
+    await say("[图1]");
+    await sleep(25);
+    await say("[图2]");
+    await sleep(25);
+    await say("[图3]");
+    await sleep(25);
+    await say("这三张哪张好");
+    await settle();
+    check("flow: three photos then the text → one reply covering all four",
+      agent.replies.length === 1 && covers(agent.replies[0], "图1", "图2", "图3", "哪张好"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ thinkMs: 50 });
+    await say("一");
+    for (const t of ["二", "三", "四", "五", "六", "七"]) { await sleep(30); await say(t); }
+    await settle();
+    check(`flow: someone who keeps typing still gets answered (≤${MAX_RESTARTS} restarts, ≤${MAX_HOLDS} holds); nothing lost`,
+      agent.aborts <= MAX_RESTARTS && agent.held <= MAX_HOLDS && agent.replies.length >= 1
+        && covers(agent.replies.join(" | "), "一", "二", "三", "四", "五", "六", "七"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup();
+    await say("我的消息", "u1");
+    await sleep(20);
+    await say("别人的消息", "u2");
+    await settle();
+    check("flow: another sender's message waits for its own turn: each answer goes to the right person, nothing held",
+      agent.aborts === 0 && agent.held === 0 && JSON.stringify(agent.sentTo) === JSON.stringify([{ to: "u1", text: "我的消息" }, { to: "u2", text: "别人的消息" }]),
+      JSON.stringify(agent.sentTo));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ thinkMs: 60 });
+    await say("看看这个");
+    bridge.noteIncoming("u1", 1); // the photo reached clawbot and is still downloading
+    await sleep(150); // the bot has thought it over and wants to reply meanwhile
+    await say("[图1]");
+    bridge.noteIncoming("u1", -1);
+    await settle();
+    check("flow: text, then a photo still downloading when the bot wants to reply → it waits for the photo, one reply",
+      agent.replies.length === 1 && covers(agent.replies[0], "看看这个", "图1") && agent.held === 1, show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ workMs: 120, failAfterWork: true });
+    await say("[文件 report.pdf]");
+    await sleep(140); // the bot is already reading the file (its first tool) when this arrives
+    await say("帮我看看第三页");
+    await settle();
+    check("flow: a turn that fails with a steered message still unread → that message is answered next, not left behind",
+      agent.aborts === 0 && agent.lists["next-step"].length === 0 && covers(agent.replies.join(" | "), "第三页"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    // Timeline (thinkMs 120): the worker's turn records 问题一 at 5 ms, replies at ~125, its closing
+    // step thinks until ~250; the reminder turn then records at ~255 and thinks until ~375.
+    const { agent, settle, say, bridge } = setup({ thinkMs: 120 });
+    await say("问题一");
+    await sleep(40);
+    const { createUserMessage } = await import(join(NPX, "@deepseek-ai/dsh-llm/lib/index.js")).catch(() => ({}));
+    const reminder = createUserMessage
+      ? createUserMessage({ content: [{ type: "text", text: "提醒：10 点去实验室取样品" }], source: { kind: "schedule" } })
+      : { id: "rem-1", role: "user", content: [{ type: "text", text: "提醒：10 点去实验室取样品" }], source: { kind: "schedule" } };
+    agent.followup(reminder); // dsh-schedule follows up while the worker's turn runs: the host runs it next, same driver
+    await sleep(270); // ~310 ms: the reminder turn is on its first thought
+    await say("谢谢");
+    await settle();
+    check("flow: a reminder the host runs next in the worker's driver is never cancelled by a newer message",
+      agent.aborts === 0 && agent.recorded.some((t) => /取样品/.test(t)) && covers(agent.replies.join(" | "), "取样品", "谢谢"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ recordDelayMs: 60, textOnlyFirstStep: true });
+    await say("问题一");
+    await sleep(20);
+    await say("补充二"); // inside step 1's claim window: steered
+    await sleep(140); // step 1 ended with no tool call; step 2 has claimed 补充二 but not recorded it yet
+    await say("补充三");
+    await settle();
+    check("flow: no restart while a later step holds a claimed message (nothing lost)",
+      agent.aborts === 0 && covers(agent.recorded.join(" "), "问题一", "补充二", "补充三") && covers(agent.replies.join(" | "), "问题一", "补充二", "补充三"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    const { bridge } = setup();
+    bridge.noteIncoming("u1", 1);
+    const stop = new AbortController();
+    setTimeout(() => stop.abort(), 50);
+    const t0 = Date.now();
+    const held = await bridge.holdReply("u1", stop.signal);
+    check("flow: a reply waiting for a download stops waiting the moment the turn is stopped", held === false && Date.now() - t0 < 1_000);
+    bridge.noteIncoming("u1", -1);
+    await bridge.dispose();
+  }
+  {
+    const { agent, settle, say, bridge } = setup({ thinkMs: 80 });
+    agent.failNext = true;
+    agent.followup({ id: "web-1", role: "user", content: [{ type: "text", text: "网页上的问题" }], source: { kind: "user" } }); // a web turn the worker does not drive
+    await sleep(40);
+    await say("微信里补一句");
+    await settle();
+    await sleep(100);
+    await settle();
+    check("flow: a web or reminder turn that fails with a WeChat message unread → that message is still answered",
+      agent.aborts === 0 && covers(agent.replies.join(" | "), "微信里补一句"), show(agent));
+    await bridge.dispose();
+  }
+  {
+    // A reminder while WeChat will not let the bot write first; the owner writes again later.
+    const sent = [];
+    let windowOpen = false;
+    const sendText = async (_to, text) => {
+      if (!windowOpen) throw new Error("sendMessage ret=-2 errmsg=prepare failed");
+      sent.push(text);
+    };
+    const dir = join(tmpdir(), `clawbot-flow-backlog-${process.pid}`);
+    rmSync(dir, { recursive: true, force: true });
+    const backlog = new Backlog(join(dir, "backlog.json"));
+    const { agent, settle, say, bridge } = setup({}, { sendText, backlog });
+    agent.onReply = (text) => bridge.sendTextTo("u1", `回复：${text}`);
+    bridge.sendTextTo("u1", "记得 10 点去实验室取样品。");
+    bridge.sendTextTo("u1", "要回答的问题？", { uncapped: true, transient: true });
+    await sleep(30);
+    check("flow: a reminder WeChat refused is kept (a transient question is not)",
+      backlog.peek("u1").length === 1 && backlog.peek("u1")[0].text === "记得 10 点去实验室取样品。" && sent.length === 0);
+    bridge.onSessionEvent({ id: "sim-wechat" }, { type: "turn/end", data: {}, seq: 0 });
+    await sleep(30);
+    check("flow: nothing is retried before they write again", sent.length === 0 && backlog.peek("u1").length === 1);
+    windowOpen = true;
+    await say("早");
+    await settle();
+    await sleep(50);
+    check("flow: they write again → the reply first, then one digest with the kept reminder and when it was due",
+      sent.length === 2 && sent[0].startsWith("回复：") && sent[1].startsWith("有 1 条消息当时没能发出")
+        && /〔\d\d-\d\d 周. \d\d:\d\d〕\n记得 10 点去实验室取样品。/.test(sent[1]), JSON.stringify(sent));
+    check("flow: delivered → the backlog is empty, and the bot is told what went out late",
+      backlog.peek("u1").length === 0 && agent.lists["next-step"].some((m) => /\[补发\]/.test(textOf(m))));
+    await bridge.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  setLogLevel("info");
+}
+
+// ------------------------- 微信不让 bot 先开口时,消息先存着,对方下次发消息、回复完之后合并补发
+// 2026-10-12:iLink 只在对方最后一条消息之后约 24 小时内让 bot 主动发(日志:失败全在 24.8–53 小时,
+// 成功的提醒全在 20.5 小时以内)。以前 send_wechat_text 先说「已发送」,真发失败只进日志,提醒等于丢了。
+{
+  const bl = await import(join(ROOT, "lib/backlog.js"));
+  check("closed window: ret=-2 with or without errmsg",
+    bl.isSendWindowClosed(new Error("sendMessage ret=-2 errmsg=prepare failed"))
+      && bl.isSendWindowClosed("sendMessage ret=-2 errmsg=(empty); context_token was included …")
+      && !bl.isSendWindowClosed(new Error("sendMessage ret=-14 errmsg=session expired"))
+      && !bl.isSendWindowClosed(new Error("CDN upload server error: 500")));
+  check("due time reads like 10-13 周一 09:00", /^\d\d-\d\d 周[日一二三四五六] \d\d:\d\d$/.test(bl.dueStamp(new Date())));
+  check("one sentence: the first line, without its trailing colon",
+    bl.oneSentence("【clawbot】已部署到本机（还没发布）：\n1. 先发图再打字…") === "【clawbot】已部署到本机（还没发布）");
+  check("one sentence: cut at the first sentence end", bl.oneSentence("全部测试通过。顺带修了两个问题。") === "全部测试通过。");
+  check("one sentence: a long line is capped with …", bl.oneSentence("很".repeat(200), 60).length === 60 && bl.oneSentence("很".repeat(200), 60).endsWith("…"));
+  const at = (iso) => new Date(iso).toISOString();
+  const items = [
+    { id: "b", kind: "notice", at: at("2026-10-13T20:40:00Z"), source: "Claude", summary: "连发合并已部署到本机。" },
+    { id: "a", kind: "text", at: at("2026-10-13T13:00:00Z"), text: "记得 10 点去实验室取样品。" },
+    { id: "c", kind: "file", at: at("2026-10-14T13:00:00Z"), path: "/tmp/x/sunset.png", caption: "今晚的晚霞" },
+    { id: "d", kind: "file", at: at("2026-10-14T13:05:00Z"), path: "/tmp/x/report.pdf", caption: "季度报告" },
+  ];
+  const digest = bl.formatDigest(items, { fileExists: (p) => p.endsWith(".png") });
+  const one = digest.join("\n\n");
+  check("digest: one message, the reason first, the owner's chosen wording",
+    digest.length === 1 && one.startsWith("有 4 条消息当时没能发出（微信不允许 bot 在你一段时间没说话时主动发消息），按原定时间补上："));
+  check("digest: items in time order, each with when it was due",
+    one.indexOf("取样品") < one.indexOf("连发合并") && one.indexOf("连发合并") < one.indexOf("sunset.png")
+      && (one.match(/〔\d\d-\d\d 周. \d\d:\d\d〕/g) ?? []).length === 4);
+  check("digest: a text entry is its due time, then the text on the next line", /〔[^〕]+〕\n记得 10 点去实验室取样品。/.test(one));
+  check("digest: a notification keeps who sent it and one sentence", /〔[^〕]+〕Claude 的通知\n连发合并已部署到本机。/.test(one));
+  check("digest: files say they follow, or that they are gone",
+    /图片 sunset\.png（随后补发）/.test(one) && /文件 report\.pdf（文件已经不在了，没法补发）/.test(one));
+  check("digest: a file that follows carries its own caption; a gone file's caption is kept in the digest",
+    !one.includes("今晚的晚霞") && /文件 report\.pdf（文件已经不在了，没法补发）\n季度报告/.test(one));
+  const long = Array.from({ length: 6 }, (_, i) => ({ id: String(i), kind: "text", at: at(`2026-10-1${i}T13:00:00Z`), text: "字".repeat(300) }));
+  const parts = bl.formatDigest(long, { fileExists: () => true, maxChars: 800 });
+  check("digest: a long one splits between entries, the header only once",
+    parts.length > 1 && parts.every((p) => p.length <= 800) && parts.filter((p) => p.startsWith("有 6 条")).length === 1
+      && parts.join("").split("字".repeat(300)).length === 7);
+  check("digest: a file an earlier digest announced is not announced again",
+    bl.digestChunks([{ id: "f", kind: "file", at: at("2026-10-13T13:00:00Z"), path: "/tmp/x/a.png", announced: true }], { fileExists: () => true }).length === 0);
+  const chunks = bl.digestChunks(long, { fileExists: () => true, maxChars: 800 });
+  check("digest: each part knows which items it carries (forgotten as it goes out)",
+    chunks.length === parts.length && chunks.flatMap((c) => c.ids).join() === long.map((i) => i.id).join());
+  const dir = join(tmpdir(), `clawbot-backlog-${process.pid}`);
+  rmSync(dir, { recursive: true, force: true });
+  const file = join(dir, "backlog.json");
+  const store = new bl.Backlog(file);
+  const kept = store.add("u1", { kind: "text", at: at("2026-10-13T13:00:00Z"), text: "一" });
+  store.add("u1", { kind: "text", at: at("2026-10-13T14:00:00Z"), text: "二" });
+  store.add("u2", { kind: "text", at: at("2026-10-13T15:00:00Z"), text: "别人的" });
+  check("backlog: kept per recipient, oldest first, on disk with mode 0600",
+    store.peek("u1").map((i) => i.text).join() === "一,二" && new bl.Backlog(file).peek("u2").length === 1
+      && (statSync(file).mode & 0o777) === 0o600);
+  store.remove("u1", [kept.id]);
+  check("backlog: removing by id leaves what came in meanwhile", store.peek("u1").map((i) => i.text).join() === "二");
+  for (let i = 0; i < bl.BACKLOG_LIMIT + 5; i++) store.add("u3", { kind: "text", at: at("2026-10-13T13:00:00Z"), text: String(i) });
+  check("backlog: capped, dropping the oldest", store.peek("u3").length === bl.BACKLOG_LIMIT && store.peek("u3")[0].text === "5");
+  rmSync(dir, { recursive: true, force: true });
+  const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("a reply WeChat refused is kept; a question or upload notice is not",
+    /if \(!opts\?\.transient && isSendWindowClosed\(err\)\) this\.keep\(sender, \{ kind: "text", at: due, text \}\)/.test(bridgeSrc)
+      && /this\.sendTextTo\(sender, question, \{ uncapped: true, transient: true \}\)/.test(bridgeSrc)
+      && /bridge\.sendTextTo\(sender, label, \{ transient: true \}\)/.test(readFileSync(join(ROOT, "src/tool.ts"), "utf-8")));
+  check("the digest goes out only after they wrote again, and after the reply",
+    /if \(\(this\.lastInbound\.get\(to\) \?\? 0\) <= newest\) return;/.test(bridgeSrc)
+      && /this\.typing\.stop\(\);\s*this\.idleCompact\.noteIdle\(\);\s*\/\/ Answered[^\n]*\n\s*this\.deliverBacklog\(first\.sender\);/.test(bridgeSrc));
+  const toolSrc = readFileSync(join(ROOT, "src/tool.ts"), "utf-8");
+  check("send_wechat_file keeps a file WeChat refused and tells the model not to retry",
+    /if \(upload\.windowClosed\) \{[\s\S]{0,200}bridge\.keepFile\(sender, \{ path: resolved, caption, original \}\);[\s\S]{0,200}不用重试/.test(toolSrc));
+  const routeSrc = readFileSync(join(ROOT, "src/mcp-route.ts"), "utf-8");
+  check("an MCP notification WeChat refused is kept as one sentence and reported as deferred",
+    /if \(!isSendWindowClosed\(err\) \|\| deps\.backlog === undefined\) throw err;/.test(routeSrc)
+      && /kind: "notice"/.test(routeSrc) && /deferred: true/.test(routeSrc));
+}
+
+// ------------------------- 补发的几处边界(2026-10-12 审查):一次只补发一份;文件失败分「永远不行」和「下次再试」
+{
+  const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+  const { Backlog, FILE_ATTEMPTS } = await import(join(ROOT, "lib/backlog.js"));
+  const { setLogLevel } = await import(join(ROOT, "lib/ilink/util/logger.js"));
+  const { DEFAULT_CONFIG } = await import(join(ROOT, "lib/config.js"));
+  setLogLevel("error");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const dir = join(tmpdir(), `clawbot-backlog-edges-${process.pid}`);
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  const photo = join(dir, "sunset.png");
+  writeFileSync(photo, "png");
+  const make = ({ sendText, sendFile }) => {
+    const backlog = new Backlog(join(dir, `backlog-${Math.random().toString(36).slice(2)}.json`));
+    const injected = [];
+    const agent = { inbox: { nextStep: [], nextTurn: [] }, inject: (m) => injected.push(m), status: "idle" };
+    const config = { ...DEFAULT_CONFIG, sessionId: "sim-wechat", autoMemory: false, idleCompaction: false };
+    const deps = { getAccount: () => null, getContextToken: () => "", pending: { hasFor: () => false, size: 0, popFor: () => undefined }, backlog, sendFile };
+    const bridge = new WechatBridge({ agents: { get: () => agent } }, config, sendText, deps);
+    return { bridge, backlog, injected };
+  };
+  const past = new Date(Date.now() - 60_000).toISOString();
+  {
+    const sent = [];
+    const { bridge, backlog } = make({ sendText: async (_to, t) => { await sleep(40); sent.push(t); } });
+    backlog.add("u1", { kind: "text", at: past, text: "一" });
+    bridge.lastInbound.set("u1", Date.now());
+    bridge.deliverBacklog("u1");
+    bridge.deliverBacklog("u1");
+    await sleep(150);
+    check("backlog: two triggers while one delivery runs → the digest goes out once", sent.length === 1 && backlog.peek("u1").length === 0, JSON.stringify(sent));
+    await bridge.dispose();
+  }
+  {
+    let calls = 0;
+    const sent = [];
+    const { bridge, backlog, injected } = make({
+      sendText: async (_to, t) => { sent.push(t); },
+      sendFile: async () => { calls += 1; return { ok: false, windowClosed: false, permanent: false, message: "CDN upload server error: 500" }; },
+    });
+    backlog.add("u1", { kind: "file", at: past, path: photo });
+    for (let i = 0; i < FILE_ATTEMPTS; i++) {
+      bridge.lastInbound.set("u1", Date.now() + i);
+      bridge.deliverBacklog("u1");
+      await sleep(30);
+      if (i === 0) check("backlog: a file that fails for a passing reason is kept for the next message, marked as announced",
+        backlog.peek("u1").length === 1 && backlog.peek("u1")[0].attempts === 1 && backlog.peek("u1")[0].announced === true);
+    }
+    const digests = sent.filter((t) => t.startsWith("有 "));
+    check("backlog: a retried file is announced once, not in a new digest every time", digests.length === 1, JSON.stringify(sent));
+    check(`backlog: …given up after ${FILE_ATTEMPTS} tries with one line to the user and a note to the bot`,
+      calls === FILE_ATTEMPTS && backlog.peek("u1").length === 0
+        && sent.some((t) => /图片 sunset\.png 补发了 3 次都没发出去，没能补发。/.test(t))
+        && injected.length === 1 && /没能补发/.test(JSON.stringify(injected[0].content)), JSON.stringify(sent));
+    await bridge.dispose();
+  }
+  {
+    const { bridge, backlog } = make({
+      sendText: async () => {},
+      sendFile: async () => ({ ok: false, windowClosed: false, permanent: true, message: "too big" }),
+    });
+    backlog.add("u1", { kind: "file", at: past, path: photo });
+    bridge.lastInbound.set("u1", Date.now());
+    bridge.deliverBacklog("u1");
+    await sleep(30);
+    check("backlog: a file WeChat will never take (over the CDN ceiling) is dropped at once", backlog.peek("u1").length === 0);
+    await bridge.dispose();
+  }
+  {
+    const sent = [];
+    const { bridge, backlog } = make({ sendText: async (_to, t) => { sent.push(t); } });
+    backlog.add("u1", { kind: "text", at: new Date().toISOString(), text: "一" });
+    bridge.lastInbound.set("u1", Date.now() - 120_000);
+    bridge.deliverBacklog("u1");
+    await sleep(30);
+    check("backlog: nothing is sent unless they wrote after the last refusal", sent.length === 0 && backlog.peek("u1").length === 1);
+    await bridge.dispose();
+  }
+  {
+    const sent = [];
+    const { bridge, backlog } = make({ sendText: async (_to, t) => { sent.push(t); } });
+    backlog.add("u1", { kind: "text", at: past, text: "一" });
+    bridge.lastInbound.set("u1", Date.now());
+    await bridge.dispose();
+    bridge.deliverBacklog("u1");
+    await sleep(30);
+    check("backlog: a disposed (superseded) bridge leaves the delivery to the new one", sent.length === 0 && backlog.peek("u1").length === 1);
+  }
+  const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  const { occurrenceAt } = await import(join(ROOT, "lib/backlog.js"));
+  check("backlog: a reminder's own due time is read from dsh-schedule's message (even if it fired late)",
+    occurrenceAt("[SCHEDULE REMINDER]\nThis is a scheduled message from the user\noccurrence_at: 2026-10-06T17:30:00.000Z\nreminder_prompt_json: \"x\"") === "2026-10-06T17:30:00.000Z"
+      && occurrenceAt("没有时间") === undefined && occurrenceAt("occurrence_at: 不是时间") === undefined);
+  check("backlog: a refused reminder is stamped with that due time",
+    /this\.reminderDueAt = occurrenceAt\(text\) \?\? new Date\(\)\.toISOString\(\);/.test(bridgeSrc) && /const due = this\.reminderDueAt \?\? new Date\(\)\.toISOString\(\);/.test(bridgeSrc));
+  check("backlog: a message counts as received once it reaches the bot (not while an image still downloads)",
+    bridgeSrc.indexOf("this.lastInbound.set(sender, Date.now());") > bridgeSrc.indexOf("const task: QueuedMessage = { sender, text, message, parts };"));
+  check("backlog: after a reminder or web turn, unread messages are answered first, then the backlog goes out",
+    /if \(senders\.length > 0\) this\.afterOtherTurn\(senders\);/.test(bridgeSrc) && /this\.requeueUnread\(live\);\s*if \(this\.queue\.length > 0\) \{\s*this\.runWorker\(\);/.test(bridgeSrc));
+  check("backlog: detached work never leaves a rejection unhandled (DSH exits on one)",
+    /void this\.sendKeptFiles\(to, items\)\s*\.catch\(/.test(bridgeSrc) && /\.catch\(\(err: unknown\) => logger\.warn\(`afterOtherTurn: /.test(bridgeSrc));
+  rmSync(dir, { recursive: true, force: true });
+  setLogLevel("info");
 }
 
 console.log(`宿主: dsh ${HOST_VERSION}  (${NPX})`);

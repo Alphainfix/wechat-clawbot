@@ -7,7 +7,7 @@
  * collected from the durable `session/event` feed and sent back to the WeChat
  * user who triggered the turn.
  */
-import { readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { basename } from "node:path";
 
 import type { Context } from "@deepseek-ai/cordis";
@@ -35,12 +35,31 @@ import type { ClawbotConfig } from "./config.js";
 import { markSessionCreated, wasSessionCreated } from "./state.js";
 import { PendingRegistry, type PendingAnswer } from "./pending.js";
 import { TypingIndicator } from "./typing.js";
+import { HOLD_MESSAGE, INCOMING_WAIT_MS, MAX_HOLDS, MAX_RESTARTS, TOGETHER_HINT, mayRestartTurn, shouldHoldReply } from "./coalesce.js";
+import { Backlog, FILE_ATTEMPTS, digestChunks, dueStamp, fileLabel, isSendWindowClosed, occurrenceAt, type BacklogItem, type NewBacklogItem } from "./backlog.js";
+import type { FileUploadResult } from "./tool.js";
 
 /**
  * Tool calls that are the bot talking to the user, not working: they must not
  * bring 「正在输入」 back after a reply (see TypingIndicator.noteWorking).
  */
 const REPLY_TOOLS = new Set(["send_wechat_text", "send_wechat_file", "ask_user_question"]);
+
+/** One inbound WeChat message waiting for its turn; `parts` lets several merge into one. */
+type QueuedMessage = { sender: string; text: string; message: UserMessage; parts: unknown[] };
+
+/** A user message as the WeChat bridge appends it. */
+function wechatUserMessage(parts: unknown[]): UserMessage {
+  return createUserMessage({
+    content: parts as never,
+    // v4 sessions refuse the retired `{ kind: "plugin", plugin }` wrapper
+    // outright ("format v4 message requires a producer-owned source kind"),
+    // so every inbound WeChat message would fail to append. This is the exact
+    // kind the v3→v4 converter gives this plugin's history
+    // (`plugin:${name}` for a third-party producer), so old and new agree.
+    source: { kind: "plugin:wechat-clawbot" } as never,
+  });
+}
 import { IdleCompactor, IDLE_COMPACT_RATIO, hostCompactionThreshold } from "./idle-compact.js";
 import { registerSendFileTool } from "./tool.js";
 import { randomUUID } from "node:crypto";
@@ -58,6 +77,10 @@ export type BridgeDeps = {
   /** Pending WeChat interactions (approvals + questions). */
   pending: PendingRegistry;
   codexPeer?: CodexPeer;
+  /** Messages WeChat would not take yet (see backlog.ts); tests pass a temp one. */
+  backlog?: Backlog;
+  /** Upload one kept file when its backlog is delivered (index.ts wires uploadFileTo). */
+  sendFile?: (to: string, file: { path: string; caption?: string; original?: boolean }) => Promise<FileUploadResult>;
 };
 
 /**
@@ -97,7 +120,34 @@ export class WechatBridge {
   private selectionInstalled = new WeakSet<object>();
 
   /** Queued turns waiting for the serialized worker (oldest first). */
-  private readonly queue: Array<{ sender: string; text: string; message: UserMessage }> = [];
+  private readonly queue: QueuedMessage[] = [];
+  /** Whether the running turn has answered yet (sent, asked, or started a file). */
+  private answeredThisTurn = false;
+  /** Replies held this turn because the recipient wrote more (capped, see coalesce.ts). */
+  private holdsThisTurn = 0;
+  /** Texts the current queued turn answers (batch, merges, steered ones), for auto-memory. */
+  private chainTexts: string[] = [];
+  /** Tool calls in the current turn; 0 means the bot is still on its first thought. */
+  private toolCallsThisTurn = 0;
+  /** Restarts made while answering the current queued message (capped). */
+  private restarts = 0;
+  /**
+   * The message the worker's running turn answers. A newer one merges into it
+   * while the host has not picked it up (a restart settling, maintenance
+   * holding the agent); once written into the history (`recordedAt`, the host
+   * turn and step that did it), a restart may cancel that step without losing
+   * it. A restart's own message is `restarted` and carries TOGETHER_HINT.
+   */
+  private turnMessage: { id: UserMessage["id"]; parts: unknown[]; restarted: boolean; recordedAt?: { turn: number; step: number } } | undefined;
+  /** The host turn and step running now, from turn/start and step/start. */
+  private hostTurn = 0;
+  private hostStep = 0;
+  /** Messages each sender has put into the agent's inbox, by id; unread while still there. */
+  private readonly inboxIds = new Map<string, Set<string>>();
+  /** What those messages were, to answer them if a turn ends with them still waiting. */
+  private readonly inboxTasks = new Map<string, QueuedMessage>();
+  /** Messages per sender that reached clawbot but not the bridge yet (an image downloading). */
+  private readonly incoming = new Map<string, number>();
   /** Whether the WeChat tools are registered on the current agent scope. */
   private toolsRegistered = false;
   /** The sender whose turn is currently being driven (approvals go to them). */
@@ -124,6 +174,16 @@ export class WechatBridge {
   private readonly idleCompact: IdleCompactor;
   /** Tokens the last model request on this session carried, as reported by the provider. */
   private lastRequestTokens: number | undefined;
+  /** Messages WeChat would not take yet; sent after the user's next message is answered. */
+  private readonly backlog: Backlog;
+  /** When each sender's latest message reached the bot: that reopens WeChat's window. */
+  private readonly lastInbound = new Map<string, number>();
+  /** Recipients whose backlog is being delivered right now (one delivery at a time). */
+  private readonly delivering = new Set<string>();
+  /** Senders whose message was steered into a turn the worker does not drive (a reminder). */
+  private readonly steeredIntoOtherTurn = new Set<string>();
+  /** When the running reminder turn was due: what a refused reminder is stamped with. */
+  private reminderDueAt: string | undefined;
 
   constructor(ctx: Context, config: ClawbotConfig, sendText: SendTextFn, deps: BridgeDeps) {
     this.ctx = ctx;
@@ -131,6 +191,7 @@ export class WechatBridge {
     this.sendText = sendText;
     this.deps = deps;
     this.sessionId = SessionId(config.sessionId);
+    this.backlog = deps.backlog ?? new Backlog();
     this.typing = new TypingIndicator({
       getAccount: () => deps.getAccount(),
       getContextToken: (sender) => deps.getContextToken(sender),
@@ -223,7 +284,7 @@ export class WechatBridge {
    * Send one text message to a WeChat user, serialized behind every other
    * outbound message so delivery order is preserved.
    */
-  sendTextTo(sender: string, text: string, opts?: { uncapped?: boolean }): boolean {
+  sendTextTo(sender: string, text: string, opts?: { uncapped?: boolean; transient?: boolean }): boolean {
     // Per-turn message cap (mirrors RULE B's "约 10 条"): beyond 10 messages
     // in one turn, drop extras and warn. Resets when a new turn starts
     // (drainQueue for WeChat turns, the schedule branch of onSessionEvent for
@@ -236,15 +297,198 @@ export class WechatBridge {
       return false;
     }
     this.turnMessageCount += 1;
+    this.answeredThisTurn = true;
+    const due = this.reminderDueAt ?? new Date().toISOString();
     this.sendChain = this.sendChain.then(async () => {
       try {
         await this.sendText(sender, text);
         this.typing.noteDelivered(sender);
       } catch (err) {
-        logger.error(`sendTextTo: failed to ${sender}: ${String(err)}`);
+        // `transient` lines (a question the bot waits on, an upload notice)
+        // mean nothing later; everything else waits for the user's next message.
+        if (!opts?.transient && isSendWindowClosed(err)) this.keep(sender, { kind: "text", at: due, text });
+        else logger.error(`sendTextTo: failed to ${sender}: ${String(err)}`);
       }
     });
     return true;
+  }
+
+  /** send_wechat_file hit WeChat's closed window: keep the file for later. */
+  keepFile(to: string, file: { path: string; caption?: string; original?: boolean }): void {
+    this.keep(to, { kind: "file", at: this.reminderDueAt ?? new Date().toISOString(), ...file });
+  }
+
+  /** Keep what WeChat would not take now (see backlog.ts). */
+  private keep(to: string, item: NewBacklogItem): void {
+    try {
+      this.backlog.add(to, item);
+      logger.info(`backlog: WeChat will not let the bot write first now; kept a ${item.kind} for ${to} until they write again`);
+    } catch (err) {
+      logger.error(`backlog: could not keep a ${item.kind} for ${to}: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Send what WeChat would not take earlier, once `to` has written again and
+   * the bot has answered: one digest in time order (on the outbound chain, so
+   * it lands after the reply), then any files. One delivery at a time.
+   */
+  private deliverBacklog(to: string): void {
+    if (this.disposed || this.delivering.has(to)) return;
+    let items: BacklogItem[];
+    try {
+      items = this.backlog.peek(to);
+    } catch (err) {
+      logger.warn(`backlog: unreadable for ${to}: ${String(err)}`);
+      return;
+    }
+    if (items.length === 0) return;
+    // Only after they have written since the last failure; before that the
+    // window is still shut and the digest would just fail again.
+    const newest = Math.max(...items.map((item) => Date.parse(item.at)));
+    if ((this.lastInbound.get(to) ?? 0) <= newest) return;
+    this.delivering.add(to);
+    this.sendChain = this.sendChain.then(async () => {
+      try {
+        // A superseded instance (instance-guard.ts) leaves this to the new one.
+        if (this.disposed) {
+          this.delivering.delete(to);
+          return;
+        }
+        const digest = await this.sendDigest(to, items);
+        if (digest.delivered.length > 0) this.noteBacklogDelivered(digest.delivered);
+        if (!digest.complete) {
+          this.delivering.delete(to);
+          return;
+        }
+        // Uploads can take a minute: they run off the outbound chain, so the
+        // next replies are not held up behind them.
+        void this.sendKeptFiles(to, items)
+          .catch((err: unknown) => logger.error(`backlog: kept files for ${to} failed: ${String(err)}`))
+          .finally(() => this.delivering.delete(to));
+      } catch (err) {
+        // Never let the outbound chain reject (DSH exits on an unhandled rejection).
+        logger.error(`backlog: delivery for ${to} failed: ${String(err)}`);
+        this.delivering.delete(to);
+      }
+    });
+  }
+
+  /** The digest, part by part; each part's items are settled once it is out. */
+  private async sendDigest(to: string, items: readonly BacklogItem[]): Promise<{ delivered: BacklogItem[]; complete: boolean }> {
+    const byId = new Map(items.map((item) => [item.id, item]));
+    const delivered: BacklogItem[] = [];
+    for (const chunk of digestChunks(items, { fileExists: (p) => existsSync(p) })) {
+      try {
+        await this.sendText(to, chunk.text);
+      } catch (err) {
+        logger.warn(`backlog: digest for ${to} not delivered (${String(err)}); keeping the rest for next time`);
+        return { delivered, complete: false };
+      }
+      const carried = chunk.ids.map((id) => byId.get(id)!);
+      // A text or notice is delivered now, and so is a file that is gone (the
+      // digest said so). A file that is there has been announced: it follows.
+      const settled = carried.filter((item) => item.kind !== "file" || !existsSync(item.path));
+      this.forget(to, settled.map((item) => item.id));
+      try {
+        this.backlog.markAnnounced(to, carried.filter((item) => item.kind === "file" && existsSync(item.path)).map((item) => item.id));
+      } catch (err) {
+        logger.warn(`backlog: could not mark files as announced for ${to}: ${String(err)}`);
+      }
+      delivered.push(...settled.filter((item) => item.kind !== "file"));
+    }
+    return { delivered, complete: true };
+  }
+
+  /** Files a digest said would follow; give up with one line after FILE_ATTEMPTS. */
+  private async sendKeptFiles(to: string, items: readonly BacklogItem[]): Promise<void> {
+    const sentFiles: BacklogItem[] = [];
+    for (const item of items) {
+      if (this.disposed) break;
+      if (item.kind !== "file" || !existsSync(item.path)) continue;
+      const sent: FileUploadResult = this.deps.sendFile === undefined
+        ? { ok: false, windowClosed: false, permanent: true, message: "no file sender" }
+        : await this.deps.sendFile(to, { path: item.path, caption: item.caption, original: item.original })
+          .catch((err: unknown): FileUploadResult => ({ ok: false, windowClosed: isSendWindowClosed(err), permanent: false, message: String(err) }));
+      if (sent.ok) {
+        this.forget(to, [item.id]);
+        sentFiles.push(item);
+        continue;
+      }
+      logger.warn(`backlog: kept file ${item.path} not sent: ${sent.message}`);
+      // Too big for WeChat never changes. A shut window or a network/CDN
+      // failure may: it is retried after their next message, a few times at most.
+      let attempts = FILE_ATTEMPTS;
+      if (!sent.permanent) {
+        try { attempts = this.backlog.bumpAttempts(to, item.id); } catch { /* treated as used up */ }
+      }
+      if (attempts < FILE_ATTEMPTS) continue;
+      this.forget(to, [item.id]);
+      // The digest said it would follow: say once that it will not.
+      const why = sent.permanent ? "超过了微信能收的大小" : `补发了 ${FILE_ATTEMPTS} 次都没发出去`;
+      const line = `〔${dueStamp(new Date(item.at))}〕${fileLabel(item.path)} ${why}，没能补发。`;
+      try {
+        await this.sendText(to, line);
+      } catch (err) {
+        logger.warn(`backlog: could not tell ${to} that a file was given up: ${String(err)}`);
+      }
+      this.noteSession(`[补发] ${line}`);
+    }
+    logger.info(`backlog: sent ${sentFiles.length} kept file(s) to ${to}`);
+    if (sentFiles.length > 0) this.noteBacklogDelivered(sentFiles);
+  }
+
+  /**
+   * After a turn the worker did not drive (a reminder, a web turn) that
+   * someone's WeChat message was steered into: once the agent is idle, a
+   * message that turn never read (it failed) is answered first; then what
+   * WeChat refused earlier goes out.
+   */
+  private afterOtherTurn(senders: readonly string[]): void {
+    const live = this.ctx.agents.get(this.sessionId);
+    if (live === undefined) return;
+    void live.whenIdle().then(() => {
+      if (this.disposed || this.worker !== null) return; // the worker answers and delivers
+      this.requeueUnread(live);
+      if (this.queue.length > 0) {
+        this.runWorker();
+        return;
+      }
+      for (const sender of senders) this.deliverBacklog(sender);
+    }).catch((err: unknown) => logger.warn(`afterOtherTurn: ${String(err)}`));
+  }
+
+  /** Drop delivered (or hopeless) items from the backlog. */
+  private forget(to: string, ids: readonly string[]): void {
+    if (ids.length === 0) return;
+    try {
+      this.backlog.remove(to, ids);
+    } catch (err) {
+      logger.error(`backlog: could not clear ${ids.length} item(s) for ${to}: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Tell the bot what just went out late, so a reply to one of those messages
+   * makes sense to it. Injected, not followed up: it rides along with the next turn.
+   */
+  private noteBacklogDelivered(items: readonly BacklogItem[]): void {
+    const live = this.ctx.agents.get(this.sessionId);
+    if (!live) return;
+    const times = items.map((item) => Date.parse(item.at)).sort((a, b) => a - b);
+    const first = dueStamp(new Date(times[0]));
+    const last = dueStamp(new Date(times[times.length - 1]));
+    const span = first === last ? first : `${first} 至 ${last}`;
+    this.noteSession(`[补发] 刚才把之前没送达的 ${items.length} 条消息（原定 ${span}）补发给了对方。`);
+  }
+
+  /** A line for the bot about what was (or was not) delivered late; it rides along with the next turn. */
+  private noteSession(text: string): void {
+    try {
+      this.ctx.agents.get(this.sessionId)?.inject(wechatUserMessage([{ type: "text", text }]));
+    } catch (err) {
+      logger.warn(`backlog: could not note the delivery in the session: ${String(err)}`);
+    }
   }
 
   get id(): SessionId {
@@ -260,7 +504,7 @@ export class WechatBridge {
   askWechat(question: string, timeoutMs = 300_000, signal?: AbortSignal): Promise<string | null> {
     const sender = this.currentSender ?? this.deps.getAccount()?.userId;
     if (!sender || signal?.aborted) return Promise.resolve(null);
-    this.sendTextTo(sender, question, { uncapped: true });
+    this.sendTextTo(sender, question, { uncapped: true, transient: true });
     return new Promise<string | null>((resolve) => {
       let settled = false;
       const entry: PendingAnswer = {
@@ -837,36 +1081,184 @@ export class WechatBridge {
         ? "\n（图片没有附在本条消息里,请用视觉工具读上面那个路径来查看。）"
         : "\n（上面这张图已附在本条消息里,直接看图回应,不用再调视觉工具。）";
     }
-    const message = createUserMessage({
-      content: block === null
-        ? [{ type: "text", text: marked }]
-        : [{ type: "text", text: marked }, block as never],
-      // v4 sessions refuse the retired `{ kind: "plugin", plugin }` wrapper
-      // outright ("format v4 message requires a producer-owned source kind"),
-      // so every inbound WeChat message would fail to append. This is the exact
-      // kind the v3→v4 converter gives this plugin's history
-      // (`plugin:${name}` for a third-party producer), so old and new agree.
-      source: { kind: "plugin:wechat-clawbot" } as never,
-    });
+    const parts: unknown[] = block === null
+      ? [{ type: "text", text: marked }]
+      : [{ type: "text", text: marked }, block];
+    const message = wechatUserMessage(parts);
+    const task: QueuedMessage = { sender, text, message, parts };
+    // Now it reaches the bot (an image may have taken a while to download).
+    this.lastInbound.set(sender, Date.now());
     const live = this.ctx.agents.get(this.sessionId);
-    if (live && live.status === "running") {
-      // Interrupt-style insertion: steer into the running turn (next-step).
-      logger.info(`enqueueMessage: steering message (${text.length} chars) into running turn`);
+    if (this.worker !== null && sender === this.currentSender && this.mergeIntoWaitingTurn(live, sender, parts, text)) {
+      this.typing.start(sender);
+      return;
+    }
+    if (live && live.status === "running" && mayRestartTurn({
+      wechatTurn: this.worker !== null && this.turnMessage !== undefined,
+      turnSender: this.currentSender,
+      sender,
+      recorded: this.turnMessage?.recordedAt !== undefined
+        && this.turnMessage.recordedAt.turn === this.hostTurn && this.turnMessage.recordedAt.step === this.hostStep,
+      toolCalls: this.toolCallsThisTurn,
+      restarts: this.restarts,
+    })) {
+      // Still on its first thought, nothing called or sent: start over with
+      // both (Claude Code's "send now"). Cancel first, keeping the inbox, then
+      // follow up: the host opens the new turn once the aborted one settles (in
+      // the other order the message would sit in the inbox with nothing to wake it).
+      const restart = wechatUserMessage([...parts, { type: "text", text: TOGETHER_HINT }]);
+      try {
+        live.cancel({ kind: "hook", reason: "wechat: newer message from the same sender before any reply" } as never, { keepInbox: true });
+        live.followup(restart);
+        this.trackInbox({ sender, text, message: restart, parts });
+        this.restarts += 1;
+        this.chainTexts.push(text);
+        this.turnMessage = { id: restart.id, parts: [...parts], restarted: true };
+        logger.info(`enqueueMessage: newer message while the bot was still thinking; restarting the turn to answer both together (${this.restarts}/${MAX_RESTARTS})`);
+        this.typing.start(sender);
+        return;
+      } catch (err) {
+        logger.warn(`enqueueMessage: restart failed (${String(err)}); steering instead`);
+      }
+    }
+    // Steer only into a turn that answers this sender (or nobody yet, a web
+    // turn): steering someone else's message in would re-address the running
+    // turn's reply to them. Theirs waits for its own turn in the queue.
+    if (live && live.status === "running" && (this.currentSender === undefined || sender === this.currentSender)) {
+      // The bot is already working: let the step finish and read it at the
+      // next one, as Claude Code does with a message sent by Enter (see
+      // coalesce.ts). Before the turn has answered, it is marked to be answered
+      // together, and the reply tools hold until it has been read.
+      const together = this.worker !== null && sender === this.currentSender && !this.answeredThisTurn;
+      const steered = together ? wechatUserMessage([...parts, { type: "text", text: TOGETHER_HINT }]) : message;
+      logger.info(`enqueueMessage: steering message (${text.length} chars) into running turn${together ? " (to be answered together)" : ""}`);
       // Attribute the running turn's reply to the WeChat sender so the
       // steered response (which may merge GUI + WeChat context) reaches the
       // phone and is not dropped as "GUI-only".
       this.currentSender = sender;
       try {
-        live.steer(message);
+        live.steer(steered);
+        this.trackInbox({ ...task, message: steered });
+        if (this.worker !== null) this.chainTexts.push(text);
+        else this.steeredIntoOtherTurn.add(sender);
         this.typing.start(sender);
         return;
       } catch (err) {
         logger.warn(`enqueueMessage: steer failed (${String(err)}); falling back to queue`);
       }
     }
-    this.queue.push({ sender, text, message });
+    this.queue.push(task);
     logger.info(`enqueueMessage: queued sender=${sender} msgId=${message.id} queueDepth=${this.queue.length}`);
     void this.runWorker();
+  }
+
+  /**
+   * Add a newer message to the one the running turn has not picked up yet (a
+   * restart settling, or maintenance such as compaction holding the agent).
+   * False once the host has taken it; then the usual rules apply.
+   */
+  private mergeIntoWaitingTurn(live: Agent | undefined, sender: string, parts: unknown[], text: string): boolean {
+    const turn = this.turnMessage;
+    if (live === undefined || turn === undefined || turn.recordedAt !== undefined) return false;
+    const combined = [...turn.parts, ...parts];
+    const merged = wechatUserMessage(turn.restarted ? [...combined, { type: "text", text: TOGETHER_HINT }] : combined);
+    let replaced = false;
+    try {
+      replaced = live.inbox.replace(turn.id, merged);
+    } catch (err) {
+      logger.warn(`enqueueMessage: merging into the waiting message failed (${String(err)})`);
+    }
+    if (!replaced) return false;
+    this.turnMessage = { ...turn, id: merged.id, parts: combined };
+    const before = this.inboxTasks.get(turn.id);
+    this.inboxTasks.delete(turn.id);
+    this.trackInbox({ sender, text: before ? `${before.text}\n${text}` : text, message: merged, parts: combined });
+    this.chainTexts.push(text);
+    logger.info(`enqueueMessage: the bot had not picked up its message yet; merged this one into it`);
+    return true;
+  }
+
+  /** Remember a message `task.sender` put into the agent's inbox (unread while it is still there). */
+  private trackInbox(task: QueuedMessage): void {
+    const ids = this.inboxIds.get(task.sender) ?? new Set<string>();
+    ids.add(task.message.id);
+    this.inboxIds.set(task.sender, ids);
+    this.inboxTasks.set(task.message.id, task);
+  }
+
+  /** A message from `sender` reached clawbot (+1) or the bridge (-1); see INCOMING_WAIT_MS. */
+  noteIncoming(sender: string, delta: 1 | -1): void {
+    const n = (this.incoming.get(sender) ?? 0) + delta;
+    if (n > 0) this.incoming.set(sender, n);
+    else this.incoming.delete(sender);
+  }
+
+  /**
+   * After the worker's turn: messages still waiting in the agent's inbox (the
+   * turn failed, or ended before reading them) are taken out and answered
+   * next, instead of waiting for whatever the user sends after them.
+   */
+  private requeueUnread(agent: Agent): void {
+    const waiting = new Set<string>([...agent.inbox.nextStep, ...agent.inbox.nextTurn].map((m) => m.id));
+    for (const [id, task] of this.inboxTasks) {
+      if (!waiting.has(id)) {
+        this.inboxTasks.delete(id);
+        continue;
+      }
+      try {
+        if (!agent.inbox.remove(task.message.id)) continue;
+      } catch (err) {
+        logger.warn(`drainQueue: could not take back an unread message (${String(err)})`);
+        continue;
+      }
+      this.inboxTasks.delete(id);
+      this.inboxIds.get(task.sender)?.delete(id);
+      this.queue.push(task);
+      logger.info(`drainQueue: a message was still unread after the turn; answering it now`);
+    }
+  }
+
+  /**
+   * Whether `sender` has a message the next step will read: one still waiting
+   * in the agent's next-step inbox. One queued for a later turn does not count;
+   * holding a reply for it would only make the model wait for nothing.
+   */
+  private hasUnread(sender: string): boolean {
+    const ids = this.inboxIds.get(sender);
+    if (ids === undefined || ids.size === 0) return false;
+    const inbox = this.ctx.agents.get(this.sessionId)?.inbox;
+    const waiting = new Set<string>((inbox?.nextStep ?? []).map((m) => m.id));
+    for (const id of ids) if (!waiting.has(id)) ids.delete(id);
+    return ids.size > 0;
+  }
+
+  /**
+   * Read before replying (see coalesce.ts): true when a reply to `sender` has
+   * to wait because they wrote more that the model has not read yet. The
+   * reply tool then returns HOLD_MESSAGE and the next step reads it.
+   */
+  async holdReply(sender: string, signal?: AbortSignal): Promise<boolean> {
+    // A message from them is still on its way (an image downloading): let it
+    // arrive first, unless the turn is stopped meanwhile (the tool then checks
+    // its signal and sends nothing).
+    for (let waited = 0; (this.incoming.get(sender) ?? 0) > 0 && waited < INCOMING_WAIT_MS && signal?.aborted !== true; waited += 100) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (signal?.aborted === true) return false;
+    if (!shouldHoldReply({ unread: this.hasUnread(sender), holds: this.holdsThisTurn })) return false;
+    this.holdsThisTurn += 1;
+    logger.info(`reply held (${this.holdsThisTurn}/${MAX_HOLDS}): ${sender} wrote more that the bot has not read yet`);
+    return true;
+  }
+
+  /** The text a held reply tool returns. */
+  get holdMessage(): string {
+    return HOLD_MESSAGE;
+  }
+
+  /** A reply tool went ahead: later messages this turn are follow-ups, not part of the same answer. */
+  noteAnswered(): void {
+    this.answeredThisTurn = true;
   }
 
   /** Start the serialized worker if it is not already running. */
@@ -880,22 +1272,43 @@ export class WechatBridge {
   /** Drive queued turns one at a time; never rejects. */
   private async drainQueue(): Promise<void> {
     while (!this.disposed && this.queue.length > 0) {
-      const task = this.queue.shift()!;
-      this.currentSender = task.sender;
-      this.turnMessageCount = 0; // 新回合重置发送计数
-      this.typing.start(task.sender);
+      // Messages that piled up from one sender (an image and its text, a quick
+      // burst) go in as one message, so they get one answer.
+      const first = this.queue.shift()!;
+      const batch = [first];
+      while (this.queue.length > 0 && this.queue[0].sender === first.sender) batch.push(this.queue.shift()!);
+      const parts = batch.flatMap((t) => t.parts);
+      const message = batch.length === 1 ? first.message : wechatUserMessage(parts);
+      if (batch.length > 1) logger.info(`drainQueue: ${batch.length} messages from the same sender answered together`);
+      this.typing.start(first.sender);
       const started = Date.now();
       try {
         const agent = await this.ensureAgent();
+        if (agent.status === "running" && this.currentSender !== undefined && this.currentSender !== first.sender) {
+          // A turn for someone else (a reminder for the owner, another sender)
+          // is running: let it finish rather than re-address its reply.
+          logger.info(`drainQueue: waiting for the running turn to finish before answering ${first.sender}`);
+          await agent.whenIdle();
+        }
+        this.currentSender = first.sender;
+        this.turnMessageCount = 0; // 新回合重置发送计数
+        this.chainTexts = batch.map((t) => t.text);
+        this.toolCallsThisTurn = 0;
+        this.restarts = 0;
+        this.turnMessage = undefined;
         if (agent.status === "running") {
           // Mid-turn steer (unexpected via queue): inject into next-step so
           // the running turn absorbs the message instead of starting a new one.
           logger.info(`drainQueue: steering queued message into running turn`);
-          agent.steer(task.message);
+          agent.steer(message);
         } else {
-          agent.followup(task.message);
+          this.turnMessage = { id: message.id, parts, restarted: false };
+          agent.followup(message);
         }
+        this.trackInbox({ sender: first.sender, text: batch.map((t) => t.text).join("\n"), message, parts });
         await agent.whenIdle();
+        this.turnMessage = undefined;
+        this.requeueUnread(agent);
         // Automatic memory fallback: capture durable user facts from this
         // turn's message without relying on the model calling
         // remember_user_info (which it often skips).
@@ -905,7 +1318,7 @@ export class WechatBridge {
         // prompt assembly, so the NEXT user message already benefits. Doing
         // it off the worker's tail keeps rapid consecutive messages from
         // being delayed by file I/O or the LLM confirm call.
-        const turnText = task.text;
+        const turnTexts = [...this.chainTexts];
         // Opt-in (see ClawbotConfig.autoMemory). Since 2026-09-22 the
         // classifier goes through the host `llm` service on **this session's
         // own route**, so it is no longer a second data destination — the text
@@ -913,7 +1326,7 @@ export class WechatBridge {
         if (this.config.autoMemory) {
           void Promise.resolve().then(async () => {
             try {
-              await captureTurnMemory([turnText], this.memoryJudge());
+              await captureTurnMemory(turnTexts, this.memoryJudge());
             } catch (err) {
               logger.warn(`memory-auto: capture failed: ${String(err)}`);
             }
@@ -921,12 +1334,15 @@ export class WechatBridge {
         }
         logger.debug(`drainQueue: idle after ${Date.now() - started}ms`);
       } catch (err) {
-        logger.error(`drainQueue: turn failed sender=${task.sender} err=${String(err)}`);
+        logger.error(`drainQueue: turn failed sender=${first.sender} err=${String(err)}`);
+        this.turnMessage = undefined;
       }
       // 后面还有排队的消息就接着显示,否则收起「正在输入」,开始等空闲压缩。
       if (this.queue.length === 0) {
         this.typing.stop();
         this.idleCompact.noteIdle();
+        // Answered: now what WeChat would not take before (after the reply on the chain).
+        this.deliverBacklog(first.sender);
       }
     }
     this.currentSender = undefined;
@@ -954,6 +1370,38 @@ export class WechatBridge {
     }
     // Real work after a reply (search, shell, files…): 「正在输入」 comes back now
     // instead of after the quiet window. A reply tool is the answer itself.
+    if (event.type === "turn/start") {
+      this.answeredThisTurn = false;
+      this.holdsThisTurn = 0;
+      this.toolCallsThisTurn = 0;
+      this.reminderDueAt = undefined;
+      const turn = (event.data as { turn?: unknown } | undefined)?.turn;
+      this.hostTurn = typeof turn === "number" ? turn : this.hostTurn + 1;
+      this.hostStep = 0;
+    }
+    if (event.type === "step/start") {
+      const step = (event.data as { step?: unknown } | undefined)?.step;
+      this.hostStep = typeof step === "number" ? step : this.hostStep + 1;
+    }
+    if (event.type === "tool/call") this.toolCallsThisTurn += 1;
+    // The host takes a message out of the inbox before the step and writes it
+    // into the history only when the step starts; until this event a restart
+    // would cancel the turn and lose the message. Pinned to this turn and
+    // step: a reminder the host runs next in the same driver is never cancelled.
+    if (event.type === "user/message" && this.turnMessage !== undefined
+      && (event.data as { id?: unknown } | undefined)?.id === this.turnMessage.id) {
+      this.turnMessage = { ...this.turnMessage, recordedAt: { turn: this.hostTurn, step: this.hostStep } };
+    }
+    if (event.type === "user/message") {
+      const source = event.data?.source as { kind?: unknown; plugin?: unknown } | undefined;
+      if (source?.kind === "schedule" || source?.plugin === "schedule") {
+        // What a refused reminder is stamped with: when it was due (even if it
+        // fired late), not when the bot got round to it.
+        const text = ((event.data as unknown as { content?: ReadonlyArray<{ type?: string; text?: string }> } | undefined)?.content ?? [])
+          .map((b) => (b.type === "text" ? b.text ?? "" : "")).join("\n");
+        this.reminderDueAt = occurrenceAt(text) ?? new Date().toISOString();
+      }
+    }
     if (event.type === "tool/call" && this.currentSender) {
       const name = (event.data as { name?: unknown } | undefined)?.name;
       if (typeof name === "string" && !REPLY_TOOLS.has(name)) this.typing.noteWorking(this.currentSender);
@@ -962,6 +1410,9 @@ export class WechatBridge {
     if (event.type === "turn/end" && !this.worker) {
       this.typing.stop();
       this.idleCompact.noteIdle();
+      const senders = [...this.steeredIntoOtherTurn];
+      this.steeredIntoOtherTurn.clear();
+      if (senders.length > 0) this.afterOtherTurn(senders);
     }
     if (event.type === "user/message" && !this.worker) {
       // v4 drops the `plugin` field: dsh-schedule now writes `{ kind: "schedule" }`

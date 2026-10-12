@@ -206,6 +206,18 @@ export class InboundRouter {
       return;
     }
 
+    // Until it is handed to the bridge (an image may take seconds to download),
+    // the bot's reply tools give it a moment to arrive (see coalesce.ts).
+    this.bridge.noteIncoming(sender, 1);
+    try {
+      await this.route(msg, sender);
+    } finally {
+      this.bridge.noteIncoming(sender, -1);
+    }
+  }
+
+  /** Everything after the sender is known and allowed. */
+  private async route(msg: WeixinMessage, sender: string): Promise<void> {
     const plainText = extractPlainText(msg);
     const body = bodyFromItemList(msg.item_list);
     const quotePrefix = buildQuotePrefix(msg, this.bridge);

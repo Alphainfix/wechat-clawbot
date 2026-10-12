@@ -23,6 +23,7 @@ import { getMimeFromFilename } from "./ilink/media/mime.js";
 import { stripEmoji, stripWechatCodes } from "./emoji.js";
 
 import { appendMemoryEntry, oneOffReminderReason } from "./memory.js";
+import { isSendWindowClosed } from "./backlog.js";
 import { logger } from "./ilink/util/logger.js";
 
 export type SendFileToolDeps = {
@@ -263,18 +264,24 @@ export function registerSendFileTool(agentCtx: Context, deps: SendFileToolDeps):
           properties: {
             ok: { type: "boolean", required: true },
             message: { type: "string", required: true },
+            deferred: { type: "boolean" },
+            held: { type: "boolean" },
           },
         },
         render: (_args, value) => [
           {
             type: "text",
-            text: value.ok
-              ? `✅ 文件已发送到微信: ${value.message}`
-              : `❌ 发送失败: ${value.message}`,
+            text: value.held
+              ? `先没发，对方又发来了新消息: ${value.message}`
+              : value.deferred
+              ? `⏳ 已存下，稍后补发: ${value.message}`
+              : value.ok
+                ? `✅ 文件已发送到微信: ${value.message}`
+                : `❌ 发送失败: ${value.message}`,
           },
         ],
       },
-      async execute(args) {
+      async execute(args, exec) {
         const { path: rawPath, caption, original } = args as { path: string; caption?: string; original?: boolean };
         const bridge = deps.getBridge();
         if (!bridge) {
@@ -288,6 +295,10 @@ export function registerSendFileTool(agentCtx: Context, deps: SendFileToolDeps):
         if (!sender) {
           return { ok: false, message: "无法确定收件人（没有活跃的微信会话）" };
         }
+
+        // Read before replying: they wrote more that this reply has not seen.
+        if (await bridge.holdReply(sender, exec?.signal)) return { ok: false, held: true, message: bridge.holdMessage };
+        if (exec?.signal?.aborted) return { ok: false, message: "这一轮已经停止，文件没有发出。" };
 
         const resolved = path.isAbsolute(rawPath)
           ? path.normalize(rawPath)
@@ -305,108 +316,167 @@ export function registerSendFileTool(agentCtx: Context, deps: SendFileToolDeps):
 
         logger.info(`send_wechat_file: sending ${resolved} (${stat.size} bytes) to ${sender}`);
 
-        // Originals were sent verbatim here until full-resolution camera files
-        // (5568x3712, 5-12MB) started making the C2C CDN answer HTTP 500 —
-        // opaque, and each failure burned the whole retry ladder, so one photo
-        // hung for ~4 minutes and then failed. Downscale first unless the
-        // caller explicitly asked for the untouched file.
-        const prep = original === true
-          ? { path: resolved, bytes: stat.size, temp: false, note: undefined }
-          : compressForUpload(resolved, {
-              maxImageEdge: deps.config.maxImageEdge,
-              imageQuality: deps.config.imageQuality,
-              compressThresholdBytes: deps.config.compressThresholdBytes,
-            });
-
-        // Refuse before uploading what the CDN will certainly reject.
-        //
-        // Measured on this account: a 2.26MB payload uploads fine, a 4.1MB image
-        // gets an opaque HTTP 500, and 7.2MB / 18.3MB files get the same. The
-        // CDN never says "too large" — it just fails, three times, ~20s each.
-        //
-        // Two reasons this guard is worth having rather than letting it fail.
-        // Compression only exists for images (downscale + quality ladder); an
-        // archive or an .xpi cannot be shrunk, so for those a rejection is the
-        // final answer and spending a minute to reach it is pure waste. And the
-        // old failure text advised "downscale before sending", which is not
-        // something the user can do to a browser extension — advice that cannot
-        // be followed is worse than none.
-        // Same test `sendWeixinMediaFile` uses to pick the upload, so the guard
-        // is measured against the ceiling that will actually apply.
-        const isImage = getMimeFromFilename(prep.path).startsWith("image/");
-        const ceiling = isImage ? CDN_REJECT_ABOVE_IMAGE_BYTES : CDN_REJECT_ABOVE_FILE_BYTES;
-        if (prep.bytes > ceiling) {
-          const mb = (prep.bytes / (1024 * 1024)).toFixed(1);
-          const limit = (ceiling / (1024 * 1024)).toFixed(1);
-          logger.warn(
-            `send_wechat_file: ${prep.bytes} bytes exceeds the CDN ceiling; refused without uploading`,
-          );
-          if (prep.temp) { try { fs.unlinkSync(prep.path); } catch { /* best effort */ } }
-          return {
-            ok: false,
-            message:
-              `这个文件 ${mb} MB,超过微信 CDN 实测能收的上限(约 ${limit} MB),传上去只会拿到一个没有说明的 500。`
-              + (isImage
-                ? "把设置里的「图片长边上限」或「JPEG 质量」调低一点再试(压缩阈值也要低于这个上限才有用)。"
-                : "非图片走的是另一条上传通道,上限低得多,而且没法压缩 —— 只能换个方式给:压缩分卷、或者放云盘/AirDrop 发链接。"),
-          };
-        }
-
-        // Announce the upload only when it is actually going to make the user
-        // wait. A downscaled photo is a few hundred KB and lands within a
-        // second or two, so a "正在发送…" line arriving just ahead of the image
-        // reads as a duplicate of the image itself — the typing indicator below
-        // already covers that case. Big files (untouched originals, PDFs,
-        // archives, video) can take a minute, and there the notice is the only
-        // thing telling the user to wait.
-        if (prep.bytes >= deps.config.noticeMinBytes) {
-          const sizeMb = (prep.bytes / (1024 * 1024)).toFixed(1);
-          const label = prep.note !== undefined
-            ? `正在发送 \`${path.basename(resolved)}\`（已压缩 ${prep.note}），可能需要一会儿…`
-            : `正在发送 \`${path.basename(resolved)}\`（${sizeMb} MB），大文件可能需要一会儿…`;
-          bridge.sendTextTo(sender, label);
-        }
-
-        // 「正在输入」 while the upload runs. Usually already up for the whole
-        // turn (see typing.ts); this covers a file sent from a reminder turn.
-        bridge.showTyping(sender);
-
-        try {
-          await sendWeixinMediaFile({
-            filePath: prep.path,
-            to: sender,
-            text: deps.config.stripEmoji ? stripEmoji(caption ?? "") : stripWechatCodes(caption ?? ""),
-            opts: {
-              baseUrl: account.baseUrl,
-              token: account.token,
-              contextToken: bridge.contextTokenFor(sender),
-              timeoutMs: 30_000,
-            },
-            cdnBaseUrl: account.cdnBaseUrl,
-          });
-        } catch (err) {
-          logger.error(`send_wechat_file: failed ${resolved}: ${String(err)}`);
-          return {
-            ok: false,
-            message: `发送失败: ${err instanceof Error ? err.message : String(err)}`,
-          };
-        } finally {
-          // Drop the downscaled copy; the original on disk is never touched.
-          if (prep.temp) {
-            try {
-              fs.rmSync(prep.path, { force: true });
-            } catch (err) {
-              logger.debug(`send_wechat_file: temp cleanup failed (non-fatal): ${String(err)}`);
-            }
-          }
+        const upload = await uploadFileTo({
+          config: deps.config,
+          account,
+          to: sender,
+          contextToken: bridge.contextTokenFor(sender),
+          resolved,
+          bytes: stat.size,
+          caption,
+          original,
+          announce: (label) => { bridge.sendTextTo(sender, label, { transient: true }); },
+          // 「正在输入」 while the upload runs. Usually already up for the whole
+          // turn (see typing.ts); this covers a file sent from a reminder turn.
+          beforeUpload: () => {
+            bridge.noteAnswered();
+            bridge.showTyping(sender);
+          },
           // The file (or the failure) lands now: restart the keepalive clock so
           // the indicator does not flash back right after it.
-          bridge.noteDelivered(sender);
+          afterUpload: () => bridge.noteDelivered(sender),
+        });
+        if (upload.ok) return { ok: true, message: resolved };
+        if (upload.windowClosed) {
+          // WeChat will not let the bot write first right now: keep it and send
+          // it after the user's next message (see backlog.ts).
+          bridge.keepFile(sender, { path: resolved, caption, original });
+          return {
+            ok: true,
+            deferred: true,
+            message: `${resolved}（微信现在不让 bot 主动发消息，这个文件已存下，对方下次发消息、你回复完之后会自动补发，不用重试）`,
+          };
         }
-        return { ok: true, message: resolved };
+        return { ok: false, message: upload.message };
       },
     }),
   );
+}
+
+/** What one upload came to; `windowClosed` = WeChat would not let the bot write first. */
+/** `permanent`: WeChat will never take it (over the CDN ceiling); anything else may work later. */
+export type FileUploadResult = { ok: true } | { ok: false; windowClosed: boolean; permanent: boolean; message: string };
+
+/**
+ * Compress (unless `original`), refuse what the CDN will reject, then upload
+ * and send one file. send_wechat_file and the backlog's later delivery share it.
+ */
+export async function uploadFileTo(params: {
+  config: ClawbotConfig;
+  account: ResolvedWeixinAccount;
+  to: string;
+  contextToken: string;
+  resolved: string;
+  bytes: number;
+  caption?: string;
+  original?: boolean;
+  /** Gets a 「正在发送…」 line when the upload will make the user wait. */
+  announce?: (label: string) => void;
+  /** Right before the upload starts (after the size check). */
+  beforeUpload?: () => void;
+  /** When the upload has finished or failed. */
+  afterUpload?: () => void;
+}): Promise<FileUploadResult> {
+  const { config, account, to, contextToken, resolved, bytes, caption, original, announce, beforeUpload, afterUpload } = params;
+  // Originals were sent verbatim here until full-resolution camera files
+  // (5568x3712, 5-12MB) started making the C2C CDN answer HTTP 500 —
+  // opaque, and each failure burned the whole retry ladder, so one photo
+  // hung for ~4 minutes and then failed. Downscale first unless the
+  // caller explicitly asked for the untouched file.
+  const prep = original === true
+    ? { path: resolved, bytes, temp: false, note: undefined }
+    : compressForUpload(resolved, {
+        maxImageEdge: config.maxImageEdge,
+        imageQuality: config.imageQuality,
+        compressThresholdBytes: config.compressThresholdBytes,
+      });
+
+  // Refuse before uploading what the CDN will certainly reject.
+  //
+  // Measured on this account: a 2.26MB payload uploads fine, a 4.1MB image
+  // gets an opaque HTTP 500, and 7.2MB / 18.3MB files get the same. The
+  // CDN never says "too large" — it just fails, three times, ~20s each.
+  //
+  // Two reasons this guard is worth having rather than letting it fail.
+  // Compression only exists for images (downscale + quality ladder); an
+  // archive or an .xpi cannot be shrunk, so for those a rejection is the
+  // final answer and spending a minute to reach it is pure waste. And the
+  // old failure text advised "downscale before sending", which is not
+  // something the user can do to a browser extension — advice that cannot
+  // be followed is worse than none.
+  // Same test `sendWeixinMediaFile` uses to pick the upload, so the guard
+  // is measured against the ceiling that will actually apply.
+  const isImage = getMimeFromFilename(prep.path).startsWith("image/");
+  const ceiling = isImage ? CDN_REJECT_ABOVE_IMAGE_BYTES : CDN_REJECT_ABOVE_FILE_BYTES;
+  if (prep.bytes > ceiling) {
+    const mb = (prep.bytes / (1024 * 1024)).toFixed(1);
+    const limit = (ceiling / (1024 * 1024)).toFixed(1);
+    logger.warn(
+      `send_wechat_file: ${prep.bytes} bytes exceeds the CDN ceiling; refused without uploading`,
+    );
+    if (prep.temp) { try { fs.unlinkSync(prep.path); } catch { /* best effort */ } }
+    return {
+      ok: false,
+      windowClosed: false,
+      permanent: true,
+      message:
+        `这个文件 ${mb} MB,超过微信 CDN 实测能收的上限(约 ${limit} MB),传上去只会拿到一个没有说明的 500。`
+        + (isImage
+          ? "把设置里的「图片长边上限」或「JPEG 质量」调低一点再试(压缩阈值也要低于这个上限才有用)。"
+          : "非图片走的是另一条上传通道,上限低得多,而且没法压缩 —— 只能换个方式给:压缩分卷、或者放云盘/AirDrop 发链接。"),
+    };
+  }
+
+  // Announce the upload only when it is actually going to make the user
+  // wait. A downscaled photo is a few hundred KB and lands within a
+  // second or two, so a "正在发送…" line arriving just ahead of the image
+  // reads as a duplicate of the image itself — the typing indicator below
+  // already covers that case. Big files (untouched originals, PDFs,
+  // archives, video) can take a minute, and there the notice is the only
+  // thing telling the user to wait.
+  if (prep.bytes >= config.noticeMinBytes) {
+    const sizeMb = (prep.bytes / (1024 * 1024)).toFixed(1);
+    const label = prep.note !== undefined
+      ? `正在发送 \`${path.basename(resolved)}\`（已压缩 ${prep.note}），可能需要一会儿…`
+      : `正在发送 \`${path.basename(resolved)}\`（${sizeMb} MB），大文件可能需要一会儿…`;
+    announce?.(label);
+  }
+
+  beforeUpload?.();
+
+  try {
+    await sendWeixinMediaFile({
+      filePath: prep.path,
+      to,
+      text: config.stripEmoji ? stripEmoji(caption ?? "") : stripWechatCodes(caption ?? ""),
+      opts: {
+        baseUrl: account.baseUrl,
+        token: account.token,
+        contextToken,
+        timeoutMs: 30_000,
+      },
+      cdnBaseUrl: account.cdnBaseUrl,
+    });
+  } catch (err) {
+    logger.error(`send_wechat_file: failed ${resolved}: ${String(err)}`);
+    return {
+      ok: false,
+      windowClosed: isSendWindowClosed(err),
+      permanent: false,
+      message: `发送失败: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  } finally {
+    // Drop the downscaled copy; the original on disk is never touched.
+    if (prep.temp) {
+      try {
+        fs.rmSync(prep.path, { force: true });
+      } catch (err) {
+        logger.debug(`send_wechat_file: temp cleanup failed (non-fatal): ${String(err)}`);
+      }
+    }
+    afterUpload?.();
+  }
+  return { ok: true };
 }
 
 /**
@@ -510,16 +580,19 @@ function registerSendTextTool(agentCtx: Context, deps: SendFileToolDeps): void {
           properties: {
             ok: { type: "boolean", required: true },
             message: { type: "string", required: true },
+            held: { type: "boolean" },
           },
         },
         render: (_args, value) => [
           {
             type: "text",
-            text: value.ok ? `微信消息已发送: ${value.message}` : `微信消息发送失败: ${value.message}`,
+            text: value.held
+              ? `先没发，对方又发来了新消息: ${value.message}`
+              : value.ok ? `微信消息已发送: ${value.message}` : `微信消息发送失败: ${value.message}`,
           },
         ],
       },
-      async execute(args) {
+      async execute(args, exec) {
         const { text } = args as { text?: string };
         const content = (text ?? "").trim();
         if (!content) {
@@ -537,6 +610,9 @@ function registerSendTextTool(agentCtx: Context, deps: SendFileToolDeps): void {
         if (!sender) {
           return { ok: false, message: "无法确定收件人（没有活跃的微信会话）" };
         }
+        // Read before replying: they wrote more that this reply has not seen.
+        if (await bridge.holdReply(sender, exec?.signal)) return { ok: false, held: true, message: bridge.holdMessage };
+        if (exec?.signal?.aborted) return { ok: false, message: "这一轮已经停止，这条没有发出。" };
         const finalText = deps.config.stripEmoji ? stripEmoji(content) : stripWechatCodes(content);
         if (!bridge.sendTextTo(sender, finalText)) {
           return { ok: false, message: "这一轮已经发满 10 条，这条没有发出，本轮也不能再发了。" };
@@ -591,6 +667,10 @@ function registerWechatAskTool(agentCtx: Context, deps: SendFileToolDeps): void 
         if (!q) return { ok: false, message: "问题为空" };
         const bridge = deps.getBridge();
         if (!bridge) return { ok: false, message: "微信桥接未运行（监控未启动）" };
+        // Read before asking: what they just wrote may already answer it.
+        const recipient = bridge.activeSender ?? deps.getAccount()?.userId;
+        if (recipient && await bridge.holdReply(recipient, exec.signal)) return { ok: false, message: bridge.holdMessage };
+        if (exec.signal?.aborted) return { ok: false, message: "这一轮已经停止，没有提问。" };
         // Forward the turn's signal: a stopped turn withdraws its question
         // instead of leaving it to swallow the user's next message.
         const answer = await bridge.askWechat(q, undefined, exec.signal);

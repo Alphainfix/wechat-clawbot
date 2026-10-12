@@ -52,7 +52,7 @@ export class ClawbotMcpClient {
 }
 
 export function createClawbotMcpServer(client = new ClawbotMcpClient()): McpServer {
-  const server = new McpServer({ name: "wechat-clawbot", version: "1.0.0" });
+  const server = new McpServer({ name: "wechat-clawbot", version: "1.0.1" });
   const text = z.string().trim().min(1).max(32_000);
   const sessionId = z.string().trim().min(1).max(256);
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
@@ -91,8 +91,13 @@ export function createClawbotMcpServer(client = new ClawbotMcpClient()): McpServ
     }, annotations: drives,
   }, (args) => call(() => client.request("send", args)));
   server.registerTool("dsh_notify_wechat", {
-    description: "Send one user-authorized text notification to the QR-linked WeChat owner. The recipient is fixed. A Codex-labelled copy is recorded in the DSH WeChat conversation.",
-    inputSchema: { text }, annotations: messages,
+    description: "Send one user-authorized text notification to the QR-linked WeChat owner. The recipient is fixed. A Codex-labelled copy is recorded in the DSH WeChat conversation. If WeChat will not let the bot write first right now (the owner has not messaged it for a while), the notification is kept and sent later in one digest, reduced to `summary`; the result then says deferred: true. Do not retry.",
+    inputSchema: {
+      text,
+      summary: z.string().trim().min(1).max(120).optional()
+        .describe("One short sentence summing up the notification, used if it has to wait for a later digest. Omit to use its first sentence."),
+    },
+    annotations: messages,
   }, (args) => call(() => client.request("notify", { ...args, source: "Codex" })));
   server.registerTool("dsh_report_codex_progress", {
     description: "Publish current Codex task progress for DSH/Clawbot to query. Call at meaningful milestones and completion; use the selected Codex thread id. This stores a timestamped report and does not notify WeChat by itself.",

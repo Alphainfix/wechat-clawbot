@@ -8,6 +8,7 @@
  *
  * @module wechat-clawbot
  */
+import fs from "node:fs";
 import path from "node:path";
 
 import type { Context } from "@deepseek-ai/cordis";
@@ -27,6 +28,8 @@ import { registerMcpRoutes } from "./mcp-route.js";
 import { CodexPeer } from "./codex-peer.js";
 import { claimInstance } from "./instance-guard.js";
 import { CodexProgressStore } from "./codex-progress.js";
+import { Backlog } from "./backlog.js";
+import { uploadFileTo } from "./tool.js";
 import { ensureMemoryFile } from "./memory.js";
 import { isHostSchedule, migrateLegacyReminders, type HostSchedule } from "./schedule-migrate.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
@@ -180,6 +183,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
 
   let bridge: WechatBridge | null = null;
   const codexProgress = new CodexProgressStore();
+  /** Messages WeChat would not take yet; shared by the bridge and the MCP notify route. */
+  const backlog = new Backlog();
   const codexPeer = new CodexPeer(config, codexProgress, {
     askWechat: (question, signal) => bridge?.askWechat(question, 300_000, signal) ?? Promise.resolve(null),
   });
@@ -261,7 +266,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // one WeChat message to the owner. Registered here rather than beside
   // registerModelsRoute because it needs `sendText` and the account getter,
   // both defined just above.
-  registerMcpRoutes(ctx, { config, sendText, getAccount: () => currentAccount, codexProgress });
+  registerMcpRoutes(ctx, { config, sendText, getAccount: () => currentAccount, codexProgress, backlog });
 
   /** Pick the first bound account (v1 supports a single account). */
   const pickAccount = (): ResolvedWeixinAccount | null => {
@@ -297,6 +302,22 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       getAccount: () => currentAccount,
       getContextToken: (sender) => router?.contextTokenFor(sender) ?? "",
       pending,
+      backlog,
+      // A kept file goes through the same compression and CDN checks as send_wechat_file.
+      sendFile: async (to, file) => {
+        const bound = currentAccount;
+        if (!bound?.configured) return { ok: false, windowClosed: false, permanent: false, message: "no bound WeChat account" };
+        return uploadFileTo({
+          config,
+          account: bound,
+          to,
+          contextToken: router?.contextTokenFor(to) ?? "",
+          resolved: file.path,
+          bytes: fs.statSync(file.path).size,
+          caption: file.caption,
+          original: file.original,
+        });
+      },
     });
     router = new InboundRouter({
       config,

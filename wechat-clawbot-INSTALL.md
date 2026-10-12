@@ -1,333 +1,308 @@
-# wechat-clawbot 安装手册（写给替用户装这个插件的 AI 看）
+# wechat-clawbot 安装与排错手册
 
-> **适用于：`wechat-clawbot` 0.9.7 + DeepSeek Harness（DSH）0.1.7 到 0.2.x（在 0.1.7-rc.2、0.2.0-rc.2 上测过）。**
+> **适用版本**：wechat-clawbot **1.0.1**；DeepSeek Harness（DSH）**0.1.7 到 0.2.0**（在 0.1.7-rc.2 和 0.2.0-rc.2 上测过）。
 >
-> 读者假设：你是一个能跑命令的 agent，正在替某个人把 `wechat-clawbot` 装进他的 DSH。
-> README 讲的是「这插件是什么」，这份讲的是「怎么装成，以及装不成时那个报错到底在说什么」。
->
-> 每一条症状都是真出过的，不是设想出来的。
+> **写给谁**：一个能执行命令、正在替别人安装 wechat-clawbot 的 AI agent。人看也一样适用。
+> README 讲「它是什么、怎么用」，这份讲「怎么装好、怎么验收、出了问题怎么查」。
+> 文中的每个症状都真实出现过，不是推测。
 
 ---
 
-## 最重要的一句话：0.1.7 上，出问题是**静默**的
+## 先记住：失败往往是静默的
 
-DSH 0.1.5 时代，一个插件导入失败会让整个 `dsh` exit(1)——很吵，但一眼就看见。
-**0.1.7 改成了宽容模式**：失败的插件只在启动时打一行
+从 DSH 0.1.7 起，插件出问题时 DSH 不会退出，也不会弹错：
 
-```
-dsh: warning: N entries did not activate
-clawbot (…): failed to import
-```
+- 插件导入失败：启动时只打一行 `dsh: warning: N entries did not activate`，DSH 照常运行，只是这个插件不在了。
+- 插件版本不在 DSH 允许的范围内：整个插件被跳过，只有一行 `skipping profile bundle "wechat-clawbot": … incompatible with dsh …`。
+- 浏览器端缺服务：整个网页只剩一行「Failed to load plugins」。
 
-然后 DSH **照常运行**，只是那个插件不在了。网页照开、模型照用，**微信那头就是没反应**。
-浏览器那半边更狠：任何一个插件在 `inject` 里写了不存在的服务，整页卡在
-「Failed to load plugins」。
+网页能打开、模型能用、进程的退出码也正常，**唯独微信那头没反应**。所以不要凭「看起来正常」下结论，装完一定按[第 4 节的验收清单](#4-验收清单)逐项确认。
 
-所以**别看 exit code**（永远是好的），要看下面第 4、5 步的那几样东西。
+**日志在哪**：插件的日志写在 DSH 进程的标准输出和标准错误里。在终端里运行 `dsh web` 的，就在那个终端；用启动器托管的，看启动器写的日志文件（例如 dsh-whale 写在 `~/.dsh/logs/dsh-web.out.log` 和 `dsh-web.err.log`）。DSH 启动失败时还会自己写一份诊断：`~/.dsh/logs/startup-*.log`。注意：DSH 内部框架（cordis）的错误在 web 模式下不会打印出来，所以「failed to import」后面通常看不到原因，要去 startup 日志里找。
 
 ---
 
-## 0. 先确认两件事，再动手
+## 1. 动手之前
 
-| 要确认的 | 怎么查 | 不满足会怎样 |
+| 检查项 | 怎么查 | 不满足会怎样 |
 |---|---|---|
-| DSH 版本 | `npx @deepseek-ai/dsh --version` | **需要 0.1.7 到 0.2.x**。插件的 peerDependencies 写的是 `^0.1.7-rc.1 \|\| ^0.2.0-rc.1`，0.1.7 起的**版本门禁**会拿运行时版本去比，不满足就把整个插件跳过（日志：`skipping profile bundle "wechat-clawbot": … is incompatible with dsh …`，dsh 本身照常运行）。**0.9.6 及更早的 peer 止于 0.2.0 以下，装在 0.2.0 上会被跳过**——升到 0.9.7。装在 0.1.5 上则是浏览器端找不到 `configForms`、整页白屏 |
-| 包管理器 | `pnpm --version` | `dsh plugin add` 走 pnpm |
+| DSH 版本 | `dsh --version` | 需要 **0.1.7 到 0.2.0**。插件声明的范围是 `^0.1.7-rc.1 \|\| ^0.2.0-rc.1`，不在范围内会被整个跳过（见上一节）。0.1.5 及更早：浏览器端整页白屏。**0.2.1 的预览版**：插件能加载，但 bot 无法设定时提醒，见[已知问题](#已知问题) |
+| Node.js | `node --version` | 需要 22 或更高 |
+| pnpm | `pnpm --version` | `dsh plugin add` 用 pnpm 安装 |
+| 手机微信 | 微信 → 设置 → 插件 | 要能看到官方的「**微信ClawBot**」插件；第一次扫码时可能会提示升级微信 |
+| 一台常开的电脑 | — | bot 只在 DSH 运行时在线 |
 
-如果用户**已经在 0.1.5 上用着这个插件**，要升 DSH，**先看第 2 节**——顺序错了会丢设置。
+如果你同时还要升级 DSH，**先读[第 8 节](#8-升级-dsh)再动手**，有几次升级的顺序会影响设置和提醒能不能保住。
 
 ---
 
-## 1. 装
-
-两种方式，效果一样：
+## 2. 安装
 
 ```bash
 dsh plugin --profile web add wechat-clawbot
 ```
 
-或者在网页侧边栏 **「插件」→「添加插件」** 里填 `wechat-clawbot`（0.1.7 自带的插件管理页，会自动测速选 npmmirror 镜像）。
+也可以在 DSH 网页侧边栏的「插件」→「添加插件」里搜 `wechat-clawbot`（插件页会自动测速，选择更快的 npm 镜像）。要固定版本就写 `wechat-clawbot@1.0.1`。
 
-装完重启一次 DSH（服务端代码要重启才加载）。
+装完**重启一次 DSH**：插件的服务端代码只在启动时加载。
 
 ---
 
-## 2. 从 DSH 0.1.5 升级上来的：顺序决定设置会不会丢
-
-0.1.7 **退役了 `~/.dsh/settings.yaml`**，配置统一存进 profile 的
-`~/.dsh/profiles/<profile>/cordis.patch.yml`。第一次启动 0.1.7 时，宿主把 settings.yaml
-**单向导入**进 patch，然后把原文件改名成 `settings.yaml.imported`。导入规则很硬，而且
-**被拒的段落只写一行 warn、stderr 里什么都看不到**：
-
-1. **段名必须等于插件的 entry id。** 本插件的 entry id 是 `clawbot`，段名 `clawbot:` 正好对得上。
-   （别的插件未必——用 `dsh --profile web --dump-config` 看每个 entry 的 `id:`。）
-2. **该段的每个字段都必须是插件声明的「热字段」（`.volatile()`）**，有一个不是，整段丢弃。
-   0.9.4 把所有能在设置卡片里改的字段都标成了 volatile；但如果用户**手写**过冷字段
-   （`sessionId`、`apiBaseUrl`、`autoStart` 这类）到 settings.yaml 的 `clawbot:` 段里，
-   那一段就会整段被拒——先把冷字段挪进 cordis.patch.yml 的 `- id: clawbot` 块。
-3. **导入发生在插件加载完之后，所以插件必须先是 0.9.4。** 如果第一次启动 0.1.7 时插件
-   还是 0.9.3（它 import 了 0.1.7 已删除的 `installSettingsSection`，会导入失败），
-   `clawbot` 这个 entry 就没有可配置的 schema，**整段设置被丢**，bot 会退回默认模型、
-   丢掉白名单、图片参数等全部设置。
-
-所以顺序是：
+## 3. 绑定微信（必须由本人完成）
 
 ```bash
-# ① 备份（0.1.5 读 settings.yaml，回滚要用）
+npx -y -p wechat-clawbot clawbot login
+```
+
+终端里会出现一个二维码，**让用户本人**用微信「扫一扫」扫码并确认。不要替用户扫码，也不要接触对方的凭据。绑定信息保存在 `~/.dsh/clawbot/accounts/`。
+
+正在运行的 DSH 会自动发现新绑定的账号，并开启一个对话，不用重启。日志里会依次出现：
+
+```
+startMonitor: monitoring account=…
+monitor started baseUrl=https://ilinkai.weixin.qq.com
+```
+
+如果看到下面这一行，说明还没绑定成功：
+
+```
+startMonitor: no bound account; waiting for `clawbot login`
+```
+
+其他命令（同样加 `npx -y -p wechat-clawbot` 前缀）：`clawbot status` 查看绑定的是谁，`clawbot logout` 解除绑定。
+
+默认**只有扫码的那个人**能给 bot 发消息，其他人的消息会被直接忽略。要加人，在设置卡片的「允许给 bot 发消息的人」里填对方的微信用户 id。
+
+---
+
+## 4. 验收清单
+
+全部满足才算装好。最后两项不能省：前面全部正常、一发消息却不通的情况真实发生过。
+
+| 检查项 | 怎么查 | 期望结果 |
+|---|---|---|
+| 服务在运行 | `lsof -nP -iTCP:3080 -sTCP:LISTEN`（默认端口 3080） | 有一行 LISTEN |
+| 插件已激活 | 日志里搜 `did not activate`、`failed to import`、`incompatible with dsh` | 都搜不到 |
+| 插件页状态 | 网页「插件」→ wechat-clawbot | 两个组件都是「运行中」 |
+| 只有一个实例 | 日志里的 `clawbot instance #N active` | 当前只有一个；改过要重启的设置后会出现更大的编号和 `superseded by instance #N`，属于正常 |
+| 微信通道已连接 | 日志里的 `monitor started baseUrl=https://ilinkai.weixin.qq.com` | 有这一行 |
+| 网页能加载 | 用带 token 的地址打开（见下） | 不是「Failed to load plugins」 |
+| 设置卡片可用 | 「插件」→ wechat-clawbot → 微信 Bot | 卡片能展开，字段能修改 |
+| **真实发一条消息** | 让用户在微信里发「在吗」 | **几秒内收到回复** |
+| **真实设一个提醒** | 让用户设一个两分钟后的提醒 | **提醒出现在微信里**，而不只是出现在网页里 |
+
+**网页地址**：固定是 `http://127.0.0.1:3080`，但每次启动 DSH 都会生成新的 token，启动输出里有一行完整地址：
+
+```bash
+grep -o 'http://127.0.0.1:3080/?token=[A-Za-z0-9_-]*' ~/.dsh/logs/dsh-web.out.log | tail -1
+```
+
+（这是 dsh-whale 写日志的位置；直接在终端运行的，去终端输出里找。）不带 token 打开只会看到一行 401 文本，这不是故障；用 token 登录一次后，30 天内都不用再带。
+
+**startup 日志里有 `EADDRINUSE` 不一定是故障**：守护程序重启 DSH 时偶尔会同时拉起两个进程，一个占到端口，另一个写下这份诊断后退出。判断服务是否在运行，看端口。
+
+---
+
+## 5. 配置
+
+**配置只有一个文件**：`~/.dsh/profiles/<profile>/cordis.patch.yml`，本插件对应其中的 `- id: clawbot` 块。设置卡片里的修改也会写回这个文件。DSH 写回时可能删掉注释、调整字段顺序，所以手动修改前先看一眼当前内容，再做精确替换。
+
+| 字段 | 在哪里改 | 什么时候生效 |
+|---|---|---|
+| 模型（provider、模型、思考等级）、允许发消息的人、图片相关四项、发文件预告阈值、emoji、审批等待超时、日志级别、拉活 Claude 会话的权限、开放 MCP 桥、空闲时整理对话、说明文件开关 | 网页「插件」→ wechat-clawbot → 微信 Bot | **立即生效**，微信连接不中断。日志：`设置已即时生效 […](没有重启,微信监听未中断)` |
+| `autoMemory`（自动记忆，默认开） | 只能手改配置文件 | 立即生效（下一条消息） |
+| `codexPeer`（Codex 会话联动，默认关） | 设置卡片或配置文件 | **会重启微信监听**（几秒） |
+| `sessionId`、`cwd`、`autoStart`、`forwardQuestions`、`apiBaseUrl`、`botAgent`、`codexTransport`、`codexSocket`、`codexBinary` | 只能手改配置文件 | **会重启微信监听**（几秒） |
+
+改过的字段在卡片上会标「已覆盖」，旁边有「重置」。
+
+关于「重启微信监听」：DSH 会在进程内重新加载插件。从 0.9.10 起，新实例会先停掉旧实例再开始监听，日志里能看到 `superseded by instance #N`。0.9.9 及更早没有这层保护，改一次这类设置就可能多出一份 bot，症状见[速查表](#9-症状速查)。
+
+---
+
+## 6. 要跟用户讲清楚的几个功能
+
+### 自动记忆（`autoMemory`，默认开）
+
+看起来像长期事实的短消息（「我住在…」「我不喝咖啡」），会原文交给**同一个模型**再判断一次：值不值得写进长期记忆。
+
+- **数据去向**：就是这个对话本来使用的模型，不会发给其他服务商。
+- **代价**：每条被选中的消息多一次模型请求。便宜的模型可以忽略；如果用户把 bot 挂在很贵的模型上，值得提醒一句。
+- **一次性提醒不会进记忆**：「明天十点开会」这类内容归定时提醒管。长期记忆每一轮都会整份放进系统提示词，过期的提醒会误导模型推算日期。
+- **怎么关**：在 `- id: clawbot` 块里加一行 `autoMemory: false`，保存后下一条消息生效。设置卡片上没有这个开关。关掉后，模型仍然可以主动调用 `remember_user_info` 记东西。
+
+装完一定要告诉用户这个功能是开着的、它做什么；关不关由用户决定。
+
+### 连着发的几条会一起回复
+
+参照 Claude Code 处理「它干活时你又发了消息」的两种方式：回车是等这一步做完再看，Ctrl+Enter 是立刻打断重来。bot 按当时在做什么分开处理，不让对方多等：
+
+- **图片和文件马上处理**，不会先等后面那句话。
+- **bot 还在第一次思考，没回复、也没调用任何工具**：立刻打断，带上新消息重新想，一次回复。同一条消息最多这样重来 3 次。定时提醒、网页里发的消息那一轮不会被打断。
+- **bot 已经开始干活**（读文件、搜索、跑命令）：不打断正在跑的工具；这一步做完，下一步就能看到新消息。
+- **bot 要发回复，而对方又补充了它还没读到的内容**：这条回复先不发（日志 `reply held`），读完再合在一起回。对方如果还有图片或文件正在下载，先等它到，最多等 8 秒。每轮最多这样等 3 次。
+- **bot 已经回复过**：新消息算接着聊，另外回复。
+- **bot 还没开始处理上一条**（比如正在空闲整理对话）：新消息直接并进上一条。
+- **某一轮出错中断**：在那一轮里并进去、还没被读到的消息会被拿出来重新回复，不会一直等到对方再发消息。
+
+日志里对应的几行：`restarting the turn to answer both together`、`steering message … (to be answered together)`、`reply held (1/3)`、`merged this one into it`、`a message was still unread after the turn; answering it now`。
+
+### 发不出去的消息会存着，下次一起补发
+
+微信只允许 bot 在用户最后一条消息之后的一段时间里主动发消息（实测约 24 小时）。超过这段时间，定时提醒、Claude Code / Codex 发来的通知都会被微信拒收，日志里是 `sendMessage ret=-2 errmsg=prepare failed`。
+
+这些消息不会丢：
+
+- 先存在 `~/.dsh/clawbot/backlog.json`，重启 DSH 也还在；
+- 用户下次发消息时，bot **先回复那条消息**，然后把存着的合并成一条补发（特别长时按条目分成几段）：开头一句说明原因，按时间顺序列出，每段标明原定送达的时间，定时提醒标的是它原定的时间；
+- Claude / Codex 的通知只保留一句话（发送方可以用 `summary` 参数自己给一句，不给就取第一句）；
+- 图片和文件在合并消息里注明，随后单独补发；文件已经不在了也会注明。补发失败时：超过微信大小上限的直接放弃，其他原因（网络、窗口又关了）留到下次再传（合并消息里只预告一次），最多试 3 次；放弃时会单独发一句告诉对方。
+
+日志里对应的两行：`backlog: WeChat will not let the bot write first now; kept a … until they write again`、`backlog: sent N kept message(s) to … after answering them`。
+
+### 空闲时整理对话（`idleCompaction`，默认开）
+
+对话越长，每条消息要带的上下文越多，越慢也越贵。开着这个功能时，bot 回复完、安静 10 分钟后，如果上下文已经接近 DSH 自动压缩的门槛（超过 85%），就调用 DSH 自带的 `/compact`，把旧对话整理成摘要。用户下一条消息来时不用再等压缩。
+
+启动日志里有一行自检：`idle-compact: /compact 可用; …`。关掉后只剩 DSH 在回复前压缩，那一条回复会多等十几秒。
+
+### 工作目录的说明文件（`workspaceInstructions`，默认开）
+
+DSH 的默认行为：bot 在哪个项目里干过活，那里的 AGENTS.md / CLAUDE.md 就会被放进对话；之后文件每改一次，再放一整份。说明文件又长又经常改的话，会白白占掉大量 token。
+
+关掉后，这些文件不再自动进入微信对话（网页里的对话不受影响），需要时 bot 可以自己去读。被拦下时日志会写：`workspace-instructions: kept … out of the WeChat session`。
+
+### Codex 会话联动（`codexPeer`，默认关）
+
+打开后，bot 可以列出 Codex 项目和对话、读取历史、转发消息、查询进度。代价是每次请求多带 5 个工具，大约 1k token。改动会重启微信监听，日志里的 `ensureTools: WeChat tools registered (Codex tools on)` 说明已经生效。
+
+- 默认的 `socket` 模式需要一个正在运行的共享 Codex App Server；**桌面版 Codex 自己的服务是私有的，外部接不进去**。
+- `stdio` 模式由插件自己启动 Codex，可以读取历史、续接没有在运行的对话，目前还是实验功能：转到微信的审批提示不完整，只建议在只有用户本人能给 bot 发消息时使用。
+- 反方向（Codex 读取微信对话、给用户发微信）要把包里的 `clawbot-mcp` 注册到 Codex。在 Codex 默认的审批设置下，「驱动 DSH 对话」和「发微信」两个工具每次调用前都会征求同意。
+
+具体配置见 README 的「和 Codex 联动」一节。
+
+### Claude Code 联动
+
+bot 可以查看 Claude Code 会话在做什么，也可以给某个会话捎一句话；已经关掉的会话会在后台重新接上。这需要本机装有 `claude` 命令行，并且**保持更新**：它不会跟着桌面版一起升级，版本太旧时会因为不支持当前模型而直接报错，运行 `claude update` 即可。
+
+插件还在本机开了一组 HTTP 接口，配合 MCP server 让 Claude Code 反过来读写 DSH 对话、给用户发微信。接口只监听本机，并且每个请求都要令牌。不需要的话，在设置卡片里关掉「开放 MCP 桥（Claude / Codex）」。
+
+### DSH 的 Session Log 上传（DSH 自己的设置，跟本插件无关，但用户应该知道）
+
+DSH「设置 → 通用设置」里有一项「在使用官方模型 API 时上传 Session Log」，默认开。开着时，每次调用 DeepSeek 官方 API 都会附带该对话还没上传过的那部分日志，累计下来就是整份对话，包括工具调用和结果。bot 使用 DeepSeek 官方模型时，整段微信对话都在其中；即使 bot 换成了别家模型，插件派出的子任务仍然固定使用 DeepSeek 官方模型，交给子任务的那部分内容也会上传。用户介意的话可以关掉；注意关闭期间的内容会在重新打开时一次性补传。
+
+---
+
+## 7. 模型与成本
+
+- **选模型**：在设置卡片里给 bot 固定一个模型，这样用户在网页里换模型不会影响 bot。留空就跟随 DSH 的全局默认。
+- **思考等级**：日常聊天用 `low` 就够。用到定时提醒时不建议完全关闭思考：关掉后，模型容易照抄历史消息里的日期，把提醒设到过去。
+- **花销从哪来**：模型接口是无状态的，每次调用都要把系统提示词、工具说明和对话历史整份重发一遍；一条微信通常要调用 2 到 4 次模型。固定开销（系统提示词加工具说明）约 1.8 万 token。好在大部分内容能命中缓存（实测约 85%）。上下文会随对话增长，再被空闲整理压回去；作者的配置下，一般在 3.5 万到 20 万 token 之间。
+- **作者的实际数据**：使用 gpt-6-luna 时，一条微信的平均成本约 $0.005–0.007，每天 7 条左右、一个月约 $1.4。
+
+**不要往系统提示词里放每次都会变的内容**（带秒的时钟、随机 id、计数器）。支持前缀缓存的模型会从变化的那个字符开始整段按未命中计价；DSH 的「in-history」模式下更糟，每变一次就把整份提示词追加进历史。插件的系统提示词在一天之内逐字节不变，时间信息放在每条入站消息里（`[微信消息 MM-DD HH:mm]`）。
+
+---
+
+## 8. 升级 DSH
+
+**总原则**：先把 wechat-clawbot 升到最新版，再切换 DSH。1.0.1 已经覆盖下面所有版本的要求。切换后照[第 4 节](#4-验收清单)重新验收一遍。
+
+用 npx 运行 DSH 时，每个版本装在单独的缓存目录里，旧目录留着就是回滚的退路。
+
+### 从 0.1.5 升到 0.1.7：顺序决定设置会不会丢
+
+0.1.7 不再使用 `~/.dsh/settings.yaml`，配置统一存进 `cordis.patch.yml`。第一次启动 0.1.7 时，DSH 会把 settings.yaml **单向导入**进来，然后把原文件改名为 `settings.yaml.imported`。导入规则很严格，被拒绝的部分只记一条警告，终端里看不到：
+
+1. **段名必须等于插件的 entry id**。本插件是 `clawbot`，正好对得上。
+2. **这一段的每个字段都必须是「改完立即生效」的那一类**，只要有一个不是，整段丢弃。如果用户曾经手写过 `sessionId`、`apiBaseUrl`、`autoStart` 这类字段，先把它们挪进 `cordis.patch.yml` 的 `- id: clawbot` 块。
+3. **第一次启动 0.1.7 时，插件必须已经是 0.9.4 或更新**。否则插件导入失败，整段设置被丢，bot 会退回默认模型，白名单和图片设置也都没了。
+
+正确顺序：
+
+```bash
+# ① 备份（回滚到 0.1.5 时要用）
 cp ~/.dsh/settings.yaml ~/.dsh/settings.yaml.bak-pre-017
 cp ~/.dsh/profiles/web/cordis.patch.yml ~/.dsh/profiles/web/cordis.patch.yml.bak-pre-017
+
+# ② 安装 0.1.7，但先不要启动
+npx -y @deepseek-ai/dsh@0.1.7-rc.2 --version
+
+# ③ 先把插件升级
+dsh plugin --profile web add wechat-clawbot@latest
 ```
 
-```bash
-# ② 装 0.1.7，但先别启动（npx 会装进一个新的缓存目录，旧的留着当回滚）
-npx -y @deepseek-ai/dsh@0.1.7-rc.1 --version
-```
+④ 然后才第一次启动 0.1.7。启动后确认 `~/.dsh/settings.yaml.imported` 存在，并且 `cordis.patch.yml` 的 `- id: clawbot` 块里能看到原来的模型、白名单等设置。
 
-```bash
-# ③ 先把插件升到 0.9.4
-dsh plugin --profile web add wechat-clawbot@0.9.4
-```
+常一起安装的第三方插件：`dsh-plugin-marketplace` 0.3.4 会让整页白屏（0.1.7 自带的插件页已经能代替它，在配置里加 `disabled: true` 禁用）；`@deepseek-ai/dsh-subagent-acp` 要升到和 DSH 同号的版本。对话历史会自动从 v3 格式转成 v4，原文件保留，回滚是安全的。
 
-④ 然后才第一次启动 0.1.7。启动后确认：
+### 从 0.1.7-rc.1 升到 rc.2：定时提醒换了存储位置
 
-```bash
-ls ~/.dsh/settings.yaml.imported          # 有 = 导入发生了
-grep -A12 '^- id: clawbot' ~/.dsh/profiles/web/cordis.patch.yml   # 能看到 provider / model 等字段
-```
+rc.2 把定时提醒从对话历史搬进了 DSH 自己的任务表（`~/.dsh/storages/schedule.json`），而且**不会迁移旧提醒**：bot 以前确认过的提醒到点不响，也不报错。
 
-日志里出现 `设置已即时生效 […](没有重启,微信监听未中断)` 就是导入的值被插件吃进去了。
-
-**另外两个 0.1.7 上已知不兼容的第三方插件**（不是本插件的问题，但常一起装）：
-- `dsh-plugin-marketplace`（含最新的 0.3.4）会让整页白屏。0.1.7 自带的插件页已经覆盖它的功能，
-  在 cordis.patch.yml 里加 `- id: plugin-marketplace` / `disabled: true` 禁用即可。
-- `@deepseek-ai/dsh-subagent-acp` 要升到 `0.1.7-rc.1`，旧版会被版本门禁禁用。
-
-**会话历史不用管**：0.1.7 会把 v3 会话转成 v4（生成一个新的 `session.v4.jsonl.zstd`），
-v3 原件不动，回滚安全。实测一个 1200 多条事件的会话，每类事件数量完全一致。
-
-### 从 0.1.7-rc.1 升到 rc.2：**先把插件升到 0.9.6**，否则已经设好的提醒会静默失效
-
-rc.2 把定时提醒从「会话历史」搬进了宿主自己的任务表（`$DSH_HOME/storages/schedule.json`），
-而且**明确不迁移旧的**：宿主只在日志里打一行
-`schedule: Session "wechat-main" contains legacy reminders; recreate active reminders with schedule_create.`
-——bot 当初确认过的提醒，到点就是不响，没有任何报错。
-
-0.9.6 在 rc.2 下第一次启动时，会把微信会话里还没响的提醒**自动搬一次**（绑回原会话，
-不唤醒它）。日志里每条一行：
+wechat-clawbot 0.9.6 起，第一次在 rc.2 上启动时，会把微信对话里还没响的提醒自动搬过去，每条在日志里写一行：
 
 ```
 legacy reminder schedule-7 carried over as schedule-3f2a9c1e-… (due 2026-10-01T13:00:00.000Z)
 ```
 
-状态目录里的 `schedule-migration.json` 记着搬过哪些，重启不会重复；用户之后在新任务表里
-删掉的，也不会被再搬回来。过期超过一天的不搬（日志里会说原因），过期一天以内的一分钟后补发
-（和旧版「下次启动补发」的行为一致）。宿主那行 `contains legacy reminders` 之后**每次启动都会打**，
-是固定提示，看到 `carried over` 就不用管它。
+搬过的记录保存在 `~/.dsh/clawbot/schedule-migration.json`，重启不会重复搬。过期超过一天的不搬；过期不到一天的，会在一分钟后补发。之后每次启动，DSH 都会打一行 `contains legacy reminders; recreate active reminders with schedule_create`，这是固定提示，看到过 `carried over` 就不用管。
 
-其他几处 rc.2 的变化：
-- `@deepseek-ai/dsh-subagent-acp` 要升到 **`0.1.7-rc.2`**：它的 peerDependencies 是**精确**锁版本的，
-  跟宿主差一个 rc 就被版本门禁禁用（日志 `disabling profile plugin row "subagent-acp-claude" … incompatible`）。
-  **回滚到 rc.1 时也要把它一起退回 `0.1.7-rc.1`**。
-- 网页端默认**关掉**了 `schedule` / `time-context` / 任务页 `ui-schedule`。本插件自带的那行会把
-  `schedule` 重新打开（插件页里 wechat-clawbot 下面会列出 `@deepseek-ai/dsh-schedule`「运行中」），
-  **不要**再在 profile 里自己 insert 一行 `schedule`。任务页默认仍是关的。
-- provider 多了一个 `deepseek-account`（DeepSeek 账号登录那条），正常情况下是 **10 个**。
-- 回滚到 rc.1 的副作用：已经搬过去、并且在 rc.2 上响过的提醒，rc.1 看会话历史会以为它们还没响，
-  **会再补发一次**；在 rc.2 上新设的提醒 rc.1 看不见。
+其他变化：
 
-### 从 0.1.7-rc.2 升到 0.2.0：**先把插件升到 0.9.7**
+- `@deepseek-ai/dsh-subagent-acp` 必须和 DSH 版本完全一致，差一个 rc 就会被禁用（日志：`disabling profile plugin row "subagent-acp-claude"`），回滚时也要一起退回。
+- 本插件自带一行 `schedule` 配置，**不要**在 profile 里再加一行。
+- 回滚到 rc.1 的副作用：已经在 rc.2 上响过的提醒，rc.1 会再补发一次；在 rc.2 上新设的提醒，rc.1 看不到。
 
-0.2.0 不改会话格式、不迁移任何数据（回滚只要换回旧版 dsh），但**版本门禁**会跳过所有 peer 写着
-`^0.1.x` 的插件——本插件 0.9.6 及更早就是这样，常一起装的第三方插件大多也是。dsh 照常运行，
-只在 stderr 打一行 `skipping profile bundle "<包名>": … is incompatible with dsh 0.2.0-…`。
+### 从 0.1.7-rc.2 升到 0.2.0：版本门禁
 
-1. 先把本插件升到 0.9.7，再换宿主。0.9.7 的 peer 是 `^0.1.7-rc.1 || ^0.2.0-rc.1`，回滚到 0.1.7 也能用。
-2. `@deepseek-ai/dsh-subagent-acp` 同号升到 `0.2.0-rc.2`（精确锁版本，回滚时一起退）。
-3. 上游还没放宽 peer 的第三方插件（写这份时：`dsh-vision` 0.2.0、`dsh-plugin-subscriptions` 0.9.6、
-   `deepseek-idesign` 0.2.2），确认它们在 0.2.0 上能用之后，可以用 **0.2.0 的 dsh**（旧版会拒绝）
-   给那个精确版本授权：
+0.2.0 不改对话格式，也不迁移任何数据（回滚只要换回旧版 DSH），但它的**版本门禁**会跳过所有声明范围只到 `^0.1.x` 的插件。
+
+1. 本插件要 0.9.7 或更新（1.x 的声明范围同时覆盖 0.1.7 和 0.2.0，回滚也能用）。
+2. `@deepseek-ai/dsh-subagent-acp` 升到同号的 `0.2.0-rc.2`。
+3. 上游还没放宽范围的第三方插件，确认它们在 0.2.0 上能正常工作后，可以用 **0.2.0 版的 dsh**（旧版会拒绝）给那个精确版本授权：
    ```bash
    npx -y @deepseek-ai/dsh@0.2.0-rc.2 plugin --profile web allow-version <包名>@<版本> --dsh-version 0.2.0-rc.2 --accept-risk
    ```
-   授权存在 `~/.dsh/profiles/<profile>/compatibility.json`，只认这一个「插件版本 × dsh 版本」组合，
-   插件或 dsh 再升级就又会被跳过。`dsh-plugin-marketplace` 0.3.3 **不要**授权：它依赖 0.1.7 已删除的
-   `settingsScope`，一旦启用整页会卡住。要么升到 0.3.7（放行 0.1.7 和恰好 0.2.0-rc.2——这次升级想留着
-   回滚路就用它；0.2.0 之后的版本会被跳过），确定留在 0.2.x 之后再换 0.4.0（只认 ≥0.2.0-rc.2，回滚到
-   0.1.7 时要退回 0.3.7），要么卸掉。
-4. 0.2.0 的网页端不再自带 `schedule` 行，本插件那一行就是唯一的一行。插件页「官方」里新出现的
-   **自动化任务**（实验性）也会 insert 一行 `schedule`：开着没事，但**别单独关掉它里面的「任务调度」**，
-   那会连微信提醒一起关掉；它的「时间感知」建议关掉——微信消息自带时间戳，这一行反而会让 bot
-   追问你说的是哪个时区。
-5. 「设置 → 通用设置」里多了一个 **「在使用官方模型 API 时上传 Session Log」**（默认开，0.1.7 起其实
-   就一直在传，0.2.0 只是给了开关）：开着时，每次调 DeepSeek 官方 API 都会带上该会话**还没传过的那一段**
-   日志（增量，默认单次最多 8 MiB；累计下来就是整份会话日志，含工具调用和结果）。bot 用的是 DeepSeek
-   官方模型时（DSH 默认的 deepseek-official / deepseek-flash 就是），**整段微信对话都在其中**；bot 换成别家
-   模型时，本插件派出去的子代理仍固定走 deepseek-official / deepseek-flash，交给子代理的那段任务照样会传
-   （只是那个任务，不含之前的微信历史——本插件关掉了会复制上下文的 `subagent_fork`）。介意就关掉；
-   关着期间的内容，之后重新打开时会作为积压一并上传。
+   授权保存在 `~/.dsh/profiles/<profile>/compatibility.json`，只对「这个插件版本 × 这个 DSH 版本」有效；任何一方升级后都要重新授权。`dsh-plugin-marketplace` 0.3.3 **不要**授权，它依赖已删除的接口，启用后整页卡住。
+4. 0.2.0 的插件页「官方」里有一个实验性的「自动化任务」，打开它会再加一行 `schedule`：开着没关系，但**不要单独关掉其中的「任务调度」**，那会连微信提醒一起关掉；其中的「时间感知」建议关掉，微信消息自带时间戳，它反而会让 bot 追问时区。
+
+### 已知问题
+
+- **DSH 0.2.1 预览版（截至 0.2.1-alpha.2）**：设定时提醒的工具（`schedule_create` 等）从 `@deepseek-ai/dsh-schedule` 挪到了新包 `@deepseek-ai/dsh-tool-schedule`，而 wechat-clawbot 1.0.1 只加载前者。插件本身能正常加载，但 bot **无法设定时提醒**，而且不会报错。在 wechat-clawbot 适配之前，请继续使用 0.2.0。
 
 ---
 
-## 3. 配置在哪（0.1.7）
+## 9. 症状速查
 
-**唯一的配置文件是 `~/.dsh/profiles/<profile>/cordis.patch.yml`**，本插件是其中的 `- id: clawbot` 块。
-
-| 字段 | 在哪改 | 改完要不要重启 |
-|---|---|---|
-| **热字段**：模型（provider / model / 思考等级）、白名单、图片参数、emoji、日志级别、Claude 桥开关等 | 网页侧边栏 **「插件」→ wechat-clawbot → 微信 Bot** 卡片 | **不用**。宿主就地提交，微信连接不中断 |
-| **冷字段**：`sessionId`、`autoStart`、`apiBaseUrl`、`cwd`、`forwardQuestions`、`botAgent` | 手改 cordis.patch.yml | 要。改冷字段宿主会自动重启这个插件 |
-| `autoMemory`（**默认开**） | 要关的话手改 cordis.patch.yml（卡片上没有这个开关，见第 8 节） | 不用（它是热字段，文件保存后下一条消息生效） |
-
-改过的字段在卡片上会显示「已覆盖」，旁边有「重置」。
-
----
-
-## 4. 启动之后：看这两样，别看 exit code
-
-```bash
-# 有没有插件没激活（0.1.7 的失败只会在这里出现）
-grep -a 'did not activate\|failed to import\|incompatible with dsh\|pending (waiting' ~/.dsh/logs/*.log | tail
-```
-
-```bash
-# 启动失败时宿主会写一份完整诊断（含每个缺服务的插件）
-ls -t ~/.dsh/logs/startup-*.log | head -3
-```
-
-注意：cordis 自己的 error 日志在 web profile 下**不写 stderr**，所以「failed to import」
-后面通常**看不到原因**。要原因的话看 startup-*.log；或者在网页「插件」页里看这个插件
-是否标着「运行中」。
-
-**`startup-*.log` 里有 `EADDRINUSE` 不一定是坏了**：守护进程重启时偶尔会同时拉起两个，
-一个抢到端口、另一个写了这份诊断后退出。判断服务活没活看端口：
-
-```bash
-lsof -nP -iTCP:3080 -sTCP:LISTEN
-```
-
----
-
-## 5. 一定要在浏览器里真打开一次
-
-服务端干净不代表能用：浏览器那半边是加载网页时才执行的。
-
-```bash
-# 地址固定 127.0.0.1:3080，但 URL 里的 token 每次重启都变，取当前这次的：
-grep -o 'http://127.0.0.1:3080/?token=[A-Za-z0-9_-]*' ~/.dsh/logs/dsh-web.out.log | tail -1
-```
-
-- 页面只有一行 **「Failed to load plugins」**，下面列着 **`pending (waiting for service: X)`**
-  → 某个插件（不一定是这个）的浏览器端在 `inject` 里写了这一版没有的服务。0.1.7 删掉的
-  `settingsScope` 是最常见的 X。客户端**没有隔离**，一个插件卡住整页都出不来。
-- 没带 token 的裸地址回 **401**（`dsh web authentication required`）——不是坏了，是还没换 cookie。
-  换过一次之后 30 天内有效。
-
----
-
-## 6. 绑定微信（一次性，要人操作）
-
-扫码登录必须由**本人**完成，agent 不要代劳、也不要碰对方的凭据。让用户自己扫，
-绑定结果落在 `~/.dsh/clawbot/accounts/`。
-
-绑定之后默认**只有扫码的那个人**能给 bot 发消息（白名单）。要加人，在微信 Bot 卡片的
-「允许给 bot 发消息的人」里填微信用户 id。
-
----
-
-## 7. 选模型，以及两个会烧钱的坑
-
-这两条不是这个插件特有的，但这个插件最容易踩，因为它每一轮都带一份完整的系统
-提示词 + 工具定义（实测约 17.7k token 的固定开销）。
-
-**坑一：提示词里放会变的东西 = 缓存全灭。**
-如果提示词里有每轮都变的字符（时钟带秒、随机 id），支持前缀缓存的模型（DeepSeek
-这类）会**从那个字符开始整段按未命中计价**。实测过一次：命中率 1%，一轮 29 步的
-对话累计 928 万 input token，约 ¥10 一轮。
-
-**坑二：`systemPromptUpdate: "in-history"` 之后，同一个毛病换个姿势咬人。**
-那个模式下「提示词变了」不是就地改写，而是**把整份追加进历史**。时钟带秒 = 每一步
-往历史里塞一份完整提示词。实测 14 轮 / 35 步塞了 35 份 24KB，上下文 519k 而真实
-对话只有 54k。（DeepSeek 官方 provider 的内置目录用的是 in-history；pi-ai 这类手写
-provider 默认就地改写。）
-
-**结论**：系统提示词必须**一天之内逐字节不变**，易变的东西放最新那条消息里。这个
-插件现在就是这么做的（入站消息带 `[微信消息 MM-DD HH:mm]`），你**不要**往提示词
-里加时钟、计数器之类的东西。
-
-思考档位：日常聊天用 `low` 就够（实测闲聊轮思考 0–220 token）。会用到定时提醒的话
-不建议关——关了之后模型会从历史消息里抄日期，把提醒设到过去的某天。
-
----
-
-## 8. `autoMemory`：默认开，要告诉用户它做了什么
-
-**默认开**（0.9.5 起）。看起来像个人信息的短消息（"我住在…"、"我不能喝咖啡"）会被原文
-**再发给同一个模型问一次**：值不值得写进长期记忆。
-
-- **去向**：就是这个会话本来就在用的模型（走宿主 `llm` 服务、跟着本会话的路由）。
-  跟对话去的是同一个地方，**不是额外的厂商**。（0.9.2 及以前是写死发到 `api.deepseek.com`，
-  那才是第二个去向，所以当时默认关。）
-- **代价**：每条被预筛选中的消息多一次请求。便宜的模型上可以忽略；如果用户把 bot 挂在
-  很贵的模型上，值得跟他提一句。
-
-装完要**跟用户说一声**这个功能开着、它做什么；**他不想要就让他自己关**——在 cordis.patch.yml
-的 `- id: clawbot` 块里加一行 `autoMemory: false`，保存即生效（热字段，不用重启）。
-卡片上没有这个开关。关掉不影响 `remember_user_info`——那是模型自己决定要记的，不经过
-这个分类器。
-
-**两条路都不收一次性提醒**（0.9.5 起）：分类器和 `remember_user_info` 最后都经过同一个
-写入口，「提醒事项」分类和带「今天/明天/几分钟后」的条目一律拒收——那些归定时提醒
-（`schedule_create`）管。原因：memory.md **每一轮都整份进系统提示词**，一条「明天十点开会」
-第二天就是错的，还会误导模型算日期。如果从老版本升上来，memory.md 里可能攒着一个
-「## 提醒事项」段，可以整段删掉（真正会响的提醒存在定时系统里，删这段不影响它们）。
-
----
-
-## 9. 装完的验收清单
-
-| 查什么 | 命令 / 位置 | 期望 |
-|---|---|---|
-| 服务活着 | `lsof -nP -iTCP:3080 -sTCP:LISTEN` | 有 LISTEN |
-| 插件激活了 | 日志里**没有** `did not activate` / `failed to import`；网页「插件」→ wechat-clawbot 两个组件都是「运行中」 | 两个都满足 |
-| 微信通道通了 | 日志里 `monitor started baseUrl=https://ilinkai.weixin.qq.com` | 有 |
-| 网页能开 | 带 token 打开 | 不是「Failed to load plugins」 |
-| 设置卡片在 | 「插件」→ wechat-clawbot → 微信 Bot | 卡片能展开、字段能填 |
-| **真发一条微信** | 让用户发「在吗」 | **几秒内收到回复** |
-| （升级的）定时提醒 | 让用户设一个两分钟后的提醒 | **提醒到了微信上**，而不只是出现在网页里 |
-| （升到 rc.2 的）旧提醒搬过去了 | 日志里 `legacy reminder … carried over as …` | 每条还没响的提醒一行 |
-
-最后两行不能省。前面全绿而一发消息就不通的情况是存在的——目录干净 ≠ 真实路径能跑。
-定时提醒那一行专门针对升级：0.1.7 换了会话格式，老版本插件识别提醒的方式会**静默失效**，
-表现就是提醒只在网页里回答、到不了微信，而且不报任何错。
-
----
-
-## 10. 症状 → 原因速查
-
-| 症状 | 多半是 |
+| 症状 | 原因与处理 |
 |---|---|
-| 日志 `N entries did not activate` + `clawbot (…): failed to import` | 插件版本太老（0.9.3 及以前 import 了 0.1.7 已删除的 API）→ 升到 0.9.4 |
-| 日志 `Plugin … is incompatible with dsh …` | 0.1.7 的版本门禁：插件 peerDependencies 的范围不含当前 DSH 版本 → 升级那个插件 |
-| 网页整页「Failed to load plugins」+ `pending (waiting for service: X)` | 某个插件浏览器端硬依赖了这一版没有的服务 X（常见 `settingsScope`）→ 升级或禁用那个插件 |
-| 升级 DSH 后 bot 用的模型不对 / 白名单没了 / 设置全回默认 | settings.yaml 导入时 `clawbot:` 段被整段拒了（第 2 节的三条规则）→ 从 `settings.yaml.imported` 里把值抄进 cordis.patch.yml |
-| 网页一行 401 文本 | 没带 token（第 5 步），不是坏了 |
-| `POST /<路径>` 回 **405** | 那条路由**根本没注册**（不是没权限）。401 才是「路由在、没过鉴权」 |
-| bot 收到消息但不回 | 看它是不是只输出了文本没调 `send_wechat_text`——这个插件里**纯文本输出永远不会到达微信** |
-| bot 回复很慢（20 秒+） | 多半在连着搜网 / 抓页面；也可能是上下文被撑大了（见第 7 步） |
-| 定时提醒只在网页里出现、没到微信 | 插件太老（见第 9 节最后一行）→ 升到 0.9.4 |
-| 升到 rc.2 之后，之前设好的提醒到点不响 | 插件还是 0.9.5 或更老：rc.2 不迁移旧提醒 → 升到 0.9.6 重启一次，日志里应出现 `carried over` |
-| 日志 `contains legacy reminders; recreate active reminders with schedule_create` | rc.2 宿主的固定提示，每次载入都打。下面跟着 `carried over`（或 marker 里已记过）就没事 |
-| 日志 `disabling profile plugin row "subagent-acp-claude"` | `dsh-subagent-acp` 版本跟宿主差了一个 rc → 升到和宿主同号 |
-| 定时提醒迟到 | 机器睡着了。提醒的定时器活在进程里，进程冻结就不会响，醒来才补发 |
+| 日志 `N entries did not activate` 加 `clawbot (…): failed to import` | 插件太旧，用到了当前 DSH 已经删除的接口。升到最新版 |
+| 日志 `skipping profile bundle "wechat-clawbot": … incompatible with dsh …` | 版本门禁：插件声明的范围不包含当前 DSH 版本。1.0.1 支持 0.1.7 到 0.2.0；DSH 更旧或更新时要先换 DSH 版本 |
+| 网页只剩「Failed to load plugins」，下面列着 `pending (waiting for service: X)` | 某个插件（不一定是本插件）的浏览器端依赖了当前版本没有的服务 X。升级或禁用那个插件 |
+| 网页只有一行 401 文本 | 打开时没带 token，不是故障，见第 4 节 |
+| `POST` 某个接口回 405 | 那条路由根本没有注册（401 才是「路由在，但没通过认证」） |
+| 升级 DSH 后模型不对、白名单没了、设置全部回到默认 | settings.yaml 导入时被整段拒绝（第 8 节第一小节）。从 `settings.yaml.imported` 里把值抄进 `cordis.patch.yml` |
+| bot 收到消息但不回复 | 模型只输出了文字，没有调用 `send_wechat_text`。在本插件里，纯文字输出永远不会发到微信 |
+| 同一条消息被回答两三遍，或者回复完了还一直显示「正在输入」 | 0.9.9 及更早：改过需要重启微信监听的设置后，多出了几份 bot 同时在运行。升到 0.9.10 或更新，再重启一次 DSH。判断方法：网络抖动时，同一毫秒有几行 `getUpdates: POST fetch failed`，就有几份 |
+| 回复送达后「正在输入」还要过几秒才消失 | 0.9.10 及更早的行为。1.0.0 在回复送达时立刻收起 |
+| 回复很慢（20 秒以上） | 多半在连续搜网或抓网页；也可能是上下文太大，或者 DSH 正在回复前压缩（打开「空闲时整理对话」） |
+| 定时提醒只出现在网页里，没发到微信 | 插件太旧（早于 0.9.4），识别不了 0.1.7 的新对话格式。升级插件 |
+| 升到 0.1.7-rc.2 后，之前设好的提醒到点不响 | 插件早于 0.9.6，rc.2 不迁移旧提醒。升级插件并重启一次，日志里应出现 `carried over` |
+| 日志 `contains legacy reminders; recreate active reminders with schedule_create` | rc.2 的固定提示，每次启动都会打。看到过 `carried over` 就没事 |
+| 日志 `disabling profile plugin row "subagent-acp-claude"` | `dsh-subagent-acp` 和 DSH 版本不一致。升到同号版本 |
+| 定时提醒迟到 | 电脑睡眠了。提醒的计时器在 DSH 进程里，进程被冻结就不会响，唤醒后才补发 |
+| 提醒或通知到点没收到，日志 `sendMessage ret=-2 errmsg=prepare failed` | 用户有一段时间（约 24 小时）没给 bot 发消息，微信不让 bot 主动发。消息已经存着，用户下次发消息、bot 回复之后会合并补发，见第 6 节 |
+| 在 DSH 0.2.1 预览版上 bot 设不了提醒 | 见[已知问题](#已知问题) |
+| Codex 工具报「Cannot connect to the shared Codex App Server」 | `socket` 模式找不到共享服务（桌面版的服务是私有的）。见第 6 节的 Codex 部分 |
+| 让 bot 给 Claude Code 会话捎话失败，报模型不受支持 | `claude` 命令行太旧，运行 `claude update` |
 
 ---
 
-## 11. 给 agent 的三条纪律
+## 10. 给 agent 的四条纪律
 
-1. **不要替用户输密码、扫码、填 OTP。** 绑定微信、`npm login`、2FA 验证码，全都
-   让本人做。
-2. **`autoMemory` 默认开着，装完要告诉用户**它会拿像个人信息的短消息再问一次同一个模型；
-   关不关由他决定，你不要替他关、也不要瞒着不说。另外**不要把他的 key 复制到任何新文件
-   里**——要用就运行时从 `~/.dsh/.credentials.yaml` 读。
-3. **改完配置要验真实路径**，别停在「目录 / 设置页看着正常」。这个插件的历史故障
-   里，有一半是「看着全对，一发消息就炸」。0.1.7 让这一条更重要了：失败是静默的。
+1. **不要替用户输入密码、扫码或填写验证码**：绑定微信、`npm login`、两步验证都由本人完成。
+2. **自动记忆默认开着**，装完要告诉用户它做什么，关不关由用户决定；不要擅自关掉，也不要不提。
+3. **不要把用户的 API key 复制到任何新文件里**；需要时在运行时从 `~/.dsh/.credentials.yaml` 读取。
+4. **改完配置一定要验证真实路径**：真实发一条消息、真实设一个提醒。这个插件历史上一半的故障都是「看起来全对，一发消息就不通」，而从 DSH 0.1.7 起，失败大多是静默的。

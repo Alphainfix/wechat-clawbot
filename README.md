@@ -3,9 +3,12 @@
 English | [中文](README.zh.md)
 
 Chat with the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) agent on your computer from WeChat.
+Clawbot is a DSH plugin and fully open source. It replies with the AI you use in DSH and does not upload your information.
 Away from your desk, you can still ask it to look through files, edit documents or run commands, and the results come back to the WeChat chat.
 
-It uses WeChat's official **微信ClawBot** channel (Tencent iLink): no second account and no web-login tricks.
+It uses WeChat's official **微信ClawBot** channel: just scan a QR code to log in.
+
+After nearly two months of development and real-world use, `wechat-clawbot` has become steadily more stable and economical, and the stable release **v1.0.0** came out on 10 October 2026.
 
 ## What it does
 
@@ -19,13 +22,21 @@ It uses WeChat's official **微信ClawBot** channel (Tencent iLink): no second a
 - **Understands quotes**: reply to an older message with WeChat's quote feature and it knows which one you mean
 - **Long chats stay quick**: when the conversation gets long, it tidies older messages into a summary during a quiet spell after a reply, so your next message never waits for it
 
+## Cost
+
+- When the author uses gpt-6-luna, one WeChat message costs about $0.005–0.007 on average; at around 7 messages a day that is about $1.4 a month (under ¥10).
+
 ## Requirements
 
-- DSH **0.1.7 – 0.2.x** (tested on 0.1.7-rc.2 and 0.2.0-rc.2), Node.js 22+ and pnpm
+- DSH **0.1.7 – 0.2.0** (tested on 0.1.7-rc.2 and 0.2.0-rc.2), Node.js 22+ and pnpm
 - The official **微信ClawBot** plugin in the WeChat mobile app (WeChat → Settings → Plugins; the first scan may ask you to update WeChat)
 - A computer that stays on: the bot is online while DSH is running
 
 ## Set up in three steps
+
+**0. Got an agent?**
+
+Copy the link to this page, or tell any agent `wechat-clawbot`, and ask it to install it into DSH. Or:
 
 **1. Install the plugin**
 
@@ -45,7 +56,7 @@ A QR code appears in the terminal. Scan it with WeChat's "Scan" and confirm.
 
 **3. Start chatting**
 
-A new contact, **微信ClawBot**, shows up in WeChat. Message it. The running DSH picks up the new link within a few seconds, so no restart is needed.
+A new contact, **微信ClawBot**, shows up in WeChat. Message it. The running DSH picks up the new link automatically and starts a conversation.
 
 Other commands: `clawbot status` shows who is linked, `clawbot logout` unlinks (use the same `npx -y -p wechat-clawbot` prefix).
 

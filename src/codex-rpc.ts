@@ -193,7 +193,7 @@ export class CodexAppServer implements CodexRpc {
 
   private async initialize(connection: ChildProcessWithoutNullStreams | WebSocket): Promise<void> {
     await this.rawRequest("initialize", {
-      clientInfo: { name: "wechat_clawbot", title: "WeChat Clawbot", version: "1.0.0" },
+      clientInfo: { name: "wechat_clawbot", title: "WeChat Clawbot", version: "1.0.1" },
       capabilities: { experimentalApi: true },
     });
     this.write(connection, { method: "initialized", params: {} });

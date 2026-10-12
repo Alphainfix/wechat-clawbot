@@ -40,6 +40,7 @@ import type { ResolvedWeixinAccount } from "./ilink/auth/accounts.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import { logger } from "./ilink/util/logger.js";
 import { CodexProgressStore, type CodexProgressState } from "./codex-progress.js";
+import { isSendWindowClosed, oneSentence, type Backlog } from "./backlog.js";
 
 /** The one method this file uses, structurally — see models-route.ts. */
 type WebServerLike = {
@@ -66,6 +67,8 @@ export type McpRouteDeps = {
   sendText: (to: string, text: string) => Promise<void>;
   /** The currently bound account, or null before `clawbot login`. */
   getAccount: () => ResolvedWeixinAccount | null;
+  /** Where a notification waits when WeChat will not let the bot write first (see backlog.ts). */
+  backlog?: Backlog;
   /** Shared with the DSH Codex tools. Process-local, never a workspace index. */
   codexProgress?: CodexProgressStore;
 };
@@ -227,12 +230,18 @@ function eventText(event: { type: string; data?: unknown }): string {
  * this runs, so a mirroring failure must never turn a delivered notify into a
  * reported failure.
  */
-function mirrorIntoSession(ctx: Context, sessionId: string, text: string, source: "Claude" | "Codex" = "Claude"): boolean {
+function mirrorIntoSession(
+  ctx: Context,
+  sessionId: string,
+  text: string,
+  source: "Claude" | "Codex" = "Claude",
+  note?: string,
+): boolean {
   try {
     const agent = ctx.agents.get(SessionId(sessionId));
     if (agent === undefined) return false;
     const message = createUserMessage({
-      content: [{ type: "text", text: `[${source} 发给用户的] ${text}` }],
+      content: [{ type: "text", text: `[${source} 发给用户的${note === undefined ? "" : `，${note}`}] ${text}` }],
       // v4 refuses the retired `plugin` wrapper; this is the kind the v3→v4
       // converter assigns this producer, so migrated history matches.
       source: { kind: "plugin:clawbot-mcp" } as never,
@@ -460,9 +469,33 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
         });
         return;
       }
-      await deps.sendText(owner, text);
+      const source = body.source === "Codex" ? "Codex" : "Claude";
+      if (body.summary !== undefined && typeof body.summary !== "string") throw new Error('"summary" must be a string');
+      try {
+        await deps.sendText(owner, text);
+      } catch (err) {
+        if (!isSendWindowClosed(err) || deps.backlog === undefined) throw err;
+        // WeChat will not let the bot write first right now: keep one sentence
+        // for the digest the owner gets after their next message (backlog.ts).
+        const given = typeof body.summary === "string" ? body.summary.trim() : "";
+        const summary = given !== "" ? given.slice(0, 120) : oneSentence(text);
+        deps.backlog.add(owner, { kind: "notice", at: new Date().toISOString(), source, summary });
+        logger.info(`mcp notify: WeChat will not let the bot write first now; kept "${summary}" for the owner's next message`);
+        const mirrored = mirrorIntoSession(ctx, deps.config.sessionId, text, source, "暂未送达，对方下次发消息后合并补发");
+        send(res, 200, {
+          ok: true,
+          deferred: true,
+          to: owner,
+          chars: text.length,
+          summary,
+          mirrored,
+          message: "微信现在不让 bot 主动发消息（机主有一段时间没发消息了）。这条已存下，机主下次发消息、bot 回复之后，"
+            + "会和其他没送达的消息按时间合并成一条补发，这条只保留一句：" + summary,
+        });
+        return;
+      }
       logger.info(`mcp notify: sent ${text.length} chars to the owner`);
-      const mirrored = mirrorIntoSession(ctx, deps.config.sessionId, text, body.source === "Codex" ? "Codex" : "Claude");
+      const mirrored = mirrorIntoSession(ctx, deps.config.sessionId, text, source);
       // Echo the recipient back so a wrong destination would be visible at the
       // call site instead of only in the recipient's chat. `mirrored` says
       // whether the bot's own history now contains a copy.
