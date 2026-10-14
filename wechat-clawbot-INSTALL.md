@@ -1,6 +1,6 @@
 # wechat-clawbot 安装与排错手册
 
-> **适用版本**：wechat-clawbot **1.0.1**；DeepSeek Harness（DSH）**0.1.7 到 0.2.0**（在 0.1.7-rc.2 和 0.2.0-rc.2 上测过）。
+> **适用版本**：wechat-clawbot **1.1.0**；DeepSeek Harness（DSH）**0.1.7 到 0.2.0**（在 0.1.7-rc.2 和 0.2.0-rc.2 上测过）。
 >
 > **写给谁**：一个能执行命令、正在替别人安装 wechat-clawbot 的 AI agent。人看也一样适用。
 > README 讲「它是什么、怎么用」，这份讲「怎么装好、怎么验收、出了问题怎么查」。
@@ -42,7 +42,7 @@
 dsh plugin --profile web add wechat-clawbot
 ```
 
-也可以在 DSH 网页侧边栏的「插件」→「添加插件」里搜 `wechat-clawbot`（插件页会自动测速，选择更快的 npm 镜像）。要固定版本就写 `wechat-clawbot@1.0.1`。
+也可以在 DSH 网页侧边栏的「插件」→「添加插件」里搜 `wechat-clawbot`（插件页会自动测速，选择更快的 npm 镜像）。要固定版本就写 `wechat-clawbot@1.1.0`。
 
 装完**重启一次 DSH**：插件的服务端代码只在启动时加载。
 
@@ -90,6 +90,7 @@ startMonitor: no bound account; waiting for `clawbot login`
 | 设置卡片可用 | 「插件」→ wechat-clawbot → 微信 Bot | 卡片能展开，字段能修改 |
 | **真实发一条消息** | 让用户在微信里发「在吗」 | **几秒内收到回复** |
 | **真实设一个提醒** | 让用户设一个两分钟后的提醒 | **提醒出现在微信里**，而不只是出现在网页里 |
+| DSH 会话能发微信（可选） | 在任意一个网页会话里说「用 notify_wechat 给我发条微信：测试」 | 微信里收到这条消息。这一步会用一次模型 |
 
 **网页地址**：固定是 `http://127.0.0.1:3080`，但每次启动 DSH 都会生成新的 token，启动输出里有一行完整地址：
 
@@ -182,9 +183,28 @@ DSH 的默认行为：bot 在哪个项目里干过活，那里的 AGENTS.md / CL
 
 具体配置见 README 的「和 Codex 联动」一节。
 
+### DSH 会话联动（DSH 内部桥，1.1.0 起）
+
+bot 能看到同一个 DSH 里的其他会话，范围是所有工作目录，不只某一个文件夹：
+
+- `list_dsh_sessions`：列出会话的标题、所在文件夹、创建时间，以及是否正在运行。
+- `read_dsh_session`：读某个会话最近的消息。
+- `send_to_dsh_session`：往某个会话里捎一句话。没开着的会话会先被唤醒，和在网页里打开它一样。回答留在网页里，不会发到微信。
+
+反过来，每个 DSH 会话都多了一个工具 `notify_wechat`，可以给用户发微信，比如「这个任务做完给我发个微信」。
+
+- **全局生效**：所有 DSH 会话都有，不用按文件夹配置，DSH 内部也不需要 MCP。
+- **微信会话自己没有**：它直接回复就行。
+- **发不出去时**：用户一段时间没给 bot 发消息、微信不让 bot 主动发时，这条消息会存着，下次一起补发，并注明是哪个会话发的。
+- **bot 能看到**：bot 自己的对话里也会出现一份，用户可以直接回复。
+
+Claude Code 和 Codex 走的是另一条路：本机 HTTP 接口加 MCP server，见下一节。
+
 ### Claude Code 联动
 
 bot 可以查看 Claude Code 会话在做什么，也可以给某个会话捎一句话；已经关掉的会话会在后台重新接上。这需要本机装有 `claude` 命令行，并且**保持更新**：它不会跟着桌面版一起升级，版本太旧时会因为不支持当前模型而直接报错，运行 `claude update` 即可。
+
+1.1.0 起，插件会自动选用本机版本最新的 `claude`。为了捎话被拉到后台的会话，处理完会自动停掉、交还给桌面版。处理期间桌面版暂时打不开它，急用就在终端运行 `claude stop <会话 id 前 8 位>`。
 
 插件还在本机开了一组 HTTP 接口，配合 MCP server 让 Claude Code 反过来读写 DSH 对话、给用户发微信。接口只监听本机，并且每个请求都要令牌。不需要的话，在设置卡片里关掉「开放 MCP 桥（Claude / Codex）」。
 
@@ -207,7 +227,7 @@ DSH「设置 → 通用设置」里有一项「在使用官方模型 API 时上�
 
 ## 8. 升级 DSH
 
-**总原则**：先把 wechat-clawbot 升到最新版，再切换 DSH。1.0.1 已经覆盖下面所有版本的要求。切换后照[第 4 节](#4-验收清单)重新验收一遍。
+**总原则**：先把 wechat-clawbot 升到最新版，再切换 DSH。1.1.0 已经覆盖下面所有版本的要求。切换后照[第 4 节](#4-验收清单)重新验收一遍。
 
 用 npx 运行 DSH 时，每个版本装在单独的缓存目录里，旧目录留着就是回滚的退路。
 
@@ -270,7 +290,7 @@ legacy reminder schedule-7 carried over as schedule-3f2a9c1e-… (due 2026-10-01
 
 ### 已知问题
 
-- **DSH 0.2.1 预览版（截至 0.2.1-alpha.2）**：设定时提醒的工具（`schedule_create` 等）从 `@deepseek-ai/dsh-schedule` 挪到了新包 `@deepseek-ai/dsh-tool-schedule`，而 wechat-clawbot 1.0.1 只加载前者。插件本身能正常加载，但 bot **无法设定时提醒**，而且不会报错。在 wechat-clawbot 适配之前，请继续使用 0.2.0。
+- **DSH 0.2.1 预览版（截至 0.2.1-alpha.2）**：设定时提醒的工具（`schedule_create` 等）从 `@deepseek-ai/dsh-schedule` 挪到了新包 `@deepseek-ai/dsh-tool-schedule`，而 wechat-clawbot 1.1.0 只加载前者。插件本身能正常加载，但 bot **无法设定时提醒**，而且不会报错。在 wechat-clawbot 适配之前，请继续使用 0.2.0。
 
 ---
 
@@ -279,7 +299,7 @@ legacy reminder schedule-7 carried over as schedule-3f2a9c1e-… (due 2026-10-01
 | 症状 | 原因与处理 |
 |---|---|
 | 日志 `N entries did not activate` 加 `clawbot (…): failed to import` | 插件太旧，用到了当前 DSH 已经删除的接口。升到最新版 |
-| 日志 `skipping profile bundle "wechat-clawbot": … incompatible with dsh …` | 版本门禁：插件声明的范围不包含当前 DSH 版本。1.0.1 支持 0.1.7 到 0.2.0；DSH 更旧或更新时要先换 DSH 版本 |
+| 日志 `skipping profile bundle "wechat-clawbot": … incompatible with dsh …` | 版本门禁：插件声明的范围不包含当前 DSH 版本。1.1.0 支持 0.1.7 到 0.2.0；DSH 更旧或更新时要先换 DSH 版本 |
 | 网页只剩「Failed to load plugins」，下面列着 `pending (waiting for service: X)` | 某个插件（不一定是本插件）的浏览器端依赖了当前版本没有的服务 X。升级或禁用那个插件 |
 | 网页只有一行 401 文本 | 打开时没带 token，不是故障，见第 4 节 |
 | `POST` 某个接口回 405 | 那条路由根本没有注册（401 才是「路由在，但没通过认证」） |
@@ -297,6 +317,8 @@ legacy reminder schedule-7 carried over as schedule-3f2a9c1e-… (due 2026-10-01
 | 在 DSH 0.2.1 预览版上 bot 设不了提醒 | 见[已知问题](#已知问题) |
 | Codex 工具报「Cannot connect to the shared Codex App Server」 | `socket` 模式找不到共享服务（桌面版的服务是私有的）。见第 6 节的 Codex 部分 |
 | 让 bot 给 Claude Code 会话捎话失败，报模型不受支持 | `claude` 命令行太旧，运行 `claude update` |
+| 桌面版打不开某个 Claude Code 会话，提示 Claude Code crashed | bot 刚把它拉到后台处理捎去的话，处理完会自动交还；急用就运行 `claude stop <会话 id 前 8 位>` |
+| 网页里的 DSH 会话说没有 `notify_wechat` 工具 | 插件早于 1.1.0，或者升级后还没重启 DSH |
 
 ---
 

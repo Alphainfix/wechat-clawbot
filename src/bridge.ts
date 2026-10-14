@@ -23,6 +23,8 @@ import { createUserMessage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import { zonedStamp } from "./localtime.js";
 import { compressForUpload } from "./image-compress.js";
 import { registerClaudePeerTools } from "./claude-peer.js";
+import { registerDshSessionTools } from "./dsh-sessions.js";
+import { NOTIFY_TOOL } from "./owner-notify.js";
 import { registerCodexPeerTools, type CodexPeer } from "./codex-peer.js";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 // `@deepseek-ai/dsh-agent-presets` (and its `ctx.agentPresets` type
@@ -1534,6 +1536,8 @@ export class WechatBridge {
       // sitting in front of. restrictTools below is a DENY list, so these three
       // are visible without needing to be named there.
       registerClaudePeerTools(agentCtx, this.config);
+      // The same for the owner's other DSH conversations, in any folder.
+      registerDshSessionTools(agentCtx, this.ctx, this.config.sessionId);
       // Codex tools only when the owner switched them on: every registered tool
       // rides along on every request. codexPeer is a cold field, so a flip
       // restarts the listener and lands here again with the new value.
@@ -1574,6 +1578,9 @@ export class WechatBridge {
     // send_message 又回到了 bot 的工具列表里(就是上面那个烧钱故事的触发器)。
     // 所以:一个名字一次调用,谁不认识就只丢那一个,并把丢掉的名字打出来。
     const deny = [
+      // Global, for the OTHER conversations (owner-notify.ts); this one has
+      // send_wechat_text, and two ways to reach the owner would double-send.
+      NOTIFY_TOOL,
       "send_message",
       "subagent_fork",
       "list_agents",

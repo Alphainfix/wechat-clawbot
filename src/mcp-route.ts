@@ -33,14 +33,15 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
 
 import type { Context } from "@deepseek-ai/cordis";
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 
 import type { ResolvedWeixinAccount } from "./ilink/auth/accounts.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import { logger } from "./ilink/util/logger.js";
 import { CodexProgressStore, type CodexProgressState } from "./codex-progress.js";
-import { isSendWindowClosed, oneSentence, type Backlog } from "./backlog.js";
+import type { Backlog } from "./backlog.js";
+import { eventText, listDshSessions, readDshSession, sendToDshSession, TAIL_TEXT_CAP } from "./dsh-sessions.js";
+import { notifyOwner } from "./owner-notify.js";
 
 /** The one method this file uses, structurally — see models-route.ts. */
 type WebServerLike = {
@@ -78,9 +79,6 @@ const MAX_BODY_BYTES = 64 * 1024;
 
 /** Default ceiling on how long `send` will wait for the turn to finish. */
 const DEFAULT_WAIT_MS = 120_000;
-
-/** How much of one message's text a tail entry keeps. */
-const TAIL_TEXT_CAP = 2_000;
 
 // ------------------------------------------------------------------ the token
 
@@ -180,81 +178,6 @@ function requireString(body: Record<string, unknown>, key: string): string {
   return value;
 }
 
-/** Pull the plain text out of a surface event, whatever kind it is. */
-function eventText(event: { type: string; data?: unknown }): string {
-  const data = event.data as
-    | { content?: readonly unknown[]; message?: { content?: readonly unknown[] } }
-    | undefined;
-  // user/message carries `content`; assistant/message nests it under `message`
-  // (the shape difference is real — see WechatBridge.buildSessionIndex).
-  const blocks = event.type === "assistant/message"
-    ? data?.message?.content ?? []
-    : data?.content ?? [];
-  return blocks
-    .filter((b): b is { type: "text"; text: string } =>
-      typeof b === "object" && b !== null && (b as { type?: unknown }).type === "text")
-    .map((b) => b.text)
-    .join("")
-    .trim();
-}
-
-/**
- * Put a copy of an outbound notify into the WeChat session's history.
- *
- * Without this the bot is blind to whatever the coding agent told the user: reply "那怎么办"
- * to one of these messages and the bot has no idea what "那" refers to. The copy
- * closes that gap.
- *
- * ## Why `session.append` and not `followup`
- *
- * `followup`/`steer` put an item in the agent's INBOX, which starts a turn — the
- * bot would answer a message that was already sent, to a user who did not ask it
- * anything. `append` is the event-sourcing primitive: it records into the log and
- * dispatches nothing. That is precisely the wanted behaviour — history gains an
- * entry, the driver stays asleep.
- *
- * ## Why `user/message` and not `assistant/message`
- *
- * Semantically an assistant message is the closer fit — this text did go out to
- * the user. But that event carries `{ turn, step, message }`, and turn/step are
- * the session's own turn bookkeeping; inventing values risks exactly the kind of
- * structural damage that an orphaned event does (one such bug bricked a session
- * here and could only be fixed by hand-editing the log). `'user/message'` is
- * just a `UserMessage` — nothing to fabricate — and it is already how this
- * bridge and dsh-schedule inject out-of-band context.
- *
- * The prefix is what makes it legible to the model, and prompt rule C.6 tells it
- * what to do with one: already delivered, do not repeat, do not reply.
- *
- * Best effort throughout. The WeChat message has already been sent by the time
- * this runs, so a mirroring failure must never turn a delivered notify into a
- * reported failure.
- */
-function mirrorIntoSession(
-  ctx: Context,
-  sessionId: string,
-  text: string,
-  source: "Claude" | "Codex" = "Claude",
-  note?: string,
-): boolean {
-  try {
-    const agent = ctx.agents.get(SessionId(sessionId));
-    if (agent === undefined) return false;
-    const message = createUserMessage({
-      content: [{ type: "text", text: `[${source} 发给用户的${note === undefined ? "" : `，${note}`}] ${text}` }],
-      // v4 refuses the retired `plugin` wrapper; this is the kind the v3→v4
-      // converter assigns this producer, so migrated history matches.
-      source: { kind: "plugin:clawbot-mcp" } as never,
-    });
-    agent.session.append("user/message", message, { surfaceOp: "append" });
-    logger.info(`mcp notify: mirrored ${text.length} chars into ${sessionId}`);
-    return true;
-  } catch (err) {
-    logger.warn(`mcp notify: mirror failed (message was still delivered): ${String(err).slice(0, 160)}`);
-    return false;
-  }
-}
-
 // --------------------------------------------------------------------- routes
 
 type Handlers = {
@@ -267,82 +190,42 @@ type Handlers = {
 };
 
 /**
- * `ctx.get` rather than a declared dependency: a headless composition may have
- * no session-query backend, and this bridge should degrade to "live agents
- * only" instead of refusing to load. Reading an un-injected service directly
- * would THROW — cordis does not return undefined.
+ * The session and notify logic lives in dsh-sessions.ts / owner-notify.ts, which
+ * the WeChat bot's own tools and the global notify_wechat tool share; these
+ * handlers only translate it to and from HTTP.
  */
-type SessionQueryLike = {
-  listSessions: (signal?: AbortSignal) => Promise<readonly {
-    header: { id: string; createdAt: number; cwd?: string };
-    live: boolean;
-    persisted: boolean;
-  }[]>;
-  readTitleSnapshots: (ids: readonly string[], signal?: AbortSignal) => Promise<readonly {
-    status: string;
-    value?: { title?: { title?: string } };
-  }[]>;
-  readSurface: (id: string) => Promise<{
-    capturedThroughSeq: number | null;
-    events: readonly { type: string; seq: number; time: number; data?: unknown }[];
-  }>;
-};
-
 function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
   const progress = deps.codexProgress ?? new CodexProgressStore();
-  const sessionQuery = (): SessionQueryLike | undefined =>
-    ctx.get("sessionQuery") as SessionQueryLike | undefined;
 
   return {
     /** Which conversations exist, which are live, which are mid-turn. */
     async sessions(_req, res) {
-      const live = new Map<string, ReturnType<typeof ctx.agents.list>[number]>(
-        ctx.agents.list().map((a) => [String(a.session.id), a]),
-      );
-      const sq = sessionQuery();
-      if (sq === undefined) {
+      const { rows, degraded } = await listDshSessions(ctx);
+      if (degraded !== undefined) {
         // Degraded: no corpus, so only the agents currently in memory.
         send(res, 200, {
           ok: true,
           wechatSessionId: deps.config.sessionId,
-          degraded: "no sessionQuery service; listing live agents only",
-          sessions: [...live.values()].map((a) => ({
-            id: String(a.session.id),
-            live: true,
-            running: a.status === "running",
-            cwd: a.session.header.cwd,
-          })),
+          degraded,
+          sessions: rows.map((r) => ({ id: r.id, live: true, running: r.running, cwd: r.cwd })),
         });
         return;
       }
-      const records = await sq.listSessions();
-      const ids = records.map((r) => r.header.id);
-      // One batched call — readTitle per session would be N round trips, and
-      // titles are the whole point of a list a human reads.
-      let titles: readonly { status: string; value?: { title?: { title?: string } } }[] = [];
-      try {
-        titles = await sq.readTitleSnapshots(ids);
-      } catch (err) {
-        logger.warn(`mcp sessions: title fold failed: ${String(err).slice(0, 120)}`);
-      }
-      const sessions = records.map((record, index) => {
-        const agent = live.get(record.header.id);
-        const title = titles[index]?.status === "fulfilled"
-          ? titles[index]?.value?.title?.title
-          : undefined;
-        return {
-          id: record.header.id,
-          ...(title === undefined ? {} : { title }),
-          ...(record.header.cwd === undefined ? {} : { cwd: record.header.cwd }),
-          createdAt: new Date(record.header.createdAt).toISOString(),
-          live: record.live,
-          persisted: record.persisted,
+      send(res, 200, {
+        ok: true,
+        wechatSessionId: deps.config.sessionId,
+        sessions: rows.map((r) => ({
+          id: r.id,
+          ...(r.title === undefined ? {} : { title: r.title }),
+          ...(r.cwd === undefined ? {} : { cwd: r.cwd }),
+          createdAt: new Date(r.createdAt).toISOString(),
+          live: r.live,
+          persisted: r.persisted,
           // The distinction that matters for "正在进行": live means resumed into
           // memory, running means a turn is executing right now.
-          running: agent?.status === "running",
-        };
+          running: r.running,
+        })),
       });
-      send(res, 200, { ok: true, wechatSessionId: deps.config.sessionId, sessions });
     },
 
     /** The tail of one conversation, as plain text. */
@@ -351,36 +234,23 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
       const sessionId = requireString(body, "sessionId");
       const rawLimit = Number(body.limit ?? 20);
       const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 200) : 20;
-      const sq = sessionQuery();
-      if (sq === undefined) {
+      const messages = await readDshSession(ctx, sessionId);
+      if (messages === undefined) {
         send(res, 501, { ok: false, message: "no sessionQuery service in this composition" });
         return;
       }
-      const surface = await sq.readSurface(sessionId);
-      const messages = surface.events
-        .filter((e) => e.type === "user/message" || e.type === "assistant/message")
-        .map((e) => ({
-          role: e.type === "user/message" ? "user" : "assistant",
-          at: new Date(e.time).toISOString(),
-          seq: e.seq,
-          text: eventText(e).slice(0, TAIL_TEXT_CAP),
-        }))
-        .filter((m) => m.text !== "");
       send(res, 200, {
         ok: true,
         sessionId,
         total: messages.length,
-        messages: messages.slice(-limit),
+        messages: messages.slice(-limit).map((m) => ({ ...m, at: new Date(m.at).toISOString() })),
       });
     },
 
     /**
-     * Put a message into a live session.
-     *
-     * steer vs followup is not a style choice: a running driver must be steered
-     * into its nearest step, while an idle one needs followup to start a turn.
-     * Calling the wrong one either drops the message or starts a second
-     * concurrent turn — the same distinction WechatBridge.drainQueue makes.
+     * Put a message into a live session (sendToDshSession has the steer vs
+     * followup rule). Only a live one: a coding agent that wakes conversations
+     * nobody is looking at is a bigger step than this route was granted.
      */
     async sendMessage(req, res) {
       const body = await readJsonBody(req);
@@ -391,37 +261,23 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
         ? Math.min(Math.max(Math.trunc(Number(body.waitMs)), 1_000), 600_000)
         : DEFAULT_WAIT_MS;
 
-      const agent = ctx.agents.get(SessionId(sessionId));
-      if (agent === undefined) {
-        send(res, 409, {
-          ok: false,
-          message:
-            `session "${sessionId}" is not live — nothing is holding it in memory. ` +
-            "Open it in the web UI (or send it a WeChat message) and try again.",
-        });
-        return;
-      }
       // A distinct plugin source, NOT "wechat-clawbot": the bridge's
       // session listener treats any non-schedule plugin turn as GUI-only and
       // leaves currentSender unset, so a message injected here is answered in
       // the web UI and does NOT get forwarded to WeChat. That is the intended
       // split — dsh_wechat_notify is the only route that reaches the phone.
-      const message = createUserMessage({
-        content: [{ type: "text", text }],
-        // v4 refuses the retired `plugin` wrapper; this is the kind the v3→v4
-        // converter assigns this producer, so migrated history matches.
-        source: { kind: "plugin:clawbot-mcp" } as never,
-      });
-      const before = agent.session.seq;
-      const wasRunning = agent.status === "running";
-      if (wasRunning) agent.steer(message);
-      else agent.followup(message);
-      logger.info(
-        `mcp send: ${wasRunning ? "steered" : "followed up"} ${text.length} chars into ${sessionId}`,
-      );
-
+      const sent = await sendToDshSession(ctx, sessionId, text, { kind: "plugin:clawbot-mcp", wake: false });
+      if (!sent.ok) {
+        send(res, 409, { ok: false, message: sent.message });
+        return;
+      }
       if (!wait) {
-        send(res, 200, { ok: true, sessionId, delivered: wasRunning ? "steered" : "followup" });
+        send(res, 200, { ok: true, sessionId, delivered: sent.delivered });
+        return;
+      }
+      const agent = ctx.agents.get(SessionId(sessionId));
+      if (agent === undefined) {
+        send(res, 200, { ok: true, sessionId, delivered: sent.delivered, replies: [] });
         return;
       }
       // Never hold the HTTP request open indefinitely: a long agent turn would
@@ -435,7 +291,7 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
       ]);
       const replies: string[] = [];
       for (const event of agent.session.snapshotEvents()) {
-        if (event.seq <= before) continue;
+        if (event.seq <= sent.before) continue;
         if (event.type !== "assistant/message") continue;
         const body_ = eventText(event as { type: string; data?: unknown });
         if (body_) replies.push(body_.slice(0, TAIL_TEXT_CAP));
@@ -443,7 +299,7 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
       send(res, 200, {
         ok: true,
         sessionId,
-        delivered: wasRunning ? "steered" : "followup",
+        delivered: sent.delivered,
         ...(timedOut ? { stillRunning: true, waitedMs: waitMs } : {}),
         replies,
       });
@@ -456,50 +312,20 @@ function buildHandlers(ctx: Context, deps: McpRouteDeps): Handlers {
       if (body.source !== undefined && body.source !== "Claude" && body.source !== "Codex") {
         throw new Error('"source" must be Claude or Codex');
       }
-      const account = deps.getAccount();
-      if (account === null || !account.configured) {
-        send(res, 503, { ok: false, message: "no bound WeChat account — run `clawbot login` first" });
-        return;
-      }
-      const owner = account.userId;
-      if (owner === undefined || owner === "") {
-        send(res, 503, {
-          ok: false,
-          message: "the bound account has no linked userId; re-run the QR login so it is recorded",
-        });
-        return;
-      }
-      const source = body.source === "Codex" ? "Codex" : "Claude";
       if (body.summary !== undefined && typeof body.summary !== "string") throw new Error('"summary" must be a string');
-      try {
-        await deps.sendText(owner, text);
-      } catch (err) {
-        if (!isSendWindowClosed(err) || deps.backlog === undefined) throw err;
-        // WeChat will not let the bot write first right now: keep one sentence
-        // for the digest the owner gets after their next message (backlog.ts).
-        const given = typeof body.summary === "string" ? body.summary.trim() : "";
-        const summary = given !== "" ? given.slice(0, 120) : oneSentence(text);
-        deps.backlog.add(owner, { kind: "notice", at: new Date().toISOString(), source, summary });
-        logger.info(`mcp notify: WeChat will not let the bot write first now; kept "${summary}" for the owner's next message`);
-        const mirrored = mirrorIntoSession(ctx, deps.config.sessionId, text, source, "暂未送达，对方下次发消息后合并补发");
-        send(res, 200, {
-          ok: true,
-          deferred: true,
-          to: owner,
-          chars: text.length,
-          summary,
-          mirrored,
-          message: "微信现在不让 bot 主动发消息（机主有一段时间没发消息了）。这条已存下，机主下次发消息、bot 回复之后，"
-            + "会和其他没送达的消息按时间合并成一条补发，这条只保留一句：" + summary,
-        });
+      const outcome = await notifyOwner(ctx, deps, {
+        text,
+        ...(typeof body.summary === "string" ? { summary: body.summary } : {}),
+        source: body.source === "Codex" ? "Codex" : "Claude",
+      });
+      if (!outcome.ok) {
+        send(res, outcome.status, { ok: false, message: outcome.message });
         return;
       }
-      logger.info(`mcp notify: sent ${text.length} chars to the owner`);
-      const mirrored = mirrorIntoSession(ctx, deps.config.sessionId, text, source);
       // Echo the recipient back so a wrong destination would be visible at the
       // call site instead of only in the recipient's chat. `mirrored` says
       // whether the bot's own history now contains a copy.
-      send(res, 200, { ok: true, to: owner, chars: text.length, mirrored });
+      send(res, 200, outcome);
     },
 
     async reportProgress(req, res) {

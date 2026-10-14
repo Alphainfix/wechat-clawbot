@@ -25,6 +25,7 @@ import { registerWechatGuidanceGlobal } from "./prompt.js";
 import { registerSubagentModelPolicy } from "./subagent-model.js";
 import { registerModelsRoute } from "./models-route.js";
 import { registerMcpRoutes } from "./mcp-route.js";
+import { registerOwnerNotifyTool } from "./owner-notify.js";
 import { CodexPeer } from "./codex-peer.js";
 import { claimInstance } from "./instance-guard.js";
 import { CodexProgressStore } from "./codex-progress.js";
@@ -267,6 +268,16 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // registerModelsRoute because it needs `sendText` and the account getter,
   // both defined just above.
   registerMcpRoutes(ctx, { config, sendText, getAccount: () => currentAccount, codexProgress, backlog });
+
+  // notify_wechat for every other DSH conversation, in every working directory:
+  // registered on the root context, so it is global (owner-notify.ts). The
+  // WeChat conversation hides it (bridge.ts restrictTools) and the tool refuses
+  // it as well, because that conversation already has send_wechat_text.
+  try {
+    registerOwnerNotifyTool(ctx, { config, sendText, getAccount: () => currentAccount, backlog });
+  } catch (err) {
+    logger.warn(`notify_wechat: registration failed: ${String(err).slice(0, 200)}`);
+  }
 
   /** Pick the first bound account (v1 supports a single account). */
   const pickAccount = (): ResolvedWeixinAccount | null => {

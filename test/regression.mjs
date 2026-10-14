@@ -13,10 +13,10 @@
  *
  * Exits non-zero when any check fails, so it can gate a build.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, lstatSync, readdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, lstatSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
@@ -385,7 +385,13 @@ function check(name, ok, detail) {
   // other than the owner" cannot be expressed at all.
   const notifyAt = routeSrc.indexOf("async notify(");
   const notifyBody = notifyAt < 0 ? "" : routeSrc.slice(notifyAt, notifyAt + 1200);
-  check("notify sends only to account.userId", /account\.userId/.test(notifyBody),
+  // The send itself moved to owner-notify.ts (shared with notify_wechat).
+  const ownerSrc = readFileSync(join(ROOT, "lib/owner-notify.js"), "utf-8");
+  const ownerAt = ownerSrc.indexOf("async function notifyOwner(");
+  const ownerBody = ownerAt < 0 ? "" : ownerSrc.slice(ownerAt, ownerAt + 1500);
+  check("notify sends only to account.userId",
+    /account\.userId/.test(ownerBody) && /deps\.sendText\(owner, text\)/.test(ownerBody)
+      && /notifyOwner\(ctx, deps,/.test(notifyBody),
     "the recipient must come from the QR-linked account, never from the request");
   check("notify reads no recipient from the request body",
     notifyAt >= 0 && !/requireString\(body,\s*"(to|recipient|userId)"/.test(notifyBody),
@@ -1816,10 +1822,11 @@ function check(name, ok, detail) {
   const toolSrc = readFileSync(join(ROOT, "src/tool.ts"), "utf-8");
   check("send_wechat_file keeps a file WeChat refused and tells the model not to retry",
     /if \(upload\.windowClosed\) \{[\s\S]{0,200}bridge\.keepFile\(sender, \{ path: resolved, caption, original \}\);[\s\S]{0,200}不用重试/.test(toolSrc));
-  const routeSrc = readFileSync(join(ROOT, "src/mcp-route.ts"), "utf-8");
+  const notifySrc = readFileSync(join(ROOT, "src/owner-notify.ts"), "utf-8");
   check("an MCP notification WeChat refused is kept as one sentence and reported as deferred",
-    /if \(!isSendWindowClosed\(err\) \|\| deps\.backlog === undefined\) throw err;/.test(routeSrc)
-      && /kind: "notice"/.test(routeSrc) && /deferred: true/.test(routeSrc));
+    /if \(!isSendWindowClosed\(err\) \|\| deps\.backlog === undefined\) throw err;/.test(notifySrc)
+      && /kind: "notice"/.test(notifySrc) && /deferred: true/.test(notifySrc)
+      && /await notifyOwner\(ctx, deps,/.test(readFileSync(join(ROOT, "src/mcp-route.ts"), "utf-8")));
 }
 
 // ------------------------- 补发的几处边界(2026-10-12 审查):一次只补发一份;文件失败分「永远不行」和「下次再试」
@@ -1925,6 +1932,187 @@ function check(name, ok, detail) {
   check("backlog: detached work never leaves a rejection unhandled (DSH exits on one)",
     /void this\.sendKeptFiles\(to, items\)\s*\.catch\(/.test(bridgeSrc) && /\.catch\(\(err: unknown\) => logger\.warn\(`afterOtherTurn: /.test(bridgeSrc));
   rmSync(dir, { recursive: true, force: true });
+  setLogLevel("info");
+}
+
+// ------------------------- bot 看得到 DSH 会话、DSH 会话能发微信(2026-10-13)
+{
+  const { setLogLevel } = await import(join(ROOT, "lib/ilink/util/logger.js"));
+  setLogLevel("error");
+  const ds = await import(join(ROOT, "lib/dsh-sessions.js"));
+  const on = await import(join(ROOT, "lib/owner-notify.js"));
+  const bl = await import(join(ROOT, "lib/backlog.js"));
+
+  // A host with three conversations: the WeChat one, one running, one closed.
+  const steered = [], followed = [], appended = [], woken = [];
+  const mkAgent = (id, status, cwd) => ({
+    status,
+    session: { id, seq: 7, header: { cwd }, append: (type, msg) => appended.push({ id, type, msg }) },
+    steer: (m) => steered.push({ id, m }),
+    followup: (m) => followed.push({ id, m }),
+  });
+  const agents = new Map([
+    ["wechat-main", mkAgent("wechat-main", "idle", "/work")],
+    ["s-run-1111", mkAgent("s-run-1111", "running", "/work/plugin")],
+  ]);
+  const records = [
+    { header: { id: "wechat-main", createdAt: 1, cwd: "/work" }, live: true, persisted: true },
+    { header: { id: "s-run-1111", createdAt: 3, cwd: "/work/plugin" }, live: true, persisted: true },
+    { header: { id: "s-old-2222", createdAt: 2, cwd: "/work/weather" }, live: false, persisted: true },
+  ];
+  const titles = { "wechat-main": "微信", "s-run-1111": "插件发布", "s-old-2222": "天气预报" };
+  const services = {
+    sessionQuery: {
+      listSessions: async () => records,
+      readTitleSnapshots: async (ids) => ids.map((id) => ({ status: "fulfilled", value: { title: { title: titles[id] } } })),
+      readSurface: async (id) => ({ capturedThroughSeq: null, events: [
+        { type: "user/message", seq: 1, time: Date.parse("2026-10-13T14:00:00Z"), data: { content: [{ type: "text", text: `问 ${id}` }] } },
+        { type: "assistant/message", seq: 2, time: Date.parse("2026-10-13T14:01:00Z"), data: { message: { content: [{ type: "text", text: "答好了" }] } } },
+      ] }),
+    },
+    sessionController: {
+      resolveAgent: async (id) => {
+        woken.push(String(id));
+        const a = mkAgent(String(id), "idle", "/work/weather");
+        agents.set(String(id), a);
+        return { agent: a };
+      },
+    },
+  };
+  const globalTools = new Map();
+  const rootCtx = {
+    agents: { list: () => [...agents.values()], get: (id) => agents.get(String(id)) },
+    get: (name) => services[name],
+    tools: { register: (t) => globalTools.set(t.name, t) },
+  };
+  const botTools = new Map();
+  ds.registerDshSessionTools({ tools: { register: (t) => botTools.set(t.name, t) } }, rootCtx, "wechat-main");
+  check("the bot gets list/read/send for DSH conversations",
+    ["list_dsh_sessions", "read_dsh_session", "send_to_dsh_session"].every((n) => botTools.has(n)));
+  const listed = await botTools.get("list_dsh_sessions").execute({});
+  check("the list covers every folder, running first, and leaves out the WeChat conversation",
+    /2 个会话\(1 个正在运行\)/.test(listed.summary) && listed.summary.indexOf("插件发布") < listed.summary.indexOf("天气预报")
+      && !listed.summary.includes("微信 —") && /weather/.test(listed.summary), listed.summary);
+  const read = await botTools.get("read_dsh_session").execute({ session: "天气" });
+  check("a conversation is found by title words and read as user/DSH lines",
+    read.ok && /会话「天气预报」/.test(read.summary) && /用户:问 s-old-2222/.test(read.summary) && /DSH:答好了/.test(read.summary), read.summary);
+  const sentRun = await botTools.get("send_to_dsh_session").execute({ session: "s-run", text: "用户在微信里说:继续" });
+  check("a running conversation is steered", sentRun.ok && steered.length === 1 && steered[0].id === "s-run-1111", sentRun.summary);
+  const sentOld = await botTools.get("send_to_dsh_session").execute({ session: "weather", text: "用户在微信里说:跑一下" });
+  check("…a closed one is woken through the host's session controller, then followed up",
+    sentOld.ok && woken.join() === "s-old-2222" && followed.length === 1 && /已唤醒/.test(sentOld.summary), sentOld.summary);
+  check("…with a plugin source the WeChat listener does not forward", followed[0]?.m?.source?.kind === "plugin:clawbot-wechat",
+    JSON.stringify(followed[0]?.m?.source));
+  const ambiguous = await botTools.get("read_dsh_session").execute({ session: "s-" });
+  check("an ambiguous name comes back with the candidates", !ambiguous.ok && /对上了 2 个会话/.test(ambiguous.summary), ambiguous.summary);
+
+  // notify_wechat: global, refuses the WeChat conversation, names its sender, waits when WeChat refuses.
+  const dir = join(tmpdir(), `clawbot-notify-${process.pid}`);
+  mkdirSync(dir, { recursive: true });
+  const backlog = new bl.Backlog(join(dir, "backlog.json"));
+  const sentTexts = [];
+  let refuse = false;
+  on.registerOwnerNotifyTool(rootCtx, {
+    config: { sessionId: "wechat-main" },
+    sendText: async (to, text) => {
+      if (refuse) throw new Error("sendMessage ret=-2 errmsg=prepare failed");
+      sentTexts.push({ to, text });
+    },
+    getAccount: () => ({ configured: true, userId: "owner@im.wechat" }),
+    backlog,
+  });
+  const notify = globalTools.get("notify_wechat");
+  check("notify_wechat is registered on the root context, so every DSH conversation gets it", notify !== undefined);
+  const self = await notify.execute({ text: "hi" }, { agent: { session: { id: "wechat-main" } } });
+  check("…the WeChat conversation itself is refused (it has send_wechat_text)", !self.ok && sentTexts.length === 0);
+  const ok = await notify.execute({ text: "插件 2.0 打包好了" }, { agent: { session: { id: "s-run-1111" } } });
+  check("…another conversation's message goes to the QR-linked owner only",
+    ok.ok && sentTexts.length === 1 && sentTexts[0].to === "owner@im.wechat", ok.summary);
+  check("…and the bot's history gets a copy naming the sending conversation",
+    appended.some((a) => a.id === "wechat-main" && /\[DSH 会话「插件发布」发给用户的\] 插件 2\.0 打包好了/.test(a.msg.content?.[0]?.text ?? "")));
+  refuse = true;
+  const kept = await notify.execute({ text: "天气预报跑完了，明天晴。明细见网页。", summary: "天气预报:明天晴" },
+    { agent: { session: { id: "s-old-2222" } } });
+  const item = backlog.peek("owner@im.wechat")[0];
+  check("…a message WeChat refuses is kept with its sender and one sentence",
+    kept.ok && /已存下/.test(kept.summary) && item?.kind === "notice" && item.source === "DSH" && item.origin === "天气预报"
+      && item.summary === "天气预报:明天晴", JSON.stringify(item));
+  check("…and the digest says which conversation it came from",
+    /DSH 会话「天气预报」的通知\n天气预报:明天晴/.test(bl.formatDigest([item], { fileExists: () => true })[0] ?? ""));
+  rmSync(dir, { recursive: true, force: true });
+  const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("the WeChat conversation hides notify_wechat and gets the DSH session tools",
+    /const deny = \[[^\]]*NOTIFY_TOOL,/.test(bridgeSrc) && /registerDshSessionTools\(agentCtx, this\.ctx, this\.config\.sessionId\);/.test(bridgeSrc));
+  const indexSrc = readFileSync(join(ROOT, "src/index.ts"), "utf-8");
+  check("notify_wechat is registered before the bridge exists (so the deny list knows the name)",
+    indexSrc.indexOf("registerOwnerNotifyTool(ctx,") > 0
+      && indexSrc.indexOf("registerOwnerNotifyTool(ctx,") < indexSrc.indexOf("bridge = new WechatBridge("));
+  setLogLevel("info");
+}
+
+// ------------------------- bot 给 Claude 会话发消息:用最新的 claude、拉活失败要收拾、干完交还桌面版(2026-10-13)
+{
+  const { setLogLevel } = await import(join(ROOT, "lib/ilink/util/logger.js"));
+  setLogLevel("error");
+  // A fake home with an OLD npm install under nvm (found first) and a NEW native install.
+  const home = join(tmpdir(), `clawbot-claude-home-${process.pid}`);
+  rmSync(home, { recursive: true, force: true });
+  const pkg = join(home, ".nvm/versions/node/v24.16.0/lib/node_modules/@anthropic-ai/claude-code");
+  mkdirSync(join(pkg, "bin"), { recursive: true });
+  writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@anthropic-ai/claude-code", version: "2.1.229" }));
+  writeFileSync(join(pkg, "bin/claude.exe"), "#!/bin/sh\n", { mode: 0o755 });
+  mkdirSync(join(home, ".nvm/versions/node/v24.16.0/bin"), { recursive: true });
+  symlinkSync(join(pkg, "bin/claude.exe"), join(home, ".nvm/versions/node/v24.16.0/bin/claude"));
+  mkdirSync(join(home, ".local/share/claude/versions"), { recursive: true });
+  writeFileSync(join(home, ".local/share/claude/versions/2.1.296"), "#!/bin/sh\n", { mode: 0o755 });
+  mkdirSync(join(home, ".local/bin"), { recursive: true });
+  symlinkSync(join(home, ".local/share/claude/versions/2.1.296"), join(home, ".local/bin/claude"));
+  const saved = { HOME: process.env.HOME, PATH: process.env.PATH };
+  process.env.HOME = home;
+  process.env.PATH = "/usr/bin:/bin";
+  let chosen;
+  try {
+    const fresh = await import(`${pathToFileURL(join(ROOT, "lib/claude-peer.js")).href}?newest=${process.pid}`);
+    chosen = fresh.resolveClaudeBinaryForTest();
+  } finally {
+    process.env.HOME = saved.HOME;
+    process.env.PATH = saved.PATH;
+  }
+  check("the newest claude wins over the first one found (an old nvm install sorts first)",
+    chosen === join(home, ".local/bin/claude"), `got ${chosen}`);
+  rmSync(home, { recursive: true, force: true });
+
+  const { strayJobs, releaseStep } = await import(join(ROOT, "lib/claude-peer.js"));
+  const target = { sessionId: "11112222-x", cwd: "/w/manual" };
+  const before = [{ id: "aaaa1111", sessionId: "aaaa1111-x", cwd: "/w/other" }];
+  const after = [...before,
+    { id: "33334444", sessionId: "33334444-x", cwd: "/w/manual" },   // forked by an old CLI
+    { id: "11112222", sessionId: "11112222-x", cwd: "/w/manual" },   // the conversation itself
+    { id: "bbbb2222", sessionId: "bbbb2222-x", cwd: "/w/elsewhere" }];
+  check("a revive that never registered: its leftovers (same id, or forked in its folder) are stopped, others are not",
+    strayJobs(before, after, target).map((j) => j.id).join() === "33334444,11112222");
+  check("…and without a before-picture only the conversation itself is stopped (the rest may be the owner's)",
+    strayJobs(undefined, after, target).map((j) => j.id).join() === "11112222"
+      && strayJobs(before, after, { sessionId: "11112222-x" }).map((j) => j.id).join() === "11112222");
+
+  const t0 = 1_000_000;
+  let st = { sawBusy: false };
+  let r = releaseStep(st, "busy", t0, t0); st = r.state;
+  r = releaseStep(st, "idle", t0 + 5_000, t0); st = r.state;
+  const early = r.release;
+  r = releaseStep(st, "idle", t0 + 36_000, t0);
+  check("a woken conversation is handed back once it has worked and then stayed idle for 30 s",
+    early === false && r.release === true);
+  let quick = releaseStep({ sawBusy: false }, "idle", t0 + 10_000, t0);
+  quick = releaseStep(quick.state, "idle", t0 + 95_000, t0);
+  check("…one that answered between two looks is handed back after 90 s of quiet",
+    quick.release === true && releaseStep({ sawBusy: false }, "idle", t0 + 40_000, t0).release === false);
+  check("…and one still busy is left alone", releaseStep({ sawBusy: true }, "busy", t0 + 9_000_000, t0).release === false);
+  const peerSrc = readFileSync(join(ROOT, "src/claude-peer.ts"), "utf-8");
+  check("a relay that fails after a revive stops the background session again",
+    /wokenByUs\.delete\(live\.sessionId\);\s*const stopped = await stopBackground\(bin, job, "the relay into it failed"\);/.test(peerSrc));
+  check("one revive per conversation at a time",
+    /const prior = reviving\.get\(target\.sessionId\);/.test(peerSrc) && /reviving\.set\(target\.sessionId, run\);/.test(peerSrc));
   setLogLevel("info");
 }
 

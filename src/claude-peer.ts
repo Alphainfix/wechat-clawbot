@@ -201,21 +201,71 @@ const RESUME_TIMEOUT_MS = 300_000;
  * are independent facts. Neither may be hardcoded and neither may be assumed
  * from the other.
  */
-let claudeBinCache: string | undefined;
+/**
+ * Pick the NEWEST of the installed binaries, not the first one found.
+ *
+ * Twice now (2026-09-09, 2026-10-13) the first hit was an old npm install under
+ * an nvm version while a current one sat elsewhere, and the session's model
+ * refused it with `400 … version X or newer is required`. On 2026-10-13 that
+ * old CLI also forked the revived conversation into new background sessions
+ * instead of resuming it. The version is read from the file system, not by
+ * running the binary: the native installer links `~/.local/bin/claude` to
+ * `…/versions/<version>`, and an npm install resolves into
+ * `@anthropic-ai/claude-code`, whose package.json carries it.
+ */
+let claudeBinCache: { bin: string; version?: string; at: number } | undefined;
+
+/** How long a choice is trusted before the candidates are looked at again (an update may land elsewhere). */
+const CLAUDE_BIN_TTL_MS = 10 * 60_000;
+
+/** The version a `claude` binary reports, from where it resolves to; undefined when that does not say. */
+function claudeVersionOf(bin: string): string | undefined {
+  let real: string;
+  try {
+    real = fs.realpathSync(bin);
+  } catch {
+    return undefined;
+  }
+  const named = /^(\d+\.\d+\.\d+)/.exec(path.basename(real));
+  if (named !== null) return named[1];
+  let dir = path.dirname(real);
+  for (let i = 0; i < 6; i++) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf-8")) as { name?: unknown; version?: unknown };
+      if (pkg.name === "@anthropic-ai/claude-code" && typeof pkg.version === "string") return pkg.version;
+    } catch {
+      // not this level
+    }
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return undefined;
+}
+
+/** Numeric dotted-version comparison: negative, zero or positive. */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split(/[.-]/).map((x) => Number.parseInt(x, 10));
+  const pb = b.split(/[.-]/).map((x) => Number.parseInt(x, 10));
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (Number.isFinite(pa[i]) ? pa[i] : 0) - (Number.isFinite(pb[i]) ? pb[i] : 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
 
 function findClaude(): string | undefined {
-  // Re-resolve when a cached path stops existing: an nvm upgrade or a `claude`
-  // reinstall moves it, and a stale cache would fail forever.
-  if (claudeBinCache !== undefined && fs.existsSync(claudeBinCache)) return claudeBinCache;
+  if (claudeBinCache !== undefined && Date.now() - claudeBinCache.at < CLAUDE_BIN_TTL_MS
+    && fs.existsSync(claudeBinCache.bin)) return claudeBinCache.bin;
+  const previous = claudeBinCache?.bin;
   claudeBinCache = undefined;
 
   const candidates: string[] = [];
-  // PATH first — when it does work, honour the user's own selection.
+  // PATH first: on equal versions the user's own selection wins.
   for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
     if (dir !== "") candidates.push(path.join(dir, "claude"));
   }
-  // Then every nvm version, newest first, so an upgrade is picked up without
-  // touching this file.
+  // Then every nvm version, and the usual global locations.
   const nvm = path.join(os.homedir(), ".nvm", "versions", "node");
   try {
     const versions = fs.readdirSync(nvm).sort().reverse();
@@ -223,21 +273,37 @@ function findClaude(): string | undefined {
   } catch {
     // no nvm on this machine
   }
-  // Then the usual global locations.
   for (const dir of ["/opt/homebrew/bin", "/usr/local/bin", path.join(os.homedir(), ".local/bin")]) {
     candidates.push(path.join(dir, "claude"));
   }
 
+  let best: { bin: string; version?: string } | undefined;
+  const seen = new Set<string>();
   for (const candidate of candidates) {
     try {
       fs.accessSync(candidate, fs.constants.X_OK);
-      claudeBinCache = candidate;
-      return candidate;
     } catch {
-      // not here
+      continue;
     }
+    let real = candidate;
+    try {
+      real = fs.realpathSync(candidate);
+    } catch {
+      // keep the link path
+    }
+    if (seen.has(real)) continue;
+    seen.add(real);
+    const version = claudeVersionOf(candidate);
+    const better = best === undefined
+      || (version !== undefined && (best.version === undefined || compareVersions(version, best.version) > 0));
+    if (better) best = { bin: candidate, ...(version === undefined ? {} : { version }) };
   }
-  return undefined;
+  if (best === undefined) return undefined;
+  claudeBinCache = { ...best, at: Date.now() };
+  if (best.bin !== previous) {
+    logger.info(`claude: using ${best.bin} (${best.version ?? "version unknown"}; newest of ${seen.size})`);
+  }
+  return best.bin;
 }
 
 /** Cap on transcript text per message, so one huge turn cannot flood a reply. */
@@ -254,6 +320,10 @@ type PeerSession = {
   startedAt?: number;
   peerProtocol?: number;
   messagingSocketPath?: string;
+  /** "busy" while a turn runs, "idle" otherwise (newer CLIs). */
+  status?: string;
+  /** "claude-desktop" for a session the desktop app owns. */
+  entrypoint?: string;
   /**
    * True for a session that exists only as a transcript — closed, or never
    * reopened. Reachable by `--resume`, not by the peer socket, so the send path
@@ -949,6 +1019,172 @@ function resolveReviveMode(
   return { mode: recorded, why: `沿用会话原本的 ${recorded}` };
 }
 
+// ------------------------------------------------- background-session hygiene
+//
+// A revived session runs as a background session, and a background session is
+// EXCLUSIVE: while it runs the desktop app cannot open that conversation. On
+// 2026-10-13 that went wrong three ways at once: a revive that never registered
+// left its process running anyway, the next attempt started another, and the
+// one that did register was never stopped — so the owner's desktop session was
+// locked although the message never arrived. Three rules now:
+//   1. one revive per conversation at a time (`reviving`);
+//   2. a revive that does not register is stopped, together with any background
+//      session it spawned under a new id (an older CLI forks instead of resuming);
+//   3. once the relayed work is done the session is stopped again, handing the
+//      conversation back to the desktop app (`releaseWhenDone`).
+
+/** One active background session as `claude agents --json` reports it. */
+type BackgroundJob = { id: string; sessionId: string; cwd?: string; state?: string };
+
+/** States after which a background session holds nothing. */
+const FINISHED = /^(failed|completed|stopped|done|exited|killed)$/i;
+
+/** Active background sessions; undefined when the CLI cannot say (an old one without `agents`). */
+async function activeBackground(bin: string): Promise<BackgroundJob[] | undefined> {
+  try {
+    const { stdout } = await runHelper(bin, ["agents", "--json"], undefined, undefined, 20_000);
+    const rows = JSON.parse(stdout) as unknown;
+    if (!Array.isArray(rows)) return undefined;
+    const jobs: BackgroundJob[] = [];
+    for (const row of rows) {
+      const r = row as { id?: unknown; sessionId?: unknown; kind?: unknown; state?: unknown; cwd?: unknown };
+      if (r.kind !== "background" || typeof r.sessionId !== "string") continue;
+      if (typeof r.state === "string" && FINISHED.test(r.state)) continue;
+      jobs.push({
+        id: typeof r.id === "string" && r.id !== "" ? r.id : r.sessionId.slice(0, 8),
+        sessionId: r.sessionId,
+        ...(typeof r.cwd === "string" ? { cwd: r.cwd } : {}),
+        ...(typeof r.state === "string" ? { state: r.state } : {}),
+      });
+    }
+    return jobs;
+  } catch (err) {
+    logger.warn(`send_to_claude_session: cannot list background sessions: ${String(err).slice(-160)}`);
+    return undefined;
+  }
+}
+
+/** Stop one background session (its conversation is kept). */
+async function stopBackground(bin: string, job: string, why: string): Promise<boolean> {
+  try {
+    await runHelper(bin, ["stop", job], undefined, undefined, 20_000);
+    logger.info(`send_to_claude_session: stopped background session ${job} (${why})`);
+    return true;
+  } catch (err) {
+    const e = err as { stdout?: unknown; stderr?: unknown };
+    logger.warn(`send_to_claude_session: could not stop ${job} (${why}): `
+      + `${`${String(e.stdout ?? "")} ${String(e.stderr ?? "")}`.trim().slice(-160)}`);
+    return false;
+  }
+}
+
+/**
+ * The background sessions a revive left behind: anything active now that was
+ * not before and runs in the revived session's directory, plus the session
+ * itself if it is running in the background.
+ */
+export function strayJobs(
+  before: readonly BackgroundJob[] | undefined,
+  after: readonly BackgroundJob[],
+  target: { sessionId: string; cwd?: string },
+): BackgroundJob[] {
+  // Without a before-picture, or without both folders, only the conversation
+  // itself is certain to be ours: anything else could be the owner's own.
+  if (before === undefined) return after.filter((j) => j.sessionId === target.sessionId);
+  const known = new Set(before.map((j) => j.sessionId));
+  return after.filter((j) => j.sessionId === target.sessionId
+    || (!known.has(j.sessionId) && target.cwd !== undefined && j.cwd === target.cwd));
+}
+
+/** Conversations being revived right now, so a second message waits instead of starting another. */
+const reviving = new Map<string, Promise<unknown>>();
+
+/** Conversations this plugin woke, with when a message was last relayed into each. */
+const wokenByUs = new Map<string, { job: string; lastRelayAt: number; watching: boolean }>();
+
+const RELEASE_POLL_MS = 5_000;
+/** Idle this long after working → the relayed work is done. */
+const RELEASE_IDLE_MS = 30_000;
+/** Never seen busy (a quick answer between polls) → done once idle this long after the relay. */
+const RELEASE_NEVER_BUSY_MS = 90_000;
+/** Stop watching after this; the session is left as it is and the log says so. */
+const RELEASE_GIVE_UP_MS = 6 * 3_600_000;
+
+/**
+ * What the watcher should do with one observation. Pure, so the rule can be
+ * tested without a real background session.
+ */
+export function releaseStep(
+  state: { sawBusy: boolean; idleSince?: number },
+  status: string | undefined,
+  now: number,
+  lastRelayAt: number,
+): { state: { sawBusy: boolean; idleSince?: number }; release: boolean } {
+  const next = { ...state };
+  if (status === "busy") {
+    next.sawBusy = true;
+    delete next.idleSince;
+  } else if (status === "idle") {
+    next.idleSince ??= now;
+  } else {
+    delete next.idleSince;
+  }
+  const quiet = next.idleSince === undefined ? 0 : now - next.idleSince;
+  const release = (next.sawBusy && quiet >= RELEASE_IDLE_MS)
+    || (!next.sawBusy && now - lastRelayAt >= RELEASE_NEVER_BUSY_MS && quiet >= RELEASE_IDLE_MS);
+  return { state: next, release };
+}
+
+/**
+ * Watch a session this plugin woke and stop it once the relayed message has
+ * been worked on, so the desktop app can open the conversation again. A newer
+ * relay into the same session restarts the wait.
+ */
+function releaseWhenDone(bin: string, sessionId: string): void {
+  const entry = wokenByUs.get(sessionId);
+  if (entry === undefined || entry.watching) return;
+  entry.watching = true;
+  const started = Date.now();
+  let seenRelay = entry.lastRelayAt;
+  let state: { sawBusy: boolean; idleSince?: number } = { sawBusy: false };
+  let busy = false;
+  const timer = setInterval(() => {
+    if (busy) return;
+    const current = wokenByUs.get(sessionId);
+    if (current === undefined) {
+      clearInterval(timer);
+      return;
+    }
+    if (current.lastRelayAt !== seenRelay) {
+      seenRelay = current.lastRelayAt;
+      state = { sawBusy: false };
+    }
+    const row = listSessions().find((s) => s.sessionId === sessionId);
+    if (row === undefined || (row.kind !== "bg" && row.kind !== "background")) {
+      // Gone (someone stopped it) or now owned differently: nothing to hand back.
+      clearInterval(timer);
+      wokenByUs.delete(sessionId);
+      return;
+    }
+    const now = Date.now();
+    const step = releaseStep(state, row.status, now, seenRelay);
+    state = step.state;
+    if (step.release) {
+      clearInterval(timer);
+      wokenByUs.delete(sessionId);
+      busy = true;
+      void stopBackground(bin, current.job, "relayed work done; handing it back to the desktop app");
+      return;
+    }
+    if (now - started > RELEASE_GIVE_UP_MS) {
+      clearInterval(timer);
+      current.watching = false;
+      logger.warn(`send_to_claude_session: ${sessionId.slice(0, 8)} still busy after 6 h; left running in the background`);
+    }
+  }, RELEASE_POLL_MS);
+  timer.unref?.();
+}
+
 /** How long to wait for a revived session to register itself as a peer. */
 const REVIVE_REGISTER_TIMEOUT_MS = 20_000;
 
@@ -1046,7 +1282,8 @@ async function relayToLive(
     // happened.
     const ok = /^sent\b/i.test(reply);
     logger.info(
-      `send_to_claude_session: -> ${target} (${shortId}) ok=${ok} (${body.length} chars)`,
+      `send_to_claude_session: -> ${target} (${shortId}) ok=${ok} (${body.length} chars)`
+      + (ok ? "" : ` reply: ${reply.replace(/\s+/g, " ").slice(0, 160)}`),
     );
     return {
       ok,
@@ -1127,6 +1364,34 @@ async function sendToDormant(
   body: string,
   configured: ClaudeResumeMode,
 ): Promise<{ ok: boolean; summary: string }> {
+  // One revive per conversation: a second message waits for the first and then
+  // goes through the ordinary relay if the session came up.
+  const prior = reviving.get(target.sessionId);
+  if (prior !== undefined) {
+    await prior.catch(() => undefined);
+    const up = listSessions().find((s) => s.sessionId === target.sessionId);
+    if (up !== undefined) {
+      const woken = wokenByUs.get(target.sessionId);
+      if (woken !== undefined) woken.lastRelayAt = Date.now();
+      return await relayToLive(agentCtx, bin, up, body);
+    }
+  }
+  const run = reviveAndSend(agentCtx, bin, target, body, configured);
+  reviving.set(target.sessionId, run);
+  try {
+    return await run;
+  } finally {
+    if (reviving.get(target.sessionId) === run) reviving.delete(target.sessionId);
+  }
+}
+
+async function reviveAndSend(
+  agentCtx: Context,
+  bin: string,
+  target: PeerSession,
+  body: string,
+  configured: ClaudeResumeMode,
+): Promise<{ ok: boolean; summary: string }> {
   const shortId = target.sessionId.slice(0, 8);
   // cwd's last segment is the most recognisable handle a dormant session has:
   // it carries no name, and its title may not have been in the tail window.
@@ -1144,26 +1409,38 @@ async function sendToDormant(
   const { mode, why } = resolveReviveMode(configured, facts.mode);
 
   // ---- preferred: wake it up, then relay like any open session -------------
+  const before = await activeBackground(bin);
   try {
     const live = await reviveAsBackground(bin, revivable, mode, helperToken);
     if (live !== undefined) {
       logger.info(
         `send_to_claude_session: revived ${shortId} as bg (mode=${mode}; ${why})`,
       );
-      // The note has to carry the hand-back commands, because a background
-      // session is EXCLUSIVE: while it runs, that conversation cannot be opened
-      // in the desktop app at all. Claude Code refuses with "is running as a
-      // background session", the app's child process exits 1, and the app shows
-      // "Claude Code crashed" — which is exactly what happened to the user on
-      // 2026-09-09, minutes after this path first shipped. The trade is inherent
-      // to --bg; the surprise is not, so every revive says how to undo it.
-      return await relayToLive(
+      const job = (await activeBackground(bin))?.find((j) => j.sessionId === live.sessionId)?.id ?? shortId;
+      wokenByUs.set(live.sessionId, { job, lastRelayAt: Date.now(), watching: false });
+      // A background session is EXCLUSIVE: while it runs, the desktop app
+      // cannot open that conversation (Claude Code refuses with "is running as
+      // a background session" and the app shows "Claude Code crashed"). So it
+      // is stopped again once the relayed work is done, and the note says how
+      // to get it back sooner.
+      const result = await relayToLive(
         agentCtx, bin, live, body,
-        `会话 ${label} 当时没开着,已在后台拉活(审批模式 ${mode} —— ${why})。`
-        + `\n注意:它现在是**后台会话**,在桌面版里打不开(会报错)。`
-        + `要自己接手:终端跑 \`claude attach ${shortId}\`;`
-        + `想在桌面版打开:先 \`claude stop ${shortId}\`。`,
+        `会话 ${label} 当时没开着,已在后台拉起来处理这条消息(审批模式 ${mode} —— ${why})。`
+        + `\n它处理完会自动停掉后台会话、交还给桌面版;处理期间桌面版打不开它(会报 Claude Code crashed),`
+        + `急着打开就在终端跑 \`claude stop ${job}\`;想在终端看它干活:\`claude attach ${job}\`。\n`,
       );
+      if (result.ok) {
+        releaseWhenDone(bin, live.sessionId);
+        return result;
+      }
+      wokenByUs.delete(live.sessionId);
+      const stopped = await stopBackground(bin, job, "the relay into it failed");
+      return {
+        ok: false,
+        summary: result.summary + (stopped
+          ? "\n拉起来的后台会话已经停掉了,桌面版可以正常打开它。"
+          : `\n拉起来的后台会话没能停掉:终端跑 \`claude stop ${job}\`,桌面版才能打开它。`),
+      };
     }
     logger.warn(
       `send_to_claude_session: ${shortId} revived but never registered as a peer; falling back`,
@@ -1179,6 +1456,16 @@ async function sendToDormant(
     logger.warn(
       `send_to_claude_session: revive of ${shortId} failed (${both.trim().slice(-160)}); falling back`,
     );
+  }
+  // A revive that did not register can still have left a process running —
+  // under the same id, or (an older CLI) forked under a new one — and either
+  // locks the conversation away from the desktop app. Stop them before the
+  // fallback touches the same conversation.
+  const after = await activeBackground(bin);
+  if (after !== undefined) {
+    for (const job of strayJobs(before, after, { sessionId: target.sessionId, cwd: revivable.cwd })) {
+      await stopBackground(bin, job.id, "left behind by a revive that never registered");
+    }
   }
 
   // ---- fallback: run the turn headlessly, the old way ----------------------
@@ -1429,10 +1716,10 @@ export function registerClaudePeerTools(
         + "conversation the user is watching, and a CLOSED one is first woken up in the background "
         + "(under the same conversation, keeping its history) and then receives it the same way. "
         + "The tool says which of the two happened, and which approval mode the woken session got. "
-        + "A woken session becomes a BACKGROUND session, which is exclusive: until it is stopped, that "
-        + "conversation cannot be opened in the desktop app (trying to shows 'Claude Code crashed'). "
-        + "The tool's reply carries the `claude attach` / `claude stop` commands — pass them on to the "
-        + "user rather than dropping them, or they will hit that error without knowing why. "
+        + "A woken session runs as a BACKGROUND session, which is exclusive: while it works on the message, "
+        + "that conversation cannot be opened in the desktop app (trying to shows 'Claude Code crashed'). "
+        + "It is stopped again automatically once the work is done, handing it back to the desktop app; the "
+        + "reply carries `claude stop` (to get it back sooner) and `claude attach` — pass them on to the user. "
         + "IMPORTANT — it does NOT arrive as if the user typed it. Claude Code labels it as coming "
         + "from another session and tells the receiver to treat it as a teammate's request, acted on "
         + "under that session's own permissions. So write the message as a relay: quote what the user "
@@ -1492,6 +1779,8 @@ export function registerClaudePeerTools(
             agentCtx, bin, found.session, body, config.claudeResumePermissionMode,
           );
         }
+        const woken = wokenByUs.get(found.session.sessionId);
+        if (woken !== undefined) woken.lastRelayAt = Date.now();
         return await relayToLive(agentCtx, bin, found.session, body);
       },
     }),

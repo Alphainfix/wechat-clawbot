@@ -399,7 +399,7 @@ check("delivery success is detected with an anchored match, not a substring",
     /"--bg", "--resume", target\.sessionId, "--permission-mode", mode/.test(src),
     "--bg --resume continues the session under the same ID and registers it as a peer");
   check("delivery then goes through the SAME relay as an open session",
-    /return await relayToLive\(\s*agentCtx, bin, live, body,/.test(src),
+    /await relayToLive\(\s*agentCtx, bin, live, body,/.test(src),
     "one mechanism, or the closed case drifts again");
   // A background session is EXCLUSIVE: while it runs, that conversation cannot
   // be opened in the desktop app — Claude Code refuses, the app's child exits 1,
@@ -407,7 +407,7 @@ check("delivery success is detected with an anchored match, not a substring",
   // after this path first shipped. The trade is inherent to --bg; the surprise
   // is not, so the reply must always carry the way out.
   check("a revive reply says how to hand the session back",
-    /claude attach \$\{shortId\}/.test(src) && /claude stop \$\{shortId\}/.test(src),
+    /claude attach \$\{(shortId|job)\}/.test(src) && /claude stop \$\{(shortId|job)\}/.test(src),
     "without these the user hits 'Claude Code crashed' with no idea why");
   check("the tool description warns the model to pass those on",
     /cannot be opened in the desktop app/.test(src) && /pass them on to the/.test(src));

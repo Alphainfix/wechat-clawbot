@@ -21,11 +21,14 @@ import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import { zonedDate, zonedStamp, zonedWeekday } from "./localtime.js";
 import { logger } from "./ilink/util/logger.js";
 
+/** Who sent a notification: Claude Code or Codex (MCP), or a DSH conversation (notify_wechat). */
+export type NoticeSource = "Claude" | "Codex" | "DSH";
+
 export type BacklogItem =
   /** A text the bot sent (a reminder, or any reply) that did not get through. */
   | { id: string; kind: "text"; at: string; text: string }
-  /** A notification from Claude or Codex, kept as one sentence. */
-  | { id: string; kind: "notice"; at: string; source: "Claude" | "Codex"; summary: string }
+  /** A notification from Claude, Codex or another DSH conversation (`origin` names it), kept as one sentence. */
+  | { id: string; kind: "notice"; at: string; source: NoticeSource; origin?: string; summary: string }
   /**
    * A file or image, sent again after the digest if it still exists. Once a
    * digest has said it follows (`announced`), later deliveries only retry it.
@@ -35,7 +38,7 @@ export type BacklogItem =
 /** What callers hand in; the backlog stamps the id. */
 export type NewBacklogItem =
   | { kind: "text"; at: string; text: string }
-  | { kind: "notice"; at: string; source: "Claude" | "Codex"; summary: string }
+  | { kind: "notice"; at: string; source: NoticeSource; origin?: string; summary: string }
   | { kind: "file"; at: string; path: string; caption?: string; original?: boolean };
 
 /** Items kept per recipient; the oldest go first beyond this. */
@@ -114,7 +117,10 @@ export function digestChunks(
   const entries = sorted.map((item) => {
     const due = `〔${dueStamp(new Date(item.at))}〕`;
     if (item.kind === "text") return `${due}\n${item.text}`;
-    if (item.kind === "notice") return `${due}${item.source} 的通知\n${item.summary}`;
+    if (item.kind === "notice") {
+      const from = item.origin === undefined ? item.source : `${item.source} 会话「${item.origin}」`;
+      return `${due}${from}${item.origin === undefined ? " " : ""}的通知\n${item.summary}`;
+    }
     const exists = opts.fileExists(item.path);
     const status = exists ? "（随后补发）" : "（文件已经不在了，没法补发）";
     // The file carries its own caption; when it is gone, the caption is all that is left.
