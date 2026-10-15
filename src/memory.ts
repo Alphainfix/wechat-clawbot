@@ -135,7 +135,13 @@ export function appendMemoryEntry(section: string, content: string): boolean {
   let body: string;
   try {
     body = fs.readFileSync(p, "utf-8");
-  } catch {
+  } catch (err) {
+    // Only a missing file starts from the template. Any other read failure
+    // must not be answered by writing a fresh file over the owner's memory.
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.warn(`memory: could not read memory.md, entry not added err=${String(err)}`);
+      return false;
+    }
     body = "";
   }
   // Dedupe: ignore if the exact content already appears on any bullet line
@@ -168,6 +174,11 @@ export function appendMemoryEntry(section: string, content: string): boolean {
     if (out.length && out[out.length - 1].trim() !== "") out.push("");
     out.push(`## ${target}`, entry);
   }
+
+  // The file's trailing newline splits into an empty last line; without this
+  // every append left one more blank line at the end, and enough of them would
+  // fill the tail the cap keeps (where the secretary's section sits).
+  while (out.length > 0 && out[out.length - 1].trim() === "") out.pop();
 
   // Cap total lines: keep the head (sections/older context) and newest tail.
   let final = out;

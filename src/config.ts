@@ -160,6 +160,28 @@ export interface ClawbotConfig {
    */
   codexPeer: boolean;
   codexTransport: "socket" | "stdio";
+
+  /**
+   * macOS Calendar for the bot (mac-calendar.ts): read every calendar, plan in
+   * one dedicated calendar. Off by default and cold for the same reason as
+   * codexPeer: while off the tools are not registered, so it costs nothing.
+   */
+  macCalendar: boolean;
+  /** The dedicated calendar's name, chosen by the owner (created on first use). Hot. */
+  macCalendarName: string;
+  /**
+   * Whether events the bot adds get a calendar alert by default, and how many
+   * minutes before. Hot. Calendar alerts ring on the phone through iCloud; they
+   * do not replace the bot's WeChat reminders (duplicates are fine).
+   */
+  macCalendarAlert: boolean;
+  macCalendarAlertMinutes: number;
+  /**
+   * The scheduling secretary (secretary.ts): planning rules written into
+   * memory.md while this and macCalendar are both on, moved out (and kept)
+   * when either goes off. Hot; index.ts edits the memory file on the flip.
+   */
+  secretary: boolean;
   codexBinary?: string;
   codexSocket?: string;
 
@@ -232,6 +254,11 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   mcpBridge: true,
   codexPeer: false,
   codexTransport: "socket",
+  macCalendar: false,
+  macCalendarName: "",
+  macCalendarAlert: true,
+  macCalendarAlertMinutes: 10,
+  secretary: false,
   imageQuality: 80,
   compressThresholdBytes: 1024 * 1024,
   noticeMinBytes: 2 * 1024 * 1024,
@@ -305,6 +332,17 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
     codexPeer:
       typeof r.codexPeer === "boolean" ? r.codexPeer : DEFAULT_CONFIG.codexPeer,
     codexTransport: r.codexTransport === "stdio" ? "stdio" : "socket",
+    macCalendar:
+      typeof r.macCalendar === "boolean" ? r.macCalendar : DEFAULT_CONFIG.macCalendar,
+    macCalendarName: typeof r.macCalendarName === "string" ? r.macCalendarName.trim().slice(0, 60) : DEFAULT_CONFIG.macCalendarName,
+    macCalendarAlert:
+      typeof r.macCalendarAlert === "boolean" ? r.macCalendarAlert : DEFAULT_CONFIG.macCalendarAlert,
+    macCalendarAlertMinutes:
+      typeof r.macCalendarAlertMinutes === "number" && Number.isFinite(r.macCalendarAlertMinutes)
+        ? Math.min(10_080, Math.max(0, Math.round(r.macCalendarAlertMinutes)))
+        : DEFAULT_CONFIG.macCalendarAlertMinutes,
+    secretary:
+      typeof r.secretary === "boolean" ? r.secretary : DEFAULT_CONFIG.secretary,
     codexBinary: typeof r.codexBinary === "string" && r.codexBinary.trim() ? r.codexBinary.trim() : undefined,
     codexSocket: typeof r.codexSocket === "string" && r.codexSocket.trim() ? r.codexSocket.trim() : undefined,
     noticeMinBytes:
@@ -388,6 +426,23 @@ export const BaseConfig = Schema.object({
     .description("【改动会重启微信监听】socket 通过 WebSocket 连接共享 Codex App Server;stdio 启动独立后台服务,只能在明确允许续聊后执行历史任务"),
   codexBinary: Schema.string()
     .description("【改动会重启微信监听】Codex CLI 路径,留空自动查找"),
+  macCalendar: Schema.boolean()
+    .default(false)
+    .description("【改动会重启微信监听】让 bot 读取 Mac「日历」里所有账户的日程(含备注),并在专用日历里自主安排(仅 macOS,默认关)。关着时不占 token"),
+  macCalendarName: Schema.string()
+    .default("")
+    .description("bot 专用日历的名字(例如「规划」)。bot 在这个日历里自主加、改、删;动别的日历会先在微信里问你。第一次添加时自动创建"),
+  macCalendarAlert: Schema.boolean()
+    .default(true)
+    .description("bot 往日历里加日程时,默认带一个日历提醒(会在手机上响)。和 bot 的微信提醒重复没关系;全天日程不加"),
+  macCalendarAlertMinutes: Schema.number()
+    .default(10)
+    .min(0)
+    .max(10080)
+    .description("日历提醒提前几分钟(0 = 开始时)"),
+  secretary: Schema.boolean()
+    .default(false)
+    .description("日程秘书(要先开 Mac 日历):打开时把一套排日程的规则写进长期记忆 memory.md 的「## 日程秘书」一节,可以自己改;关掉时移出记忆并留一份副本,再打开原样放回"),
   codexSocket: Schema.string()
     .description("【改动会重启微信监听】共享 App Server 的 socket 路径,留空使用 Codex 默认路径"),
   maxImageEdge: Schema.number()
@@ -490,6 +545,18 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "logLevel",
   // Read fresh on each send, so changing it takes effect on the next message.
   "claudeResumePermissionMode",
+  // Switches that change which tools the bot has. Hot so the settings card can
+  // write them at all (the host's form edits volatile fields only; as cold
+  // fields both switches silently did nothing), and index.ts restarts the
+  // WeChat listener when one flips, so the tool list is rebuilt.
+  "macCalendar",
+  "codexPeer",
+  // Read on each calendar call.
+  "macCalendarName",
+  "macCalendarAlert",
+  "macCalendarAlertMinutes",
+  // index.ts adds or removes the rules in memory.md when it flips.
+  "secretary",
 ]);
 
 /**

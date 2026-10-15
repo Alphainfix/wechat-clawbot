@@ -59,7 +59,8 @@ fi
 # 只列出来,不写 memory。别写死 nvm 的某个版本路径:升级 node 之后那条路径就没了。
 NODE_BIN="$(command -v node || true)"
 TASKS_FILE="${DSH_HOME}/storages/schedule.json"
-PLUGIN_LIB="${DSH_HOME}/profiles/web/node_modules/wechat-clawbot/lib/schedule-migrate.js"
+# 按脚本自己的位置找 lib:包名改过(开发名 → 公开名),装法也可能是 link 或 npm。
+PLUGIN_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/schedule-migrate.js"
 if [ -z "$NODE_BIN" ]; then
   echo "  (没有 node,跳过提醒盘点)"
 elif [ -f "$TASKS_FILE" ]; then

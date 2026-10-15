@@ -182,9 +182,11 @@ test("disable switch prevents new RPC operations; invalid messages do not mutate
   assert.equal(normalized.codexPeer, false);
   assert.equal(normalized.codexTransport, "stdio");
   assert.equal(normalizeConfig({ codexTransport: "unknown" }).codexTransport, "socket");
-  // Off by default, and cold: a flip restarts the listener, which rebuilds the tool list.
+  // Off by default. Hot since 2026-10-14 so the settings card can write it at all
+  // (the host's form edits volatile fields only); a flip restarts the WeChat
+  // listener in place (index.ts), which rebuilds the tool list.
   assert.equal(normalizeConfig({}).codexPeer, false);
-  assert.equal(HOT_FIELDS.has("codexPeer"), false);
+  assert.equal(HOT_FIELDS.has("codexPeer"), true);
   assert.equal(HOT_FIELDS.has("codexTransport"), false);
 });
 

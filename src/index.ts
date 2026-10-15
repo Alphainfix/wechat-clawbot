@@ -26,12 +26,14 @@ import { registerSubagentModelPolicy } from "./subagent-model.js";
 import { registerModelsRoute } from "./models-route.js";
 import { registerMcpRoutes } from "./mcp-route.js";
 import { registerOwnerNotifyTool } from "./owner-notify.js";
+import { CalendarHelper, HELPER_NAME, registerCalendarStatusRoute } from "./mac-calendar.js";
 import { CodexPeer } from "./codex-peer.js";
 import { claimInstance } from "./instance-guard.js";
 import { CodexProgressStore } from "./codex-progress.js";
 import { Backlog } from "./backlog.js";
 import { uploadFileTo } from "./tool.js";
 import { ensureMemoryFile } from "./memory.js";
+import { addSecretaryRules, hasSecretaryRules, registerMemoryOpenRoute, removeSecretaryRules } from "./secretary.js";
 import { isHostSchedule, migrateLegacyReminders, type HostSchedule } from "./schedule-migrate.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import {
@@ -75,6 +77,10 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // and read the field at the moment they use it. Replacing the reference would
   // update nobody.
 
+  /** The secretary needs the calendar, which is macOS only. Read live: both switches are hot. */
+  const secretaryActive = (): boolean =>
+    config.secretary === true && config.macCalendar === true && process.platform === "darwin";
+
   // Reads the running fiber's references on every call, so it always returns
   // the values the Loader last committed.
   const readSettings = (): Partial<ClawbotConfig> | undefined => snapshotConfig(rawConfig);
@@ -97,6 +103,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     // from inside its own change hook is a re-entrancy hazard, and a WeChat
     // monitor that drops itself as each keystroke lands is worse than one that
     // waits to be told. The card says so, and /restart applies them.
+    const secretaryWas = secretaryActive();
     for (const key of hot) (config as unknown as Record<string, unknown>)[key] = incoming[key];
     // The one hot field with a side effect beyond the config object: the logger
     // captured its level at startup, so an in-place change is invisible.
@@ -109,6 +116,32 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       void bridge?.refreshSelection().catch((err) => {
         logger.warn(`refreshSelection 失败: ${String(err)}`);
       });
+    }
+    // Switches that change WHICH tools the bot has. The tool list is fixed per
+    // agent (and part of the prompt cache), so these restart the WeChat
+    // listener in place: the old bridge takes its tools back (bridge.ts
+    // releaseTools), the new one registers the new set. No plugin reload.
+    const toolSwitches = hot.filter((key) => key === "macCalendar" || key === "codexPeer");
+    if (toolSwitches.length > 0 && !superseded) {
+      if (hot.includes("codexPeer") && config.codexPeer !== true) codexPeer.close();
+      void (async () => {
+        await stopMonitor(`工具开关变了 [${toolSwitches.join(", ")}]`);
+        if (!superseded) startMonitor();
+        if (hot.includes("macCalendar") && config.macCalendar === true && process.platform === "darwin") {
+          // The owner is at the settings card right now: put the permission prompt up.
+          await calendarHelper.prepare(true);
+        }
+      })().catch((err: unknown) => logger.warn(`重启微信监听失败: ${String((err as Error).message ?? err).slice(0, 200)}`));
+    }
+    // The secretary's rules live in memory.md; the switch (or the calendar it
+    // leans on) going on or off is what adds or removes them — nothing else does.
+    if (secretaryActive() !== secretaryWas && !superseded) {
+      try {
+        if (secretaryActive()) addSecretaryRules();
+        else removeSecretaryRules();
+      } catch (err) {
+        logger.warn(`secretary: could not update memory.md: ${String((err as Error).message ?? err).slice(0, 200)}`);
+      }
     }
     if (cold.length > 0) logger.info(`设置已保存 [${cold.join(", ")}],但要等重启才生效(/restart 或小鲸鱼的重启按钮)`);
   };
@@ -161,6 +194,16 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // Long-term user memory (Claude-Desktop style): seed the memory file so the
   // dynamic memory section (registered above, order 79) has content to inject.
   ensureMemoryFile();
+  // The secretary switched on but its rules missing (first start after the
+  // switch was set in the config file): put them in. Switched off, nothing is
+  // removed here — only flipping the switch does that.
+  if (secretaryActive() && !hasSecretaryRules()) {
+    try {
+      addSecretaryRules();
+    } catch (err) {
+      logger.warn(`secretary: could not add the rules to memory.md: ${String((err as Error).message ?? err).slice(0, 200)}`);
+    }
+  }
 
   // Subagents delegated from the WeChat session run with max thinking:
   // the main conversation is reasoningEffort=off for fast replies, but deep
@@ -186,6 +229,14 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   const codexProgress = new CodexProgressStore();
   /** Messages WeChat would not take yet; shared by the bridge and the MCP notify route. */
   const backlog = new Backlog();
+  /** The macOS Calendar helper (mac-calendar.ts); built and asked for permission only when switched on. */
+  const calendarHelper = new CalendarHelper();
+  if (config.macCalendar === true && process.platform === "darwin") {
+    // Switching it on restarts this fiber, so this is where the permission
+    // prompt gets put on screen — while the owner is still at the settings card.
+    void calendarHelper.prepare().catch((err: unknown) =>
+      logger.warn(`calendar: could not prepare ${HELPER_NAME}: ${String((err as Error).message ?? err).slice(0, 300)}`));
+  }
   const codexPeer = new CodexPeer(config, codexProgress, {
     askWechat: (question, signal) => bridge?.askWechat(question, 300_000, signal) ?? Promise.resolve(null),
   });
@@ -279,6 +330,19 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     logger.warn(`notify_wechat: registration failed: ${String(err).slice(0, 200)}`);
   }
 
+  // What the settings card shows under the calendar switch. No event content —
+  // only whether it is on, the permission, and how many calendars it sees — so,
+  // like the MCP status route, it needs no token.
+  registerCalendarStatusRoute(ctx, () => ({
+    enabled: config.macCalendar === true,
+    name: config.macCalendarName,
+    // Others on the allow list share the conversation: the calendar tools refuse then.
+    others: (config.allowFrom ?? []).filter((id) => id !== currentAccount?.userId).length,
+    secretary: hasSecretaryRules(),
+  }), calendarHelper);
+  // The card's "打开 memory.md" button (the secretary's rules live in that file).
+  registerMemoryOpenRoute(ctx);
+
   /** Pick the first bound account (v1 supports a single account). */
   const pickAccount = (): ResolvedWeixinAccount | null => {
     const ids = listIndexedWeixinAccountIds();
@@ -314,6 +378,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       getContextToken: (sender) => router?.contextTokenFor(sender) ?? "",
       pending,
       backlog,
+      calendarHelper,
       // A kept file goes through the same compression and CDN checks as send_wechat_file.
       sendFile: async (to, file) => {
         const bound = currentAccount;

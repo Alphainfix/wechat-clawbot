@@ -26,6 +26,7 @@ import { registerClaudePeerTools } from "./claude-peer.js";
 import { registerDshSessionTools } from "./dsh-sessions.js";
 import { NOTIFY_TOOL } from "./owner-notify.js";
 import { registerCodexPeerTools, type CodexPeer } from "./codex-peer.js";
+import { registerCalendarTools, type CalendarHelper, type OwnerAnswer } from "./mac-calendar.js";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 // `@deepseek-ai/dsh-agent-presets` (and its `ctx.agentPresets` type
 // augmentation) is gone in DSH 0.1.7; the service keeps its name
@@ -83,6 +84,8 @@ export type BridgeDeps = {
   backlog?: Backlog;
   /** Upload one kept file when its backlog is delivered (index.ts wires uploadFileTo). */
   sendFile?: (to: string, file: { path: string; caption?: string; original?: boolean }) => Promise<FileUploadResult>;
+  /** The macOS Calendar helper; the tools are registered only when `macCalendar` is on. */
+  calendarHelper?: CalendarHelper;
 };
 
 /**
@@ -152,6 +155,8 @@ export class WechatBridge {
   private readonly incoming = new Map<string, number>();
   /** Whether the WeChat tools are registered on the current agent scope. */
   private toolsRegistered = false;
+  /** Undo functions for every tool this bridge registered or restricted on the agent. */
+  private readonly toolDisposers: Array<() => void> = [];
   /** The sender whose turn is currently being driven (approvals go to them). */
   private currentSender: string | undefined;
   /** Messages sent in the current turn (cap enforcement, RULE B). */
@@ -529,6 +534,69 @@ export class WechatBridge {
       };
       const timer = setTimeout(withdraw, timeoutMs);
       signal?.addEventListener("abort", withdraw, { once: true });
+      this.deps.pending.push(entry);
+    });
+  }
+
+  /**
+   * Ask the account OWNER a question on WeChat and wait for the answer — for a
+   * decision that must be theirs (a change to their calendar). Unlike
+   * askWechat it never goes to whoever happens to be chatting, it waits until
+   * the question has actually been delivered before listening (a question that
+   * never arrived must not turn the owner's next, unrelated message into a
+   * yes), and it says why there is no answer.
+   */
+  async askOwner(question: string, timeoutMs: number, signal?: AbortSignal): Promise<OwnerAnswer> {
+    const owner = this.deps.getAccount()?.userId;
+    if (!owner) return { status: "no_owner" };
+    if (signal?.aborted) return { status: "stopped" };
+    // Delivered in order behind everything already queued for WeChat.
+    let failure: unknown;
+    const sent = this.sendChain.then(async () => {
+      try {
+        await this.sendText(owner, question);
+        this.typing.noteDelivered(owner);
+        return true;
+      } catch (err) {
+        failure = err;
+        return false;
+      }
+    });
+    this.sendChain = sent.then(() => undefined);
+    if (!(await sent)) {
+      const detail = isSendWindowClosed(failure)
+        ? "微信现在不让 bot 主动发消息"
+        : String((failure as Error)?.message ?? failure).slice(0, 120);
+      logger.warn(`askOwner: question not delivered (${detail})`);
+      return { status: "undelivered", detail };
+    }
+    this.answeredThisTurn = true;
+    if (signal?.aborted) return { status: "stopped" };
+    return new Promise<OwnerAnswer>((resolve) => {
+      let settled = false;
+      const finish = (answer: OwnerAnswer): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(answer);
+      };
+      const entry: PendingAnswer = {
+        tag: "question",
+        sender: owner,
+        resolve: (reply) => finish(reply === null ? { status: "timeout" } : { status: "answered", reply }),
+      };
+      // The entry must not outlive its waiter, or the owner's next message
+      // would be taken as its answer and never reach the agent.
+      const timer = setTimeout(() => {
+        this.deps.pending.remove(entry);
+        finish({ status: "timeout" });
+      }, timeoutMs);
+      const onAbort = (): void => {
+        this.deps.pending.remove(entry);
+        finish({ status: "stopped" });
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.deps.pending.push(entry);
     });
   }
@@ -1523,8 +1591,49 @@ export class WechatBridge {
    * per bridge lifetime; safe
    * to call from both the creation setup and the live-agent path.
    */
-  private ensureTools(agentCtx: Context): void {
+  /**
+   * The agent's context with every tool registration and restriction recorded,
+   * so dispose() can take them back. The agent can outlive this bridge (the web
+   * UI may hold it), and the next bridge must find no leftovers: registering a
+   * name twice throws, and a tool that was switched off must really go.
+   */
+  private trackingTools(agentCtx: Context): Context {
+    const tools = agentCtx.tools as unknown as {
+      register: (definition: unknown) => unknown;
+      restrict?: (filter: unknown) => unknown;
+    };
+    const record = (off: unknown): unknown => {
+      if (typeof off === "function") this.toolDisposers.push(off as () => void);
+      return off;
+    };
+    const wrapped = {
+      register: (definition: unknown) => record(tools.register(definition)),
+      ...(typeof tools.restrict === "function" ? { restrict: (filter: unknown) => record(tools.restrict!(filter)) } : {}),
+    };
+    return new Proxy(agentCtx as object, {
+      get: (target, prop) => {
+        if (prop === "tools") return wrapped;
+        const value = Reflect.get(target, prop, target) as unknown;
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    }) as Context;
+  }
+
+  /** Take back every tool this bridge put on the agent (see trackingTools). */
+  private releaseTools(): void {
+    for (const off of this.toolDisposers.splice(0).reverse()) {
+      try {
+        off();
+      } catch (err) {
+        logger.warn(`releaseTools: ${String(err).slice(0, 160)}`);
+      }
+    }
+    this.toolsRegistered = false;
+  }
+
+  private ensureTools(target: Context): void {
     if (this.toolsRegistered) return;
+    const agentCtx = this.trackingTools(target);
     try {
       registerSendFileTool(agentCtx, {
         getBridge: () => this,
@@ -1543,10 +1652,24 @@ export class WechatBridge {
       // restarts the listener and lands here again with the new value.
       const codex = this.deps.codexPeer !== undefined && this.config.codexPeer === true;
       if (codex) registerCodexPeerTools(agentCtx, this.deps.codexPeer!);
+      // The Mac calendar, only when switched on (cold field, like Codex): off costs nothing.
+      const calendar = this.deps.calendarHelper !== undefined && this.config.macCalendar === true
+        && process.platform === "darwin";
+      if (calendar) {
+        registerCalendarTools(agentCtx, {
+          config: this.config,
+          getAccount: this.deps.getAccount,
+          activeSender: () => this.activeSender,
+          askOwner: (question, signal) => this.askOwner(question, 600_000, signal),
+          helper: this.deps.calendarHelper!,
+        });
+      }
       this.restrictTools(agentCtx);
       this.toolsRegistered = true;
-      logger.info(`ensureTools: WeChat tools registered (Codex tools ${codex ? "on" : "off"})`);
+      logger.info(`ensureTools: WeChat tools registered (Codex tools ${codex ? "on" : "off"}, calendar tools ${calendar ? "on" : "off"})`);
     } catch (err) {
+      // Undo the half that did register, so the retry starts clean.
+      this.releaseTools();
       logger.warn(`ensureTools: registration failed (will retry): ${String(err)}`);
     }
   }
@@ -1625,6 +1748,9 @@ export class WechatBridge {
     this.disposed = true;
     this.typing.dispose();
     this.idleCompact.dispose();
+    // The tools go before the agent: if something else keeps the agent alive,
+    // the next bridge must be able to register its own set.
+    this.releaseTools();
     // Dispose the agent first: this stops the driver, so a pending whenIdle
     // resolves and the worker can exit instead of hanging forever.
     try {

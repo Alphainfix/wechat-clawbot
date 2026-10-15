@@ -13,7 +13,7 @@
  *
  * Exits non-zero when any check fails, so it can gate a build.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, lstatSync, readdirSync, rmSync, symlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, lstatSync, readdirSync, rmSync, symlinkSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -63,7 +63,7 @@ function check(name, ok, detail) {
     ["看这个 [图片: /Users/a/b.jpg] 行吗", false, "inbound media marker must survive"],
     ["参考 [引用: 明天晴] 那条", false, "quote marker must survive"],
     ["点 [这里](https://x.com) 看", false, "markdown link label must survive"],
-    ["地图 [Jefferson Lab](https://maps.example/x)", false, "latin markdown label"],
+    ["地图 [City Library](https://maps.example/x)", false, "latin markdown label"],
   ];
   for (const [input, shouldChange, why] of cases) {
     const out = stripWechatCodes(input);
@@ -109,7 +109,7 @@ function check(name, ok, detail) {
   // absence, which is the check working: a field can only be called hot if some
   // file here reads it live.
   const sources = ["src/index.ts", "src/bridge.ts", "src/inbound.ts", "src/tool.ts", "src/approvals.ts",
-    "src/prompt.ts", "src/mcp-route.ts", "src/claude-peer.ts", "src/codex-peer.ts"]
+    "src/prompt.ts", "src/mcp-route.ts", "src/claude-peer.ts", "src/codex-peer.ts", "src/mac-calendar.ts"]
     .filter((f) => existsSync(join(ROOT, f)))
     .map((f) => readFileSync(join(ROOT, f), "utf-8")).join("\n");
   for (const field of HOT_FIELDS) {
@@ -1214,7 +1214,11 @@ function check(name, ok, detail) {
 {
   const cfgMod3 = await import(join(ROOT, "lib/config.js"));
   check("codexPeer is off by default", cfgMod3.DEFAULT_CONFIG.codexPeer === false && cfgMod3.normalizeConfig({}).codexPeer === false);
-  check("codexPeer is a cold field (a flip rebuilds the tool list)", !cfgMod3.HOT_FIELDS.has("codexPeer"));
+  // Hot since 2026-10-14: the card can only write volatile fields (as a cold
+  // field the switch silently did nothing), and a flip restarts the WeChat
+  // listener in place, which rebuilds the tool list.
+  check("codexPeer flips rebuild the tool list (hot field + listener restart)",
+    cfgMod3.HOT_FIELDS.has("codexPeer") && /key === "macCalendar" \|\| key === "codexPeer"/.test(readFileSync(join(ROOT, "src/index.ts"), "utf-8")));
   const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
   check("Codex tools are registered only when the switch is on",
     /const codex = this\.deps\.codexPeer !== undefined && this\.config\.codexPeer === true;\s*if \(codex\) registerCodexPeerTools/.test(bridgeSrc));
@@ -1268,6 +1272,18 @@ function check(name, ok, detail) {
   await fifth.ready;
   check("after our own unload the next instance starts fresh", fifth.isCurrent());
   fifth.release();
+  // An instance started by a version whose slot key carried the package name
+  // (the dev name, or the public one) is retired too.
+  const legacyStopped = [];
+  for (const name of [["dsh", "plugin", "clawbot"].join("-"), "wechat-clawbot"]) {
+    globalThis[Symbol.for(`${name}/active-instance`)] = { seq: 7, active: { id: 7, stop: async (reason) => { legacyStopped.push([name, reason]); } } };
+  }
+  const sixth = claimInstance(async () => {});
+  await sixth.ready;
+  check("an instance left under an old package-name key is retired as well",
+    legacyStopped.length === 2 && legacyStopped.every(([, reason]) => reason === `superseded by instance #${sixth.id}`)
+    && globalThis[Symbol.for("wechat-clawbot/active-instance")].active === undefined);
+  sixth.release();
   const indexSrc = readFileSync(join(ROOT, "src/index.ts"), "utf-8");
   check("the monitor starts only after the older instance stopped, and only while current",
     /void claim\.ready\.then\(\(\) => \{\s*if \(claim\.isCurrent\(\)\) startMonitor\(\);/.test(indexSrc));
@@ -2114,6 +2130,435 @@ function check(name, ok, detail) {
   check("one revive per conversation at a time",
     /const prior = reviving\.get\(target\.sessionId\);/.test(peerSrc) && /reviving\.set\(target\.sessionId, run\);/.test(peerSrc));
   setLogLevel("info");
+}
+
+// ------------------------- Mac 日历:读全部、专用日历自主、别的日历先问、只对机主(2026-10-14)
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const { setLogLevel } = await import(join(ROOT, "lib/ilink/util/logger.js"));
+  setLogLevel("error");
+  const cal = await import(join(ROOT, "lib/mac-calendar.js"));
+  const cfgMod = await import(join(ROOT, "lib/config.js"));
+  check("calendar: off by default, with no name",
+    cfgMod.DEFAULT_CONFIG.macCalendar === false && cfgMod.DEFAULT_CONFIG.macCalendarName === "");
+  check("calendar: the tool switches are hot (the card can only write volatile fields), and flipping one restarts the listener",
+    cfgMod.HOT_FIELDS.has("macCalendar") && cfgMod.HOT_FIELDS.has("codexPeer") && cfgMod.HOT_FIELDS.has("macCalendarName")
+      && /const toolSwitches = hot\.filter\(\(key\) => key === "macCalendar" \|\| key === "codexPeer"\);[\s\S]{0,400}await stopMonitor\([\s\S]{0,80}startMonitor\(\);/
+        .test(readFileSync(join(ROOT, "src/index.ts"), "utf-8")));
+  {
+    // The host's settings form refuses writes to non-volatile fields (silently,
+    // for the card): every field the card writes must be hot.
+    const clientSrc = readFileSync(join(ROOT, "src/client.js"), "utf-8");
+    const written = [...new Set([...clientSrc.matchAll(/\b(?:set|clear|num)\("([A-Za-z]+)"/g)].map((m) => m[1]))];
+    const cold = written.filter((f) => !cfgMod.HOT_FIELDS.has(f));
+    check("settings card: every field it writes is volatile (the host drops the rest without a word)",
+      written.length > 10 && cold.length === 0, `cold: ${cold.join(", ")}`);
+  }
+
+  // A fake helper with EventKit's own conventions: an all-day event ends at
+  // 23:59:59 of its LAST day.
+  const calls = [];
+  const work = { id: "c-work", title: "工作", account: "iCloud", accountType: "caldav", writable: true };
+  const hol = { id: "c-hol", title: "节假日", account: "订阅", accountType: "subscribed", writable: false };
+  const planCal = { id: "c-planCal", title: "规划", account: "iCloud", accountType: "caldav", writable: true };
+  const gPlanCal = { id: "c-gplanCal", title: "规划", account: "Google", accountType: "caldav", writable: true };
+  let calendars = [work, hol];
+  const events = [
+    { id: "ev-meet", calendarId: "c-work", calendar: "工作", account: "iCloud", title: "组会", start: "2026-10-15T14:00:00-04:00",
+      end: "2026-10-15T15:00:00-04:00", allDay: false, recurring: true, occurrence: "2026-10-15T14:00:00-04:00",
+      location: "会议室 A", notes: "带上周的图\n链接 https://example.com/zoom", attendees: 5, organizerIsMe: true },
+    { id: "ev-block", calendarId: "c-planCal", calendar: "规划", account: "iCloud", title: "写论文", start: "2026-10-15T09:00:00-04:00",
+      end: "2026-10-15T10:30:00-04:00", allDay: false, recurring: false },
+    { id: "ev-hol", calendarId: "c-hol", calendar: "节假日", account: "订阅", title: "哥伦布日", start: "2026-10-16T00:00:00-04:00",
+      end: "2026-10-16T23:59:59-04:00", allDay: true, recurring: false },
+    { id: "ev-trip", calendarId: "c-work", calendar: "工作", account: "iCloud", title: "开会出差", start: "2026-10-17T00:00:00-04:00",
+      end: "2026-10-18T23:59:59-04:00", allDay: true, recurring: false },
+    { id: "ev-g", calendarId: "c-gplanCal", calendar: "规划", account: "Google", title: "同名日历里的事", start: "2026-10-15T20:00:00-04:00",
+      end: "2026-10-15T21:00:00-04:00", allDay: false, recurring: false },
+  ];
+  let authorization = "fullAccess";
+  const runner = async (req) => {
+    calls.push(req);
+    if (authorization !== "fullAccess" && req.cmd !== "status" && req.cmd !== "request") return { ok: false, code: "not_authorized", error: authorization };
+    switch (req.cmd) {
+      case "status": return { ok: true, authorization };
+      case "request": return { ok: true, authorization };
+      case "calendars": return { ok: true, calendars };
+      case "events": return { ok: true, events, calendars };
+      case "ensureCalendar": {
+        if (req.knownId && calendars.some((c) => c.id === req.knownId)) return { ok: true, calendar: calendars.find((c) => c.id === req.knownId), created: false };
+        if (req.adoptId) return { ok: true, calendar: calendars.find((c) => c.id === req.adoptId), created: false };
+        const same = calendars.filter((c) => c.title === req.name && c.writable);
+        if (same.length > 0) return { ok: false, code: "name_taken", calendars: same };
+        calendars = [...calendars, planCal];
+        return { ok: true, calendar: planCal, created: true };
+      }
+      case "add": return { ok: true, event: { id: "ev-new", calendarId: req.calendarId, calendar: calendars.find((c) => c.id === req.calendarId)?.title,
+        account: "iCloud", title: req.title, start: "2026-10-15T16:00:00-04:00", end: "2026-10-15T17:00:00-04:00", allDay: false, recurring: false },
+        overlaps: [{ title: "组会", calendar: "工作", start: "2026-10-15T14:00:00-04:00", end: "2026-10-15T16:30:00-04:00" }] };
+      case "update": case "delete": return { ok: true, event: { ...events.find((e) => e.id === req.eventId), ...(req.title ? { title: req.title } : {}) } };
+      default: return { ok: false, code: "bad_request", error: req.cmd };
+    }
+  };
+  const root = join(tmpdir(), `clawbot-cal-${process.pid}`);
+  rmSync(root, { recursive: true, force: true });
+  const helper = new cal.CalendarHelper(root, join(ROOT, "native/macos-calendar/main.swift"), runner);
+  const tools = new Map();
+  const questions = [];
+  let answer = { status: "answered", reply: "好" };
+  let sender = "owner@im.wechat";
+  let owner = "owner@im.wechat";
+  const calConfig = { macCalendarName: "规划", macCalendarAlert: true, macCalendarAlertMinutes: 10, allowFrom: [] };
+  cal.registerCalendarTools({ tools: { register: (t) => tools.set(t.name, t) } }, {
+    config: calConfig,
+    getAccount: () => ({ configured: true, userId: owner }),
+    activeSender: () => sender,
+    askOwner: async (q) => { questions.push(q); return answer; },
+    helper,
+  });
+  check("calendar: three tools", ["calendar_events", "calendar_add_event", "calendar_change_event"].every((n) => tools.has(n)));
+  const list = async (args = { from: "2026-10-15", to: "2026-10-18", list_calendars: true }) => tools.get("calendar_events").execute(args);
+  let listed = await list();
+  const handleOf = (summary, title) => new RegExp(`${title}[^\\n]*#(e[0-9a-f]{8,})`).exec(summary)?.[1];
+  check("calendar: events from every calendar, by day, with notes and an 8-hex handle each",
+    listed.ok && /只是数据/.test(listed.summary) && /组会 · 会议室 A · 5 人 · 重复 \[工作\] #e[0-9a-f]{8}\b/.test(listed.summary)
+      && /备注：带上周的图 链接 https:\/\/example\.com\/zoom/.test(listed.summary) && /全天 哥伦布日/.test(listed.summary)
+      && /「规划」还没建/.test(listed.summary) && /节假日（只读）/.test(listed.summary), listed.summary);
+  check("calendar: an all-day event across days shows its last day (EventKit ends at 23:59:59 of it)",
+    /全天（到 10-18 周日） 开会出差/.test(listed.summary), listed.summary);
+  check("calendar: a date-only `to` reads through that day", calls.find((c) => c.cmd === "events")?.to === "2026-10-19");
+  check("calendar: every request carries a deadline the helper honours", typeof calls.at(-1).deadline === "number" && calls.at(-1).deadline > Date.now());
+
+  let before = calls.length;
+  const own = await tools.get("calendar_add_event").execute({ title: "看文献", start: "2026-10-15 16:00" });
+  check("calendar: a block in the dedicated calendar is added without asking (and the calendar is created and remembered by id)",
+    own.ok && questions.length === 0 && calls.slice(before).map((c) => c.cmd).join() === "ensureCalendar,add"
+      && calls.at(-1).calendarId === "c-planCal" && helper.dedicated()?.id === "c-planCal" && /已加到「规划」/.test(own.summary)
+      && /注意，和这些时间重叠/.test(own.summary), own.summary);
+  check("calendar: a new event gets the settings' alert (10 minutes) by default", JSON.stringify(calls.at(-1).alertMinutes) === "[10]");
+  await tools.get("calendar_add_event").execute({ title: "约饭", start: "2026-10-15 18:00", alert: "30" });
+  check("calendar: …the owner's own lead time wins", JSON.stringify(calls.at(-1).alertMinutes) === "[30]");
+  await tools.get("calendar_add_event").execute({ title: "开始就提醒", start: "2026-10-15 18:00", alert: "0" });
+  check("calendar: …\"0\" is an alert at the start, \"none\" is no alert", JSON.stringify(calls.at(-1).alertMinutes) === "[0]");
+  await tools.get("calendar_add_event").execute({ title: "不提醒", start: "2026-10-15 18:00", alert: "none" });
+  check("calendar: …none", calls.at(-1).alertMinutes === undefined);
+  // The exact call a model made on 2026-10-14: every optional parameter
+  // filled with an empty value. alert_minutes: 0 then meant "at the start" and
+  // overrode the setting; now nothing empty may change anything.
+  calConfig.macCalendarAlertMinutes = 15;
+  await tools.get("calendar_add_event").execute({ title: "去健身", start: "2026-10-15 16:00", end: "2026-10-15 17:00",
+    all_day: false, location: "", notes: "", calendar: "", alert: "", alert_minutes: 0 });
+  check("calendar: a model that fills every optional field with an empty value still gets the setting's alert (15)",
+    JSON.stringify(calls.at(-1).alertMinutes) === "[15]" && calls.at(-1).location === undefined && calls.at(-1).notes === undefined
+      && calls.at(-1).allDay === undefined && calls.at(-1).calendarId === "c-planCal", JSON.stringify(calls.at(-1)));
+  await tools.get("calendar_add_event").execute({ title: "请假", start: "2026-10-16", all_day: false, alert: "" });
+  check("calendar: …and a date-only start with a filled all_day:false is still all-day", calls.at(-1).allDay === undefined && calls.at(-1).alertMinutes === undefined);
+  calConfig.macCalendarAlertMinutes = 10;
+  await tools.get("calendar_add_event").execute({ title: "假期", start: "2026-10-16" });
+  check("calendar: …an all-day event gets no default alert", calls.at(-1).cmd === "add" && calls.at(-1).alertMinutes === undefined);
+  calConfig.macCalendarAlert = false;
+  await tools.get("calendar_add_event").execute({ title: "跑步", start: "2026-10-15 07:00" });
+  check("calendar: …and with alerts switched off, none (read live: no restart)", calls.at(-1).alertMinutes === undefined);
+  calConfig.macCalendarAlert = true;
+  check("calendar: the add tool tells the model a calendar alert does not replace its WeChat reminder",
+    /still create one with schedule_create; both firing is fine/.test(tools.get("calendar_add_event").description));
+  check("calendar: …and that a plain reminder stays a WeChat reminder, out of the calendar",
+    /A plain reminder[\s\S]{0,300}do NOT put it in the calendar/.test(tools.get("calendar_add_event").description));
+
+  // Another calendar: asked first; the answer decides; a non-yes reaches the model word for word.
+  answer = { status: "answered", reply: "不，改到周五下午三点" };
+  before = calls.length;
+  const refusedAdd = await tools.get("calendar_add_event").execute({ title: "答辩彩排", start: "2026-10-15 16:00", calendar: "工作" });
+  check("calendar: another calendar asks the owner first; a no adds nothing and passes their words on",
+    !refusedAdd.ok && questions.length === 1 && /加到你的「工作」日历（iCloud）吗/.test(questions[0])
+      && /机主回复「不，改到周五下午三点」/.test(refusedAdd.summary) && !calls.slice(before).some((c) => c.cmd === "add"), refusedAdd.summary);
+  answer = { status: "timeout" };
+  const silent = await tools.get("calendar_add_event").execute({ title: "答辩彩排", start: "2026-10-15 16:00", calendar: "工作" });
+  check("calendar: silence is reported as silence, not as a refusal", !silent.ok && /10 分钟没回复/.test(silent.summary));
+  answer = { status: "undelivered", detail: "微信现在不让 bot 主动发消息" };
+  const undelivered = await tools.get("calendar_add_event").execute({ title: "答辩彩排", start: "2026-10-15 16:00", calendar: "工作" });
+  check("calendar: a question that never arrived executes nothing", !undelivered.ok && /问题没发到机主微信/.test(undelivered.summary));
+  answer = { status: "answered", reply: "好的。" };
+  const okAdd = await tools.get("calendar_add_event").execute({ title: "答辩彩排", start: "2026-10-15 16:00", calendar: "工作" });
+  check("calendar: …and a yes adds it there", okAdd.ok && calls.at(-1).cmd === "add" && calls.at(-1).calendarId === "c-work");
+  const asked = questions.length;
+  const readOnly = await tools.get("calendar_add_event").execute({ title: "x", start: "2026-10-15 16:00", calendar: "节假日" });
+  check("calendar: a read-only calendar is refused before asking", !readOnly.ok && /只读/.test(readOnly.summary) && questions.length === asked);
+
+  // Changes.
+  listed = await list();
+  const block = handleOf(listed.summary, "写论文");
+  const moved = await tools.get("calendar_change_event").execute({ event: `#${block}`, action: "update", start: "2026-10-15 11:00" });
+  check("calendar: moving its own block needs no question, and the helper is told where the event should be",
+    moved.ok && questions.length === asked && calls.at(-1).cmd === "update" && calls.at(-1).expectCalendarId === "c-planCal"
+      && calls.at(-1).currentStart === "2026-10-15T09:00:00-04:00", moved.summary);
+  const sameName = handleOf(listed.summary, "同名日历里的事");
+  const other = await tools.get("calendar_change_event").execute({ event: sameName, action: "delete" });
+  check("calendar: a different calendar that merely shares the name is not the bot's: it asks",
+    questions.length === asked + 1 && /删掉你「规划」日历里的「同名日历里的事」/.test(questions.at(-1)), other.summary);
+  answer = { status: "answered", reply: "好" };
+  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "组会"), action: "delete" });
+  check("calendar: deleting one occurrence says only this one, and deletes it at its own occurrence",
+    /（只这一次）/.test(questions.at(-1)) && /5 位参与者/.test(questions.at(-1))
+      && calls.at(-1).cmd === "delete" && calls.at(-1).span === "this" && calls.at(-1).occurrence === "2026-10-15T14:00:00-04:00", questions.at(-1));
+  listed = await list();
+  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "组会"), action: "delete", scope: "future" });
+  check("calendar: …deleting the series says so in the question",
+    /连同之后的每一次一起删掉/.test(questions.at(-1)) && calls.at(-1).span === "future", questions.at(-1));
+  listed = await list();
+  const meeting2 = handleOf(listed.summary, "组会");
+  const replace = await tools.get("calendar_change_event").execute({ event: meeting2, action: "update", notes: "带电脑" });
+  check("calendar: shortened notes are not replaced wholesale by accident", !replace.ok && /add_notes/.test(replace.summary));
+  await tools.get("calendar_change_event").execute({ event: meeting2, action: "update", add_notes: "带电脑" });
+  check("calendar: …adding a line is appended by the helper", calls.at(-1).addNotes === "带电脑" && calls.at(-1).notes === undefined
+    && /备注里加一句「带电脑」/.test(questions.at(-1)));
+  listed = await list();
+  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "写论文"), action: "update", scope: "this",
+    title: "写论文第二章", start: "", end: "", all_day: false, location: "", clear_location: false, notes: "", clear_notes: false,
+    add_notes: "", replace_notes: false, calendar: "", alert: "" });
+  {
+    const c = calls.at(-1);
+    check("calendar: a change filled with empty values changes only what was asked (no wiped location, notes or alert, no all-day flip)",
+      c.cmd === "update" && c.title === "写论文第二章" && !("location" in c) && !("notes" in c) && !("allDay" in c) && !("alertMinutes" in c) && !("start" in c),
+      JSON.stringify(c));
+  }
+  listed = await list();
+  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "写论文"), action: "update", clear_location: true, alert: "none" });
+  check("calendar: removing a location or the alert takes an explicit clear_location / alert:none",
+    calls.at(-1).location === "" && JSON.stringify(calls.at(-1).alertMinutes) === "[]");
+  check("calendar: parseAlert", cal.parseAlert("") === undefined && cal.parseAlert(0) === undefined && cal.parseAlert("0") === 0
+    && cal.parseAlert("15") === 15 && cal.parseAlert("30分钟") === 30 && cal.parseAlert("none") === "none" && cal.parseAlert("不要") === "none"
+    && cal.parseAlert("soon") === undefined && cal.parseAlert(20) === 20);
+  const unknown = await tools.get("calendar_change_event").execute({ event: "#e00000000", action: "delete" });
+  check("calendar: an unknown handle says to look again", !unknown.ok && /先用 calendar_events/.test(unknown.summary));
+
+  // A calendar with the chosen name that the bot did not create: asked once, remembered by id.
+  {
+    const root2 = join(tmpdir(), `clawbot-cal2-${process.pid}`);
+    rmSync(root2, { recursive: true, force: true });
+    const helper2 = new cal.CalendarHelper(root2, join(ROOT, "native/macos-calendar/main.swift"), runner);
+    const tools2 = new Map();
+    const q2 = [];
+    let reply2 = { status: "answered", reply: "不要" };
+    calendars = [work, hol, gPlanCal];
+    cal.registerCalendarTools({ tools: { register: (t) => tools2.set(t.name, t) } }, {
+      config: { macCalendarName: "规划" }, getAccount: () => ({ configured: true, userId: "owner@im.wechat" }),
+      activeSender: () => "owner@im.wechat", askOwner: async (q) => { q2.push(q); return reply2; }, helper: helper2,
+    });
+    const no = await tools2.get("calendar_add_event").execute({ title: "a", start: "2026-10-15 16:00" });
+    check("calendar: an existing calendar with the chosen name is not adopted silently; a no leaves it alone",
+      !no.ok && /已经有一个叫「规划」的日历（Google）/.test(q2[0]) && helper2.dedicated() === null && /换个没用过的名字/.test(no.summary), no.summary);
+    reply2 = { status: "answered", reply: "好" };
+    const yes = await tools2.get("calendar_add_event").execute({ title: "a", start: "2026-10-15 16:00" });
+    check("calendar: …a yes adopts it, remembered by its id", yes.ok && helper2.dedicated()?.id === "c-gplanCal" && calls.at(-1).calendarId === "c-gplanCal");
+    rmSync(root2, { recursive: true, force: true });
+    calendars = [work, hol, planCal];
+  }
+
+  sender = "friend@im.wechat";
+  before = calls.length;
+  const friend = await tools.get("calendar_events").execute({});
+  check("calendar: only the owner — a friend is refused before anything is read",
+    !friend.ok && /只对机主开放/.test(friend.summary) && calls.length === before);
+  sender = undefined;
+  const gui = await tools.get("calendar_events").execute({ from: "2026-10-15" });
+  check("calendar: the owner using the bot's session from the web UI is allowed", gui.ok);
+  calConfig.allowFrom = ["owner@im.wechat", "friend@im.wechat"];
+  const shared = await tools.get("calendar_events").execute({});
+  check("calendar: with others on the allow list (one shared conversation) the tools refuse", !shared.ok && /白名单里还有别人/.test(shared.summary));
+  calConfig.allowFrom = [];
+  owner = undefined;
+  const nobody = await tools.get("calendar_events").execute({});
+  check("calendar: with no known owner id the tools fail closed", !nobody.ok && /不知道机主是谁/.test(nobody.summary));
+  owner = "owner@im.wechat";
+  sender = "owner@im.wechat";
+
+  authorization = "denied";
+  const denied = await tools.get("calendar_events").execute({});
+  check("calendar: a refusal says where to turn it on", !denied.ok && /系统设置 → 隐私与安全性 → 日历/.test(denied.summary) && /Clawbot-Calendar/.test(denied.summary));
+  authorization = "fullAccess";
+
+  check("calendar: a yes is a clear yes; silence and maybes are no",
+    cal.isYes("好") && cal.isYes("好的。") && cal.isYes("OK") && !cal.isYes(null) && !cal.isYes("不要") && !cal.isYes("好吧不行") && !cal.isYes("等一下"));
+  check("calendar: when() reads EventKit's inclusive all-day end as that same day",
+    cal.when("2026-10-15T00:00:00-04:00", "2026-10-15T23:59:59-04:00", true).endsWith("全天")
+      && !cal.when("2026-10-15T00:00:00-04:00", "2026-10-15T23:59:59-04:00", true).includes("至"));
+  const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("calendar: the tools exist only when switched on, on a Mac, and use the owner-only question",
+    /this\.config\.macCalendar === true\s*&& process\.platform === "darwin"/.test(bridgeSrc)
+      && /askOwner: \(question, signal\) => this\.askOwner\(question, 600_000, signal\)/.test(bridgeSrc));
+  check("calendar: every tool the bridge registers is taken back when it goes (so a switched-off tool really goes)",
+    /this\.releaseTools\(\);\s*\/\/ Dispose the agent first/.test(bridgeSrc) && /const agentCtx = this\.trackingTools\(target\);/.test(bridgeSrc));
+  const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
+  check("calendar: the Swift source ships in the npm package", pkg.files.includes("native")
+    && existsSync(join(ROOT, "native/macos-calendar/main.swift")));
+  rmSync(root, { recursive: true, force: true });
+
+  // The owner-only question on a real bridge: to the owner, after delivery, and never a stale yes.
+  {
+    const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+    const { PendingRegistry } = await import(join(ROOT, "lib/pending.js"));
+    const { DEFAULT_CONFIG } = await import(join(ROOT, "lib/config.js"));
+    const sent = [];
+    let failSend = false;
+    const pending = new PendingRegistry();
+    const config = { ...DEFAULT_CONFIG, sessionId: "sim-wechat", autoMemory: false, idleCompaction: false };
+    const deps = { getAccount: () => ({ configured: true, userId: "owner@im.wechat" }), getContextToken: () => "", pending };
+    const bridge = new WechatBridge({ agents: { get: () => undefined } }, config, async (to, text) => {
+      if (failSend) throw new Error("sendMessage ret=-2 errmsg=prepare failed");
+      sent.push({ to, text });
+    }, deps);
+    const asking = bridge.askOwner("要删掉吗？", 2_000);
+    await sleep(20);
+    const entry = pending.popFor("owner@im.wechat");
+    check("askOwner: the question goes to the account owner, and only then waits for an answer",
+      sent.length === 1 && sent[0].to === "owner@im.wechat" && entry !== undefined);
+    entry?.resolve("好");
+    const got = await asking;
+    check("askOwner: …the reply comes back as an answer", got.status === "answered" && got.reply === "好");
+    failSend = true;
+    const lost = await bridge.askOwner("要删掉吗？", 2_000);
+    check("askOwner: a question WeChat refused is reported as undelivered, and nothing is left waiting for the next message",
+      lost.status === "undelivered" && pending.popFor("owner@im.wechat") === undefined);
+    failSend = false;
+    const late = await bridge.askOwner("要删掉吗？", 30);
+    check("askOwner: no answer in time is a timeout, and the question is withdrawn",
+      late.status === "timeout" && pending.popFor("owner@im.wechat") === undefined);
+    await bridge.dispose();
+  }
+  setLogLevel("info");
+}
+
+// ------------------------------------------------------------- 日程秘书(2026-10-14)
+// 规则写进 memory.md(和人设一样属于机主,不进插件提示词);只有翻开关时增删,
+// 关掉时留一份副本,再打开原样放回,机主自己改过的措辞不丢。
+{
+  const state = join(tmpdir(), `clawbot-secretary-${process.pid}`);
+  rmSync(state, { recursive: true, force: true });
+  mkdirSync(state, { recursive: true });
+  const prevState = process.env.CLAWBOT_STATE_DIR;
+  process.env.CLAWBOT_STATE_DIR = state;
+  try {
+    const sec = await import(join(ROOT, "lib/secretary.js"));
+    const mem = await import(join(ROOT, "lib/memory.js"));
+    const cfgS = await import(join(ROOT, "lib/config.js"));
+    const memPath = join(state, "memory.md");
+    const copyPath = join(state, "secretary-rules.md");
+    const read = () => readFileSync(memPath, "utf-8");
+    check("secretary: off by default, and hot (the card can write it; index.ts edits memory.md when it flips)",
+      cfgS.DEFAULT_CONFIG.secretary === false && cfgS.normalizeConfig({}).secretary === false
+      && cfgS.normalizeConfig({ secretary: true }).secretary === true && cfgS.HOT_FIELDS.has("secretary"));
+
+    // A fresh install has no memory.md yet: switching on seeds it, then adds the rules.
+    check("secretary: on a fresh install the memory file is created with the rules at the end",
+      sec.addSecretaryRules() === "added" && /## 基本档案/.test(read()) && read().endsWith(`${sec.SECRETARY_RULES}\n`));
+
+    const before = "# 用户记忆（长期）\n\n## 基本档案\n- [2026-10-01] 住在波士顿\n\n## 偏好与习惯\n- [2026-10-02] 回复要短\n";
+    writeFileSync(memPath, before);
+    check("secretary: switching on appends the default rules after everything else", sec.addSecretaryRules() === "added"
+      && read() === `${before.trimEnd()}\n\n${sec.SECRETARY_RULES}\n` && sec.hasSecretaryRules());
+    const once = read();
+    check("secretary: switching on again changes nothing", sec.addSecretaryRules() === "present" && read() === once);
+    check("secretary: the rules keep reminders out of the calendar",
+      /提醒我/.test(sec.SECRETARY_RULES) && /只设微信提醒，不进日历/.test(sec.SECRETARY_RULES));
+
+    // Auto-memory keeps writing under its own headings; the section stays whole.
+    mem.appendMemoryEntry("偏好与习惯", "喜欢早上写东西");
+    check("secretary: an auto-memory entry lands under its own heading, the rules untouched",
+      /## 偏好与习惯\n- \[[0-9-]+\] 喜欢早上写东西/.test(read()) && read().endsWith(`${sec.SECRETARY_RULES}\n`));
+
+    mem.appendMemoryEntry("基本档案", "养了一只猫");
+    check("memory: appending never leaves blank lines piling up at the end of the file", read().endsWith(`${sec.SECRETARY_RULES}\n`));
+
+    // The owner rewrites a rule; a section auto-memory created later sits after it.
+    writeFileSync(memPath, read().replace("60–90 分钟一块", "45 分钟一块") + "\n## 重要事实\n- [2026-10-03] 在写论文\n");
+    check("secretary: switching off moves the section out and keeps everything else",
+      sec.removeSecretaryRules() === "removed" && !/日程秘书|45 分钟一块/.test(read())
+      && /喜欢早上写东西/.test(read()) && /## 重要事实\n- \[2026-10-03\] 在写论文/.test(read()) && !/\n{3,}/.test(read()));
+    check("secretary: …into a private copy, with the owner's wording",
+      existsSync(copyPath) && /45 分钟一块/.test(readFileSync(copyPath, "utf-8")) && (statSync(copyPath).mode & 0o777) === 0o600);
+    check("secretary: switching off again changes nothing", sec.removeSecretaryRules() === "absent" && !sec.hasSecretaryRules());
+    check("secretary: switching on again puts the owner's version back, not the default",
+      sec.addSecretaryRules() === "added" && /45 分钟一块/.test(read()) && !/60–90 分钟一块/.test(read())
+      && /## 重要事实/.test(read()));
+
+    // memory.md is capped at 500 lines (head 70% + tail 30%); the rules sit in the tail.
+    for (let i = 0; i < 520; i += 1) mem.appendMemoryEntry("基本档案", `测试条目 ${i}`);
+    check("secretary: the 500-line memory cap keeps the rules", sec.hasSecretaryRules() && /45 分钟一块/.test(read()));
+
+    // The owner retitles the section: still the same one (no second copy at the next start).
+    writeFileSync(memPath, "## 基本档案\n- 住在波士顿\n\n## 日程秘书（我的版本）\n- 早上不排会\n");
+    check("secretary: a retitled section is still recognised (no second copy)",
+      sec.hasSecretaryRules() && sec.addSecretaryRules() === "present" && (read().match(/日程秘书/g) ?? []).length === 1);
+    check("secretary: …and switching off moves the retitled one out",
+      sec.removeSecretaryRules() === "removed" && !/日程秘书|早上不排会/.test(read()) && /住在波士顿/.test(read())
+      && /早上不排会/.test(readFileSync(copyPath, "utf-8")));
+
+    // A memory file that cannot be read is never written over (it would lose everything in it).
+    writeFileSync(memPath, "## 基本档案\n- 住在波士顿\n");
+    chmodSync(memPath, 0o000);
+    let unreadable = false;
+    try { readFileSync(memPath, "utf-8"); } catch { unreadable = true; }
+    if (unreadable) {
+      let threw = false;
+      try { sec.addSecretaryRules(); } catch { threw = true; }
+      const appended = mem.appendMemoryEntry("基本档案", "不该写进去的一条");
+      chmodSync(memPath, 0o644);
+      check("secretary + memory: an unreadable memory.md is left alone, not replaced by a fresh file",
+        threw && appended === false && read() === "## 基本档案\n- 住在波士顿\n" && !sec.hasSecretaryRules());
+    } else {
+      chmodSync(memPath, 0o644);
+      check("secretary + memory: an unreadable memory.md is left alone (skipped: running as root)", true);
+    }
+
+    // The card's "打开 memory.md" button: only the card's own JSON POST opens the file.
+    const fakeRes = () => ({ status: 0, body: null, writeHead(code) { this.status = code; }, end(text) { this.body = JSON.parse(text); } });
+    const opened = [];
+    const opener = async (file) => { opened.push(file); };
+    const post = (headers) => ({ method: "POST", headers: { host: "127.0.0.1:3080", ...headers } });
+    let r = fakeRes();
+    await sec.handleMemoryOpen({ method: "GET", headers: {} }, r, opener);
+    check("memory open: GET is refused", r.status === 405 && opened.length === 0);
+    r = fakeRes();
+    await sec.handleMemoryOpen(post({ "content-type": "text/plain" }), r, opener);
+    check("memory open: a form-style POST (what another site's page can send unasked) is refused", r.status === 403 && opened.length === 0);
+    r = fakeRes();
+    await sec.handleMemoryOpen(post({ "content-type": "application/json", origin: "https://evil.example" }), r, opener);
+    check("memory open: a request from another origin is refused", r.status === 403 && opened.length === 0);
+    r = fakeRes();
+    await sec.handleMemoryOpen(post({ "content-type": "application/json", origin: "http://127.0.0.1:3080" }), r, opener);
+    check("memory open: the card's own request opens memory.md and says where it is",
+      r.status === 200 && r.body.ok === true && opened.length === 1 && opened[0] === memPath && r.body.path === memPath);
+    r = fakeRes();
+    await sec.handleMemoryOpen(post({ "content-type": "application/json" }), r, async () => { throw new Error("no app"); });
+    check("memory open: a failure comes back as a message for the card", r.status === 500 && /打不开：no app/.test(r.body.message));
+  } finally {
+    if (prevState === undefined) delete process.env.CLAWBOT_STATE_DIR; else process.env.CLAWBOT_STATE_DIR = prevState;
+    rmSync(state, { recursive: true, force: true });
+  }
+
+  const secSrc = readFileSync(join(ROOT, "src/secretary.ts"), "utf-8");
+  check("memory open: the file is opened without a shell (execFile with an argument list)",
+    /execFile\(cmd, args/.test(secSrc) && !/\bexec\(|shell: true/.test(secSrc));
+  check("memory open: the card button sends a JSON POST and the route is registered",
+    /fetch\(MEMORY_OPEN_URL, \{ method: "POST", headers: \{ "content-type": "application\/json" \}/.test(readFileSync(join(ROOT, "src/client.js"), "utf-8"))
+    && /registerMemoryOpenRoute\(ctx\)/.test(readFileSync(join(ROOT, "src/index.ts"), "utf-8")));
+
+  const indexSrc = readFileSync(join(ROOT, "src/index.ts"), "utf-8");
+  check("secretary: it needs the Mac calendar (and macOS)",
+    /config\.secretary === true && config\.macCalendar === true && process\.platform === "darwin"/.test(indexSrc));
+  check("secretary: memory.md changes only when the switch (or the calendar) flips; a start-up only fills in a missing section",
+    /secretaryActive\(\) !== secretaryWas && !superseded/.test(indexSrc)
+    && /secretaryActive\(\) && !hasSecretaryRules\(\)/.test(indexSrc)
+    && (indexSrc.match(/removeSecretaryRules\(\)/g) ?? []).length === 1);
+  check("secretary: the rules are not in the plugin's own prompt (they belong to the owner, in memory.md)",
+    !/日程秘书|建议主线/.test(readFileSync(join(ROOT, "src/prompt.ts"), "utf-8")));
+  const clientSrc = readFileSync(join(ROOT, "src/client.js"), "utf-8");
+  check("secretary: the card shows it off and locked while the calendar is off",
+    /on: v\.secretary === true && v\.macCalendar === true/.test(clientSrc)
+    && /disabled: disabled \|\| v\.macCalendar !== true/.test(clientSrc));
+  check("secretary: the status route says whether the rules are in memory",
+    /secretary: hasSecretaryRules\(\)/.test(indexSrc) && /others, secretary, helper/.test(readFileSync(join(ROOT, "src/mac-calendar.ts"), "utf-8")));
 }
 
 console.log(`宿主: dsh ${HOST_VERSION}  (${NPX})`);

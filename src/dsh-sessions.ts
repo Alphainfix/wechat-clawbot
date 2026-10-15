@@ -365,7 +365,8 @@ export function registerDshSessionTools(agentCtx: Context, ctx: Context, wechatS
           return { ok: false, summary: `读不出会话「${found.row.title ?? found.row.id.slice(0, 8)}」:${String(err).slice(0, 160)}` };
         }
         if (messages === undefined) return { ok: false, summary: "这个 DSH 读不了会话内容(没有 sessionQuery 服务)" };
-        const n = Number.isFinite(Number(limit)) ? Math.min(Math.max(Math.trunc(Number(limit)), 1), 40) : 10;
+        // A filled-in 0 (models that fill every optional parameter) means "not given".
+        const n = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.min(Math.trunc(Number(limit)), 40) : 10;
         const tail = messages.slice(-n);
         logger.info(`read_dsh_session: ${found.row.id.slice(0, 8)} -> ${tail.length} of ${messages.length}`);
         const head = `会话「${found.row.title ?? found.row.id.slice(0, 8)}」(${stateLabel(found.row)})`

@@ -73,6 +73,8 @@ window.__ModuleLoader__.load({
     const MB = 1024 * 1024;
     const MODELS_URL = "/plugins/clawbot/models";
     const BRIDGE_URL = "/plugins/clawbot/mcp/status";
+    const CALENDAR_URL = "/plugins/clawbot/calendar/status";
+    const MEMORY_OPEN_URL = "/plugins/clawbot/memory/open";
 
     const cls = (n) => `clawbot-${n}`;
     const S = {
@@ -233,6 +235,56 @@ window.__ModuleLoader__.load({
       return `MCP 客户端已调用 ${bridge.calls} 次，最近一次 ${ago(bridge.lastCallAt)}（${bridge.lastRoute}）${rejected}`;
     }
 
+    /**
+     * What the calendar row says under its switch. The interesting states are the
+     * ones that need the owner at the Mac: the permission prompt, or a refusal
+     * that only System Settings can undo.
+     */
+    function calendarHint(status, name, on) {
+      const base = "打开后 bot 能读取 Mac「日历」里所有账户的日程（含备注），在这个专用日历里自主加、改、删；"
+        + "动别的日历会先在微信里问你。关着时不占 token。改开关会重启微信监听";
+      if (status === null) return base;
+      if (status.unreachable === true) return "状态读不到（路由没注册？DSH 可能需要重启）";
+      if (status.mac === false) return "只支持 macOS";
+      if (!on) return name ? base : `先填专用日历的名字，再打开开关。${base}`;
+      if (status.others > 0) return "白名单里还有别人：大家共用这一个对话，日历内容会被看到，所以日历工具不开放";
+      if (status.error && status.authorization !== "fullAccess") return `还没就绪：${status.error}`;
+      const app = status.helper || "Clawbot-Calendar";
+      if (status.prompting) return `等你在 Mac 上点「允许」：屏幕上有「${app}」想要访问日历的窗口`;
+      switch (status.authorization) {
+        case "fullAccess": {
+          const own = status.dedicated && status.dedicated.name === name
+            ? `专用日历「${name}」在「${status.dedicated.account || "本机"}」`
+            : `专用日历「${name}」第一次添加时创建（优先建在 iCloud；和已有日历重名会先在微信里问你）`;
+          return `已授权，能看到 ${status.calendars ?? "?"} 个日历（${status.accounts ?? "?"} 个账户）。${own}；`
+            + "改名字会另用一个日历，旧的不会删";
+        }
+        case "notDetermined":
+          return `等你在 Mac 上点「允许」：屏幕上应该有「${app}」想要访问日历的窗口。`
+            + "没看到就去 系统设置 → 隐私与安全性 → 日历";
+        case "denied":
+          return `授权被拒绝了：在 系统设置 → 隐私与安全性 → 日历 里打开「${app}」`;
+        case "writeOnly":
+          return `「${app}」只有「仅添加」权限，读不到日程：在 系统设置 → 隐私与安全性 → 日历 里改成完全访问`;
+        case "restricted":
+          return "这台 Mac 的日历访问被管理策略限制了";
+        default:
+          return status.built === false ? `正在准备「${app}」（第一次要编译，约一分钟）…` : "读取状态…";
+      }
+    }
+
+    /** What the secretary row says: what the switch does, and whether the rules are in memory now. */
+    function secretaryHint(status, on, calendarOn) {
+      const what = "把一套排日程的规则写进长期记忆（memory.md 里的「## 日程秘书」一节）：你说待办、截止时间，"
+        + "bot 先查日历再排进专用日历，回复只说几点做什么、挪走了什么。规则可以直接在 memory.md 里改；"
+        + "关掉时移出记忆并留一份副本，再打开原样放回";
+      if (!calendarOn) return on ? "Mac 日历关着，秘书暂停（规则已移出记忆）；打开日历后自动恢复" : `要先打开 Mac 日历。${what}`;
+      if (!on) return what;
+      if (status && status.secretary === true) return "已开：规则在 memory.md 的「## 日程秘书」一节，可以直接改，下一条消息生效";
+      if (status && status.secretary === false) return "已开，但 memory.md 里没找到「## 日程秘书」一节：关掉再打开一次就会放回去";
+      return what;
+    }
+
     function Switch(props) {
       return h(
         "button",
@@ -256,6 +308,11 @@ window.__ModuleLoader__.load({
       const [failed, setFailed] = useState(false);
       const [catalogue, setCatalogue] = useState(null);
       const [bridge, setBridge] = useState(null);
+      const [calendar, setCalendar] = useState(null);
+      // What is typed in the calendar-name box; null = show the saved name.
+      const [calName, setCalName] = useState(null);
+      // The "打开 memory.md" button: null, "opening", "opened", or what went wrong.
+      const [memoryOpen, setMemoryOpen] = useState(null);
 
       // The model catalogue is a server fact, fetched the first time the card is
       // opened rather than on mount: it costs one resolveModelInfo per model, and
@@ -287,6 +344,31 @@ window.__ModuleLoader__.load({
         return () => { alive = false; clearInterval(timer); };
       }, [open]);
 
+      // Calendar permission state. The server only asks the helper while the
+      // switch is on, and caches the answer, so polling here launches nothing.
+      useEffect(() => {
+        if (!open) return;
+        let alive = true;
+        let timer = null;
+        // Fast while the permission is still being decided, slow once it has
+        // settled (or the switch is off): every look launches the helper app.
+        const settled = (d) => d && (d.enabled !== true
+          || ["fullAccess", "denied", "restricted", "writeOnly"].includes(d.authorization));
+        const next = (d) => { if (alive) timer = setTimeout(tick, settled(d) ? 60000 : 10000); };
+        const tick = () => {
+          fetch(CALENDAR_URL, { headers: { accept: "application/json" } })
+            .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+            .then((d) => { if (!alive) return; if (d && d.ok) setCalendar(d); next(d && d.ok ? d : null); })
+            .catch(() => { if (alive) { setCalendar({ unreachable: true }); next(null); } });
+        };
+        tick();
+        return () => { alive = false; if (timer) clearTimeout(timer); };
+      }, [open]);
+
+      // Follow the saved name again once it changes (a save landed, or 重置).
+      const savedName = state && state.value ? (state.value.macCalendarName || "") : "";
+      useEffect(() => { setCalName(null); }, [savedName]);
+
       if (!state || state.available !== true) return null;
 
       const v = state.value || {};
@@ -309,6 +391,23 @@ window.__ModuleLoader__.load({
       const models = (provider && provider.models) || [];
       const model = models.find((m) => m.id === v.model);
       const efforts = (model && model.efforts) || [];
+
+      const openMemory = async () => {
+        if (memoryOpen === "opening") return;
+        setMemoryOpen("opening");
+        try {
+          const res = await fetch(MEMORY_OPEN_URL, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+          const d = await res.json().catch(() => null);
+          if (res.ok && d && d.ok) {
+            setMemoryOpen("opened");
+            setTimeout(() => setMemoryOpen((now) => (now === "opened" ? null : now)), 3000);
+          } else {
+            setMemoryOpen((d && d.message) || `打不开（HTTP ${res.status}）`);
+          }
+        } catch {
+          setMemoryOpen("打不开：路由读不到，DSH 可能需要重启");
+        }
+      };
 
       const restartNow = async () => {
         if (restarting) return;
@@ -558,6 +657,71 @@ window.__ModuleLoader__.load({
           }),
         }),
         Field({
+          label: "Mac 日历",
+          hint: calendarHint(calendar, (calName ?? v.macCalendarName ?? "").trim(), v.macCalendar === true),
+          overridden: isSet("macCalendar") || isSet("macCalendarName"), disabled,
+          onReset: () => { clear("macCalendar"); clear("macCalendarName"); setCalName(null); },
+          inline: h(Switch, {
+            label: "Mac 日历",
+            on: v.macCalendar === true,
+            // Turning it on needs a calendar name first (the one being typed
+            // counts); turning it off never does.
+            disabled: disabled || (v.macCalendar !== true
+              && (!(calName ?? v.macCalendarName ?? "").trim() || (calendar !== null && calendar.mac === false))),
+            onChange: (next) => {
+              const typed = (calName ?? v.macCalendarName ?? "").trim();
+              if (next && typed !== (v.macCalendarName || "").trim()) set("macCalendarName", typed);
+              set("macCalendar", next);
+            },
+          }),
+          control: h("input", {
+            type: "text", className: S.input, disabled,
+            value: calName ?? (v.macCalendarName || ""),
+            placeholder: "专用日历的名字，例如 规划",
+            maxLength: 60,
+            onChange: (e) => setCalName(String(e.target.value)),
+            onBlur: (e) => {
+              const name = String(e.target.value).trim();
+              if (name === (v.macCalendarName || "").trim()) return;
+              if (name === "") clear("macCalendarName"); else set("macCalendarName", name);
+            },
+          }),
+        }),
+        Field({
+          label: "日历提醒",
+          hint: "bot 往日历里加日程时，默认带一个提前这么多分钟的日历提醒（手机上也会响）。"
+            + "和 bot 的微信提醒重复没关系；全天日程不加；你在微信里说了要提前多久，就按你说的",
+          overridden: isSet("macCalendarAlert") || isSet("macCalendarAlertMinutes"), disabled,
+          onReset: () => { clear("macCalendarAlert"); clear("macCalendarAlertMinutes"); },
+          inline: h(Switch, {
+            label: "日历提醒", on: v.macCalendarAlert !== false, disabled,
+            onChange: (next) => set("macCalendarAlert", next),
+          }),
+          control: h("input", {
+            type: "number", className: S.input, min: 0, max: 10080, disabled: disabled || v.macCalendarAlert === false,
+            value: v.macCalendarAlertMinutes === undefined ? "" : v.macCalendarAlertMinutes,
+            placeholder: "提前几分钟，默认 10",
+            onChange: (e) => num("macCalendarAlertMinutes", e.target.value),
+          }),
+        }),
+        Field({
+          label: "日程秘书",
+          hint: secretaryHint(calendar, v.secretary === true, v.macCalendar === true)
+            + (memoryOpen !== null && memoryOpen !== "opening" && memoryOpen !== "opened" ? `（${memoryOpen}）` : ""),
+          control: h("div", null, h("button", {
+            type: "button", className: S.button, disabled: disabled || memoryOpen === "opening", onClick: openMemory,
+          }, memoryOpen === "opened" ? "已在 Mac 上打开" : "打开 memory.md")),
+          overridden: isSet("secretary"), disabled,
+          onReset: () => clear("secretary"),
+          inline: h(Switch, {
+            label: "日程秘书",
+            // It leans on the calendar: off (and not switchable) while the calendar is off.
+            on: v.secretary === true && v.macCalendar === true,
+            disabled: disabled || v.macCalendar !== true || (calendar !== null && calendar.mac === false),
+            onChange: (next) => set("secretary", next),
+          }),
+        }),
+        Field({
           label: "Codex 会话联动",
           hint: "默认关。打开后 bot 可以选择 Codex 项目和会话、转发微信消息、查询进度,但每次请求要多带 5 个工具(约 1k token)。改动会重启微信监听。连接方式和 CLI 路径在 clawbot 配置里设置",
           overridden: isSet("codexPeer"), disabled,
@@ -583,7 +747,7 @@ window.__ModuleLoader__.load({
             { className: S.headText },
             h("span", { className: S.name }, "微信 Bot"),
             h("span", { className: S.description },
-              "模型、图片、发送与白名单。改完立刻生效，微信连接不中断"),
+              "模型、图片、白名单、Mac 日历与日程秘书。大多改完立刻生效，微信连接不中断"),
           ),
           h(
             "svg",
