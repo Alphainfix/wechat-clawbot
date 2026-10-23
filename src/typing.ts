@@ -23,7 +23,6 @@ type TypingAccount = { baseUrl: string; token?: string };
 
 export type TypingDeps = {
   getAccount: () => TypingAccount | null | undefined;
-  getContextToken: (sender: string) => string;
   /**
    * True while the bot is waiting for this sender to answer (an approval or a
    * question). The bot is not typing then — the user is — so the indicator
@@ -224,14 +223,20 @@ export class TypingIndicator {
     const cached = this.tickets.get(sender);
     if (cached !== undefined && now < cached.nextFetchAt) return cached.ticket || undefined;
     try {
+      // No context token: since some time after 2026-10-10, getconfig answers
+      // `ret=-1 invalid request` (and no ticket) when the message's context
+      // token rides along, so typing had silently stopped showing.
       const resp = await this.api.getConfig({
         baseUrl: account.baseUrl,
         token: account.token,
         ilinkUserId: sender,
-        contextToken: this.deps.getContextToken(sender) || undefined,
         timeoutMs: 5_000,
       });
       const ticket = resp.ret === undefined || resp.ret === 0 ? resp.typing_ticket ?? "" : "";
+      if (!ticket) {
+        // Was silent before: typing just never showed. Once per retry window at most.
+        logger.info(`typing: no typing ticket from getconfig (ret=${String(resp.ret)} ${String((resp as { errmsg?: unknown }).errmsg ?? "")}); typing stays off for now`);
+      }
       // Spread refreshes over the day, like the official channel does.
       this.tickets.set(sender, {
         ticket,

@@ -27,6 +27,8 @@ import { registerDshSessionTools } from "./dsh-sessions.js";
 import { NOTIFY_TOOL } from "./owner-notify.js";
 import { registerCodexPeerTools, type CodexPeer } from "./codex-peer.js";
 import { registerCalendarTools, type CalendarHelper, type OwnerAnswer } from "./mac-calendar.js";
+import { registerAlarmTools, type AlarmService } from "./mac-alarms.js";
+import { registerClockReadingFilter, registerLateScheduleNotes } from "./time-context.js";
 import { setApprovalPolicy } from "@deepseek-ai/dsh-user-approval";
 // `@deepseek-ai/dsh-agent-presets` (and its `ctx.agentPresets` type
 // augmentation) is gone in DSH 0.1.7; the service keeps its name
@@ -39,7 +41,7 @@ import { markSessionCreated, wasSessionCreated } from "./state.js";
 import { PendingRegistry, type PendingAnswer } from "./pending.js";
 import { TypingIndicator } from "./typing.js";
 import { HOLD_MESSAGE, INCOMING_WAIT_MS, MAX_HOLDS, MAX_RESTARTS, TOGETHER_HINT, mayRestartTurn, shouldHoldReply } from "./coalesce.js";
-import { Backlog, FILE_ATTEMPTS, digestChunks, dueStamp, fileLabel, isSendWindowClosed, occurrenceAt, type BacklogItem, type NewBacklogItem } from "./backlog.js";
+import { Backlog, FILE_ATTEMPTS, digestChunks, dueStamp, fileLabel, isSendWindowClosed, occurrenceAt, quietTask, type BacklogItem, type NewBacklogItem } from "./backlog.js";
 import type { FileUploadResult } from "./tool.js";
 
 /**
@@ -50,6 +52,12 @@ const REPLY_TOOLS = new Set(["send_wechat_text", "send_wechat_file", "ask_user_q
 
 /** One inbound WeChat message waiting for its turn; `parts` lets several merge into one. */
 type QueuedMessage = { sender: string; text: string; message: UserMessage; parts: unknown[] };
+
+/** The text of a session message (its text parts). */
+function messageText(data: unknown): string {
+  const content = (data as { content?: ReadonlyArray<{ type?: string; text?: string }> } | undefined)?.content ?? [];
+  return content.map((b) => (b.type === "text" ? b.text ?? "" : "")).join("\n");
+}
 
 /** A user message as the WeChat bridge appends it. */
 function wechatUserMessage(parts: unknown[]): UserMessage {
@@ -86,6 +94,8 @@ export type BridgeDeps = {
   sendFile?: (to: string, file: { path: string; caption?: string; original?: boolean }) => Promise<FileUploadResult>;
   /** The macOS Calendar helper; the tools are registered only when `macCalendar` is on. */
   calendarHelper?: CalendarHelper;
+  /** Alarms (urgent reminders), registered with the calendar tools: both are 全天候秘书. */
+  alarms?: AlarmService;
 };
 
 /**
@@ -201,7 +211,6 @@ export class WechatBridge {
     this.backlog = deps.backlog ?? new Backlog();
     this.typing = new TypingIndicator({
       getAccount: () => deps.getAccount(),
-      getContextToken: (sender) => deps.getContextToken(sender),
       isWaitingFor: (sender) => deps.pending.hasFor(sender),
     });
     this.idleCompact = new IdleCompactor({
@@ -213,6 +222,7 @@ export class WechatBridge {
         || this.ctx.agents.get(this.sessionId)?.status === "running",
       lastRequestTokens: () => this.lastRequestTokens,
       hostThreshold: () => this.hostCompactionThreshold(),
+      fixedTrigger: () => this.config.idleCompactionTokens,
       compact: (signal) => this.runHostCompact(signal),
       onCompacted: () => { this.lastRequestTokens = undefined; },
     });
@@ -236,10 +246,12 @@ export class WechatBridge {
     const hasCompact = commands?.find !== undefined && agent !== undefined && commands.find(agent, "compact") !== undefined;
     let threshold: number | undefined;
     try { threshold = await this.hostCompactionThreshold(); } catch { threshold = undefined; }
+    const fixed = this.config.idleCompactionTokens;
+    const trigger = fixed ?? (threshold === undefined ? "?" : Math.floor(threshold * IDLE_COMPACT_RATIO));
     logger.info(
       `idle-compact: /compact ${hasCompact ? "可用" : "不可用(只剩宿主回复前的压缩)"};`
-      + ` 宿主阈值 ${threshold ?? "未知"},空闲时超过 ${threshold === undefined ? "?" : Math.floor(threshold * IDLE_COMPACT_RATIO)} token 就整理`
-      + `(上次请求 ${this.lastRequestTokens ?? "未知"})`,
+      + ` 宿主阈值 ${threshold ?? "未知"},空闲时超过 ${trigger} token 就整理`
+      + `${fixed === undefined ? "" : "(插件设置的阈值)"}(上次请求 ${this.lastRequestTokens ?? "未知"})`,
     );
   }
 
@@ -1467,9 +1479,7 @@ export class WechatBridge {
       if (source?.kind === "schedule" || source?.plugin === "schedule") {
         // What a refused reminder is stamped with: when it was due (even if it
         // fired late), not when the bot got round to it.
-        const text = ((event.data as unknown as { content?: ReadonlyArray<{ type?: string; text?: string }> } | undefined)?.content ?? [])
-          .map((b) => (b.type === "text" ? b.text ?? "" : "")).join("\n");
-        this.reminderDueAt = occurrenceAt(text) ?? new Date().toISOString();
+        this.reminderDueAt = occurrenceAt(messageText(event.data)) ?? new Date().toISOString();
       }
     }
     if (event.type === "tool/call" && this.currentSender) {
@@ -1503,7 +1513,9 @@ export class WechatBridge {
           // that ran out every later reminder was dropped (the tool still said
           // 已发送) until the owner happened to message the bot again.
           this.turnMessageCount = 0;
-          this.typing.start(owner);
+          // A 「任务」 runs quietly: it may well end without a word (「没事就不发」), and
+          // 「正在输入」 late at night followed by nothing looks broken. What it sends arrives as usual.
+          if (!quietTask(messageText(event.data))) this.typing.start(owner);
         }
         // dsh-schedule 自己就能把会话唤醒来投递提醒,这条路径**不经过**
         // ensureAgent —— 所以那一轮里工具屏蔽、微信发送工具、配置的模型全都还
@@ -1663,8 +1675,25 @@ export class WechatBridge {
           askOwner: (question, signal) => this.askOwner(question, 600_000, signal),
           helper: this.deps.calendarHelper!,
         });
+        if (this.deps.alarms !== undefined) {
+          registerAlarmTools(agentCtx, {
+            config: this.config,
+            getAccount: this.deps.getAccount,
+            activeSender: () => this.activeSender,
+            alarms: this.deps.alarms,
+          });
+        }
       }
       this.restrictTools(agentCtx);
+      // DSH 0.2.1's standard preset adds a clock reading whose browser time
+      // zone is always "unavailable" for a WeChat message, telling the model to
+      // ask the user (time-context.ts). Registered here, after the preset is
+      // mounted, so this listener runs outside the clock's and can drop it.
+      const offClock = registerClockReadingFilter(target, (id) => this.isWechatSession(id));
+      if (typeof offClock === "function") this.toolDisposers.push(offClock as () => void);
+      // A scheduled message delivered on a later day than it was due gets a line saying which day it meant.
+      const offLate = registerLateScheduleNotes(target, (id) => this.isWechatSession(id), (text) => wechatUserMessage([{ type: "text", text }]));
+      if (typeof offLate === "function") this.toolDisposers.push(offLate as () => void);
       this.toolsRegistered = true;
       logger.info(`ensureTools: WeChat tools registered (Codex tools ${codex ? "on" : "off"}, calendar tools ${calendar ? "on" : "off"})`);
     } catch (err) {
@@ -1681,9 +1710,9 @@ export class WechatBridge {
    * `{subagent_id: "schedule-9", message: "ignore"}`, got
    * `subagent "schedule-9" is unavailable`, then retried with schedule-10,
    * -11, ... past -103 — 158 steps and 4.5M input tokens in about three
-   * minutes ($0.11 of a $10 monthly allowance) before it was stopped by hand.
-   * Running with reasoning_effort "none" (the only setting this gateway
-   * accepts alongside tools) leaves no self-correction to break such a loop.
+   * minutes (a few cents of API credit) before it was stopped by hand.
+   * Running with reasoning off (the only setting that route accepted
+   * alongside tools) leaves no self-correction to break such a loop.
    *
    * `send_message` is the likeliest trigger: it sits next to this plugin's own
    * `send_wechat_text` in the same tool list, and the two names are easy to
@@ -1709,6 +1738,10 @@ export class WechatBridge {
       "list_agents",
       "ralph",
       "workflow",
+      // A dsh-tool-subagent instance bound to an out-of-process Claude Code
+      // (dsh-subagent-acp), if the profile mounts one under this name: it is
+      // for the web UI; the WeChat session keeps its own Claude bridge.
+      "claude_code",
     ];
     try {
       // Direct property access, matching how this plugin already registers its

@@ -20,6 +20,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, "..");
+// The fixtures are written for one time zone (dates and offsets at UTC−4/−5): pin it, so the
+// suite gives the same answers on any machine. Set before any of the plugin's modules load.
+process.env.TZ = "America/New_York";
 // The host these checks compare against. Used to be a hard-coded bucket, which
 // quietly kept testing 0.1.1-rc.2 through three upgrades. Now: the bucket whose
 // `.bin/dsh` is newest — the same rule the menu-bar whale boots by — or
@@ -253,26 +256,20 @@ function check(name, ok, detail) {
   const { buildWechatSystemPrompt } = await import(join(ROOT, "lib/prompt.js"));
   const prompt = buildWechatSystemPrompt(false);
 
-  // 22:31 US Eastern on Aug 31 is already Sep 1 in UTC. A memory entry stamped
+  // 22:31 at UTC−4 on Aug 31 is already Sep 1 in UTC. A memory entry stamped
   // then read `[2026-09-01]`, so the agent saw a fact dated in the future.
   const lateEvening = new Date("2026-08-31T22:31:00-04:00");
   const utcWouldSay = lateEvening.toISOString().slice(0, 10);
   const zoned = lt.zonedDate(lateEvening);
-  const eastern = lt.USER_TIME_ZONE === "America/New_York";
-  if (eastern) {
-    check("zonedDate does not drift to the UTC date late in the evening",
-      zoned === "2026-08-31" && utcWouldSay === "2026-09-01",
-      `zoned=${zoned} utc=${utcWouldSay}`);
-  } else {
-    check(`zonedDate agrees with the host zone (${lt.USER_TIME_ZONE})`,
-      /^\d{4}-\d{2}-\d{2}$/.test(zoned), zoned);
-  }
+  check("zonedDate does not drift to the UTC date late in the evening",
+    zoned === "2026-08-31" && utcWouldSay === "2026-09-01",
+    `zoned=${zoned} utc=${utcWouldSay}`);
   check("no source file stamps dates from toISOString",
     ["lib/memory.js", "lib/prompt.js", "lib/bridge.js"].every(
       (f) => !/toISOString\(\)\.slice\(0, ?10\)/.test(readFileSync(join(ROOT, f), "utf-8"))));
 
-  // Stepping the calendar, not adding 24h: 2026-03-08 is the US DST spring
-  // forward, where +24h lands on the same date at 23:00 in some zones.
+  // Stepping the calendar, not adding 24h: 2026-03-08 is a DST spring-forward
+  // date in the suite's zone, where +24h would land on the same date at 23:00.
   check("zonedDatePlus steps whole calendar days across a DST boundary",
     lt.zonedDatePlus(1, new Date("2026-03-07T20:00:00-05:00")) === "2026-03-08"
     && lt.zonedDatePlus(2, new Date("2026-03-07T20:00:00-05:00")) === "2026-03-09");
@@ -351,14 +348,14 @@ function check(name, ok, detail) {
     "[微信消息 08-31 22:30] 我是大学生".replace(strip, "") === "我是大学生"
     && "[微信消息] 我是大学生".replace(strip, "") === "我是大学生");
 
-  // 2026-09-22:机主发「你知道吗,我**其实**可以吃肉桂」来验新链路,结果整条被
-  // 预筛挡掉 —— 老正则要求「我」和动词紧挨着,中间夹一个副词就漏判。
+  // 一句「你知道吗,我**其实**可以吃辣」曾被预筛整条挡掉 ——
+  // 老正则要求「我」和动词紧挨着,中间夹一个副词就漏判。
   // 这几条钉住「副词可以夹在中间」,同时钉住不能因此把「我们…」放进来。
   const shouldPass = [
-    "你知道吗，我其实可以吃肉桂，只是有些同学不喜欢。",
+    "你知道吗，我其实可以吃辣，只是家里人不太能吃。",
     "我真的不喜欢香菜",
     "我平时都喝美式",
-    "我不能喝咖啡",
+    "我不能喝酒",
   ];
   const shouldBlock = ["帮我查一下明天的天气", "哈哈哈那太好了", "我们公司可以报销"];
   check("预筛允许「我」和动词之间夹语气副词",
@@ -550,16 +547,16 @@ function check(name, ok, detail) {
   check("预筛选挡掉明确的定时请求", !pre("三分钟后提醒我来找你") && !pre("到点提醒我喝水"));
   check("预筛选挡掉「别忘了 + 具体时间」", !pre("别忘了明天上午十点开会"));
   check("「请记得 + 事实」照常送判定", pre("请记得我对花生过敏"));
-  check("带时间的习惯照常送判定", pre("我习惯晚上十点睡觉") && pre("我每周三下午都有组会"));
+  check("带时间的习惯照常送判定", pre("我习惯晚上十点睡觉") && pre("我每周三下午都有例会"));
 
   // 兜底:模型被告知不要,仍然偶尔会把提醒归档。用假判定函数模拟它不听话。
   const say = (out) => async () => out;
-  const r1 = await confirmWithLLM("我每周三下午都有组会", say('{"section":"提醒事项","fact":"用户每周三下午有组会"}'));
+  const r1 = await confirmWithLLM("我每周三下午都有例会", say('{"section":"提醒事项","fact":"用户每周三下午有例会"}'));
   check("兜底:模型返回「提醒事项」就丢弃，而不是改塞进别的分类", r1 === null);
   const r2 = await confirmWithLLM("我喜欢喝茶", say('{"section":"重要事实","fact":"用户明天上午十点有会议"}'));
   check("兜底:事实里带「明天」这类相对时间就丢弃", r2 === null);
-  const r3 = await confirmWithLLM("今天开始我戒咖啡了", say('{"section":"偏好与习惯","fact":"用户戒了咖啡"}'));
-  check("兜底:改写后不带相对时间的事实照常保留", r3?.fact === "用户戒了咖啡" && r3?.section === "偏好与习惯");
+  const r3 = await confirmWithLLM("今天开始我戒奶茶了", say('{"section":"偏好与习惯","fact":"用户戒了奶茶"}'));
+  check("兜底:改写后不带相对时间的事实照常保留", r3?.fact === "用户戒了奶茶" && r3?.section === "偏好与习惯");
   const src = readFileSync(join(ROOT, "lib/memory-auto.js"), "utf-8");
   check("分类器的可选分类里没有「提醒事项」",
     !/SECTIONS\s*=\s*\[[^\]]*提醒事项/.test(src));
@@ -572,7 +569,7 @@ function check(name, ok, detail) {
   check("写入口:「提醒事项」分类一律拒收", why("提醒事项", "用户要记得交作业") !== null && why("remind", "x") !== null);
   check("写入口:带相对时间的条目拒收", why("重要事实", "用户明天上午十点有会议") !== null);
   check("写入口:长期事实照常放行",
-    why("重要事实", "用户每周三下午有组会") === null && why("偏好与习惯", "用户喜欢喝茶") === null);
+    why("重要事实", "用户每周三下午有例会") === null && why("偏好与习惯", "用户喜欢喝茶") === null);
   check("写入口:拒收理由指向 schedule_create（模型读得到，才知道该换工具）",
     /schedule_create/.test(why("提醒事项", "x") ?? ""));
   const memSrc = readFileSync(join(ROOT, "lib/memory.js"), "utf-8");
@@ -818,6 +815,29 @@ function check(name, ok, detail) {
     h.typing.noteWorking("u1"); await sleep(10);
     check("noteWorking while typing already shows sends nothing extra", h.calls.slice(m).join() === "u1:1", h.calls.join());
     h.typing.stop();
+  }
+  {
+    // 2026-10-20: getconfig turned down requests carrying the context token
+    // (ret=-1 "invalid request", no ticket) but answers without it, so typing
+    // had silently stopped. The ticket request never carries the token now.
+    const asked = [];
+    const calls = [];
+    const typing = new TypingIndicator({
+      getAccount: () => ({ baseUrl: "http://127.0.0.1:9", token: "t" }),
+      isWaitingFor: () => false,
+      keepaliveMs: 40,
+      api: {
+        getConfig: async ({ contextToken }) => {
+          asked.push(contextToken ?? "none");
+          return contextToken ? { ret: -1, errmsg: "invalid request" } : { ret: 0, typing_ticket: "ticket" };
+        },
+        sendTyping: async ({ body }) => { calls.push(`${body.ilink_user_id}:${body.status}:${body.typing_ticket}`); },
+      },
+    });
+    typing.start("u1"); await sleep(10);
+    check("the typing ticket is asked for without the context token (iLink rejects it with one)",
+      calls.join() === "u1:1:ticket" && asked.join() === "none", `${asked.join()} | ${calls.join()}`);
+    typing.stop();
   }
   {
     let release;
@@ -1136,6 +1156,30 @@ function check(name, ok, detail) {
     try { await h.compactor.check(); } catch { threw = true; }
     check("a failing compaction never throws into the bridge", !threw);
   }
+  // idleCompactionTokens (2026-10-19): the bot's own trigger, so the model's window — shared with the
+  // web UI — can stay large. A model with a 1M window and 384K output → host threshold 550,464.
+  check("host threshold, 1M window with 384K output: 550,464", hostCompactionThreshold(1000000, 384000) === 550464);
+  {
+    const h = make({ lastRequestTokens: () => 310000, hostThreshold: async () => 550464, fixedTrigger: () => 300000 });
+    await h.compactor.check();
+    check("a configured trigger compacts at its own size, well below 85% of a large host threshold", h.calls.length === 1);
+  }
+  {
+    const h = make({ lastRequestTokens: () => 230000, hostThreshold: async () => 241696, fixedTrigger: () => 300000 });
+    await h.compactor.check();
+    check("a configured trigger above the size leaves the session alone even when 85% of the host threshold would compact",
+      h.calls.length === 0);
+  }
+  {
+    const h = make({ lastRequestTokens: () => 310000, hostThreshold: async () => { throw new Error("no route"); }, fixedTrigger: () => 300000 });
+    await h.compactor.check();
+    check("a configured trigger still works when the host threshold cannot be read", h.calls.length === 1);
+  }
+  {
+    const h = make({ lastRequestTokens: () => 230000, fixedTrigger: () => undefined });
+    await h.compactor.check();
+    check("without a configured trigger it stays 85% of the host threshold", h.calls.length === 1);
+  }
   const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
   check("the quiet-period clock starts when the queue drains and when a turn nobody drives ends",
     (bridgeSrc.match(/this\.idleCompact\.noteIdle\(\)/g) ?? []).length >= 2);
@@ -1150,6 +1194,70 @@ function check(name, ok, detail) {
   const cfgMod = await import(join(ROOT, "lib/config.js"));
   check("idleCompaction is on by default and takes effect without a restart",
     cfgMod.DEFAULT_CONFIG.idleCompaction === true && cfgMod.HOT_FIELDS.has("idleCompaction"));
+  const norm = (v) => cfgMod.normalizeConfig({ ...cfgMod.DEFAULT_CONFIG, idleCompactionTokens: v }).idleCompactionTokens;
+  check("idleCompactionTokens: unset by default, hot, on the card, and 0 / junk mean \"automatic\"",
+    cfgMod.DEFAULT_CONFIG.idleCompactionTokens === undefined && cfgMod.HOT_FIELDS.has("idleCompactionTokens")
+      && /num\("idleCompactionTokens", e\.target\.value, 10000\)/.test(clientSrc)
+      && norm(300000) === 300000 && norm(0) === undefined && norm(-5) === undefined && norm("300000") === undefined,
+    JSON.stringify([norm(300000), norm(0), norm(-5), norm("300000")]));
+  check("the bridge hands the configured trigger to the compactor", /fixedTrigger: \(\) => this\.config\.idleCompactionTokens/.test(bridgeSrc));
+}
+
+// ------------------------------------------- 宿主的时钟读数不进微信会话(DSH 0.2.1,2026-10-17)
+// 0.2.1 把 dsh-time-context 放进了标准预设:微信消息没有浏览器时区,读数永远写着
+// 「unavailable. Ask the user to clarify」,bot 会反问时区。它是 prepend 的 pre-step 监听器,
+// 挂在 agent 自己的作用域里;cordis 的 waterfall 从外往里调、prepend 插到最前面,
+// 所以只有在预设挂好之后才挂的过滤器在它外面。
+{
+  const tc = await import(join(ROOT, "lib/time-context.js"));
+  const reading = { id: "r1", role: "user", source: { kind: "time-context" }, content: [{ type: "text", text: "2026-10-17T15:00 … unavailable. Ask the user to clarify" }] };
+  const wechat = { id: "w1", role: "user", source: { kind: "plugin:wechat-clawbot" }, content: [{ type: "text", text: "[微信消息] 明天下午三点提醒我" }] };
+  const kept = tc.stripClockReadings({ kind: "continue", messages: [wechat, reading] });
+  check("clock readings: only the reading is dropped", kept.dropped === 1 && kept.decision.messages.length === 1 && kept.decision.messages[0] === wechat);
+  const reject = { kind: "reject", messages: [reading] };
+  check("clock readings: a rejected step is left as it is", tc.stripClockReadings(reject).decision === reject);
+
+  // cordis semantics, as read in its source: listeners run in list order, the
+  // first one outermost; `prepend` unshifts.
+  const bus = () => {
+    const list = [];
+    const ctx = { on: (name, listener, options) => { const entry = { name, listener }; options?.prepend ? list.unshift(entry) : list.push(entry); return () => list.splice(list.indexOf(entry), 1); } };
+    const run = async (args) => {
+      const queue = list.filter((e) => e.name === "agent/pre-step").map((e) => e.listener);
+      const next = () => (queue.shift() ?? (async () => ({ kind: "continue", messages: [wechat] })))(args, next);
+      return next();
+    };
+    return { ctx, run };
+  };
+  const clock = async (_args, next) => { const d = await next(); return { ...d, messages: [...d.messages, reading] }; };
+  const isWechat = (id) => id === "wechat-main";
+  {
+    const { ctx, run } = bus();
+    ctx.on("agent/pre-step", clock, { prepend: true });            // the preset mounts first …
+    tc.registerClockReadingFilter(ctx, isWechat);                    // … ensureTools afterwards
+    const d = await run({ agent: { id: "wechat-main" } });
+    check("clock readings: registered after the preset, the filter keeps the reading out of the WeChat step",
+      d.messages.length === 1 && d.messages[0] === wechat);
+    const web = await run({ agent: { id: "session-web" } });
+    check("clock readings: other sessions keep them", web.messages.some((m) => m.source.kind === "time-context"));
+  }
+  {
+    const { ctx, run } = bus();
+    tc.registerClockReadingFilter(ctx, isWechat);                    // registered first (as at plugin start) …
+    ctx.on("agent/pre-step", clock, { prepend: true });            // … the clock ends up outside it
+    const d = await run({ agent: { id: "wechat-main" } });
+    check("clock readings: a filter registered before the preset cannot see them (why it lives in ensureTools)",
+      d.messages.some((m) => m.source.kind === "time-context"));
+  }
+  const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("clock readings: ensureTools registers the filter on the agent's scope, after the preset mount, and takes it back on dispose",
+    /await agentPresets\.mount\(agentCtx\);[\s\S]{0,1200}this\.ensureTools\(agentCtx\);/.test(bridgeSrc)
+    && /const offClock = registerClockReadingFilter\(target, \(id\) => this\.isWechatSession\(id\)\);\s*if \(typeof offClock === "function"\) this\.toolDisposers\.push/.test(bridgeSrc));
+  const hostClock = join(NPX, "@deepseek-ai/dsh-time-context/lib/index.js");
+  if (existsSync(hostClock)) {
+    const { name } = await import(hostClock);
+    check(`clock readings: the host's dsh-time-context still tags its readings "${tc.TIME_CONTEXT_KIND}"`, name === tc.TIME_CONTEXT_KIND, `host says ${name}`);
+  }
 }
 
 // ------------------------------- 工作目录说明文件不进微信会话(可选,2026-10-04)
@@ -1685,14 +1793,14 @@ function check(name, ok, detail) {
     await sleep(40);
     const { createUserMessage } = await import(join(NPX, "@deepseek-ai/dsh-llm/lib/index.js")).catch(() => ({}));
     const reminder = createUserMessage
-      ? createUserMessage({ content: [{ type: "text", text: "提醒：10 点去实验室取样品" }], source: { kind: "schedule" } })
-      : { id: "rem-1", role: "user", content: [{ type: "text", text: "提醒：10 点去实验室取样品" }], source: { kind: "schedule" } };
+      ? createUserMessage({ content: [{ type: "text", text: "提醒：10 点去取快递" }], source: { kind: "schedule" } })
+      : { id: "rem-1", role: "user", content: [{ type: "text", text: "提醒：10 点去取快递" }], source: { kind: "schedule" } };
     agent.followup(reminder); // dsh-schedule follows up while the worker's turn runs: the host runs it next, same driver
     await sleep(270); // ~310 ms: the reminder turn is on its first thought
     await say("谢谢");
     await settle();
     check("flow: a reminder the host runs next in the worker's driver is never cancelled by a newer message",
-      agent.aborts === 0 && agent.recorded.some((t) => /取样品/.test(t)) && covers(agent.replies.join(" | "), "取样品", "谢谢"), show(agent));
+      agent.aborts === 0 && agent.recorded.some((t) => /取快递/.test(t)) && covers(agent.replies.join(" | "), "取快递", "谢谢"), show(agent));
     await bridge.dispose();
   }
   {
@@ -1744,11 +1852,11 @@ function check(name, ok, detail) {
     const backlog = new Backlog(join(dir, "backlog.json"));
     const { agent, settle, say, bridge } = setup({}, { sendText, backlog });
     agent.onReply = (text) => bridge.sendTextTo("u1", `回复：${text}`);
-    bridge.sendTextTo("u1", "记得 10 点去实验室取样品。");
+    bridge.sendTextTo("u1", "记得 10 点去取快递。");
     bridge.sendTextTo("u1", "要回答的问题？", { uncapped: true, transient: true });
     await sleep(30);
     check("flow: a reminder WeChat refused is kept (a transient question is not)",
-      backlog.peek("u1").length === 1 && backlog.peek("u1")[0].text === "记得 10 点去实验室取样品。" && sent.length === 0);
+      backlog.peek("u1").length === 1 && backlog.peek("u1")[0].text === "记得 10 点去取快递。" && sent.length === 0);
     bridge.onSessionEvent({ id: "sim-wechat" }, { type: "turn/end", data: {}, seq: 0 });
     await sleep(30);
     check("flow: nothing is retried before they write again", sent.length === 0 && backlog.peek("u1").length === 1);
@@ -1758,7 +1866,7 @@ function check(name, ok, detail) {
     await sleep(50);
     check("flow: they write again → the reply first, then one digest with the kept reminder and when it was due",
       sent.length === 2 && sent[0].startsWith("回复：") && sent[1].startsWith("有 1 条消息当时没能发出")
-        && /〔\d\d-\d\d 周. \d\d:\d\d〕\n记得 10 点去实验室取样品。/.test(sent[1]), JSON.stringify(sent));
+        && /〔\d\d-\d\d 周. \d\d:\d\d〕\n记得 10 点去取快递。/.test(sent[1]), JSON.stringify(sent));
     check("flow: delivered → the backlog is empty, and the bot is told what went out late",
       backlog.peek("u1").length === 0 && agent.lists["next-step"].some((m) => /\[补发\]/.test(textOf(m))));
     await bridge.dispose();
@@ -1785,8 +1893,8 @@ function check(name, ok, detail) {
   const at = (iso) => new Date(iso).toISOString();
   const items = [
     { id: "b", kind: "notice", at: at("2026-10-13T20:40:00Z"), source: "Claude", summary: "连发合并已部署到本机。" },
-    { id: "a", kind: "text", at: at("2026-10-13T13:00:00Z"), text: "记得 10 点去实验室取样品。" },
-    { id: "c", kind: "file", at: at("2026-10-14T13:00:00Z"), path: "/tmp/x/sunset.png", caption: "今晚的晚霞" },
+    { id: "a", kind: "text", at: at("2026-10-13T13:00:00Z"), text: "记得 10 点去取快递。" },
+    { id: "c", kind: "file", at: at("2026-10-14T13:00:00Z"), path: "/tmp/x/photo.png", caption: "今天拍的照片" },
     { id: "d", kind: "file", at: at("2026-10-14T13:05:00Z"), path: "/tmp/x/report.pdf", caption: "季度报告" },
   ];
   const digest = bl.formatDigest(items, { fileExists: (p) => p.endsWith(".png") });
@@ -1794,14 +1902,14 @@ function check(name, ok, detail) {
   check("digest: one message, the reason first, the owner's chosen wording",
     digest.length === 1 && one.startsWith("有 4 条消息当时没能发出（微信不允许 bot 在你一段时间没说话时主动发消息），按原定时间补上："));
   check("digest: items in time order, each with when it was due",
-    one.indexOf("取样品") < one.indexOf("连发合并") && one.indexOf("连发合并") < one.indexOf("sunset.png")
+    one.indexOf("取快递") < one.indexOf("连发合并") && one.indexOf("连发合并") < one.indexOf("photo.png")
       && (one.match(/〔\d\d-\d\d 周. \d\d:\d\d〕/g) ?? []).length === 4);
-  check("digest: a text entry is its due time, then the text on the next line", /〔[^〕]+〕\n记得 10 点去实验室取样品。/.test(one));
+  check("digest: a text entry is its due time, then the text on the next line", /〔[^〕]+〕\n记得 10 点去取快递。/.test(one));
   check("digest: a notification keeps who sent it and one sentence", /〔[^〕]+〕Claude 的通知\n连发合并已部署到本机。/.test(one));
   check("digest: files say they follow, or that they are gone",
-    /图片 sunset\.png（随后补发）/.test(one) && /文件 report\.pdf（文件已经不在了，没法补发）/.test(one));
+    /图片 photo\.png（随后补发）/.test(one) && /文件 report\.pdf（文件已经不在了，没法补发）/.test(one));
   check("digest: a file that follows carries its own caption; a gone file's caption is kept in the digest",
-    !one.includes("今晚的晚霞") && /文件 report\.pdf（文件已经不在了，没法补发）\n季度报告/.test(one));
+    !one.includes("今天拍的照片") && /文件 report\.pdf（文件已经不在了，没法补发）\n季度报告/.test(one));
   const long = Array.from({ length: 6 }, (_, i) => ({ id: String(i), kind: "text", at: at(`2026-10-1${i}T13:00:00Z`), text: "字".repeat(300) }));
   const parts = bl.formatDigest(long, { fileExists: () => true, maxChars: 800 });
   check("digest: a long one splits between entries, the header only once",
@@ -1856,7 +1964,7 @@ function check(name, ok, detail) {
   const dir = join(tmpdir(), `clawbot-backlog-edges-${process.pid}`);
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
-  const photo = join(dir, "sunset.png");
+  const photo = join(dir, "photo.png");
   writeFileSync(photo, "png");
   const make = ({ sendText, sendFile }) => {
     const backlog = new Backlog(join(dir, `backlog-${Math.random().toString(36).slice(2)}.json`));
@@ -1898,7 +2006,7 @@ function check(name, ok, detail) {
     check("backlog: a retried file is announced once, not in a new digest every time", digests.length === 1, JSON.stringify(sent));
     check(`backlog: …given up after ${FILE_ATTEMPTS} tries with one line to the user and a note to the bot`,
       calls === FILE_ATTEMPTS && backlog.peek("u1").length === 0
-        && sent.some((t) => /图片 sunset\.png 补发了 3 次都没发出去，没能补发。/.test(t))
+        && sent.some((t) => /图片 photo\.png 补发了 3 次都没发出去，没能补发。/.test(t))
         && injected.length === 1 && /没能补发/.test(JSON.stringify(injected[0].content)), JSON.stringify(sent));
     await bridge.dispose();
   }
@@ -1940,7 +2048,7 @@ function check(name, ok, detail) {
     occurrenceAt("[SCHEDULE REMINDER]\nThis is a scheduled message from the user\noccurrence_at: 2026-10-06T17:30:00.000Z\nreminder_prompt_json: \"x\"") === "2026-10-06T17:30:00.000Z"
       && occurrenceAt("没有时间") === undefined && occurrenceAt("occurrence_at: 不是时间") === undefined);
   check("backlog: a refused reminder is stamped with that due time",
-    /this\.reminderDueAt = occurrenceAt\(text\) \?\? new Date\(\)\.toISOString\(\);/.test(bridgeSrc) && /const due = this\.reminderDueAt \?\? new Date\(\)\.toISOString\(\);/.test(bridgeSrc));
+    /this\.reminderDueAt = occurrenceAt\(messageText\(event\.data\)\) \?\? new Date\(\)\.toISOString\(\);/.test(bridgeSrc) && /const due = this\.reminderDueAt \?\? new Date\(\)\.toISOString\(\);/.test(bridgeSrc));
   check("backlog: a message counts as received once it reaches the bot (not while an image still downloads)",
     bridgeSrc.indexOf("this.lastInbound.set(sender, Date.now());") > bridgeSrc.indexOf("const task: QueuedMessage = { sender, text, message, parts };"));
   check("backlog: after a reminder or web turn, unread messages are answered first, then the backlog goes out",
@@ -2073,12 +2181,12 @@ function check(name, ok, detail) {
   // A fake home with an OLD npm install under nvm (found first) and a NEW native install.
   const home = join(tmpdir(), `clawbot-claude-home-${process.pid}`);
   rmSync(home, { recursive: true, force: true });
-  const pkg = join(home, ".nvm/versions/node/v24.16.0/lib/node_modules/@anthropic-ai/claude-code");
+  const pkg = join(home, ".nvm/versions/node/v22.1.0/lib/node_modules/@anthropic-ai/claude-code");
   mkdirSync(join(pkg, "bin"), { recursive: true });
   writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@anthropic-ai/claude-code", version: "2.1.229" }));
   writeFileSync(join(pkg, "bin/claude.exe"), "#!/bin/sh\n", { mode: 0o755 });
-  mkdirSync(join(home, ".nvm/versions/node/v24.16.0/bin"), { recursive: true });
-  symlinkSync(join(pkg, "bin/claude.exe"), join(home, ".nvm/versions/node/v24.16.0/bin/claude"));
+  mkdirSync(join(home, ".nvm/versions/node/v22.1.0/bin"), { recursive: true });
+  symlinkSync(join(pkg, "bin/claude.exe"), join(home, ".nvm/versions/node/v22.1.0/bin/claude"));
   mkdirSync(join(home, ".local/share/claude/versions"), { recursive: true });
   writeFileSync(join(home, ".local/share/claude/versions/2.1.296"), "#!/bin/sh\n", { mode: 0o755 });
   mkdirSync(join(home, ".local/bin"), { recursive: true });
@@ -2164,12 +2272,12 @@ function check(name, ok, detail) {
   const gPlanCal = { id: "c-gplanCal", title: "规划", account: "Google", accountType: "caldav", writable: true };
   let calendars = [work, hol];
   const events = [
-    { id: "ev-meet", calendarId: "c-work", calendar: "工作", account: "iCloud", title: "组会", start: "2026-10-15T14:00:00-04:00",
+    { id: "ev-meet", calendarId: "c-work", calendar: "工作", account: "iCloud", title: "例会", start: "2026-10-15T14:00:00-04:00",
       end: "2026-10-15T15:00:00-04:00", allDay: false, recurring: true, occurrence: "2026-10-15T14:00:00-04:00",
       location: "会议室 A", notes: "带上周的图\n链接 https://example.com/zoom", attendees: 5, organizerIsMe: true },
-    { id: "ev-block", calendarId: "c-planCal", calendar: "规划", account: "iCloud", title: "写论文", start: "2026-10-15T09:00:00-04:00",
+    { id: "ev-block", calendarId: "c-planCal", calendar: "规划", account: "iCloud", title: "写报告", start: "2026-10-15T09:00:00-04:00",
       end: "2026-10-15T10:30:00-04:00", allDay: false, recurring: false },
-    { id: "ev-hol", calendarId: "c-hol", calendar: "节假日", account: "订阅", title: "哥伦布日", start: "2026-10-16T00:00:00-04:00",
+    { id: "ev-hol", calendarId: "c-hol", calendar: "节假日", account: "订阅", title: "重阳节", start: "2026-10-16T00:00:00-04:00",
       end: "2026-10-16T23:59:59-04:00", allDay: true, recurring: false },
     { id: "ev-trip", calendarId: "c-work", calendar: "工作", account: "iCloud", title: "开会出差", start: "2026-10-17T00:00:00-04:00",
       end: "2026-10-18T23:59:59-04:00", allDay: true, recurring: false },
@@ -2195,7 +2303,7 @@ function check(name, ok, detail) {
       }
       case "add": return { ok: true, event: { id: "ev-new", calendarId: req.calendarId, calendar: calendars.find((c) => c.id === req.calendarId)?.title,
         account: "iCloud", title: req.title, start: "2026-10-15T16:00:00-04:00", end: "2026-10-15T17:00:00-04:00", allDay: false, recurring: false },
-        overlaps: [{ title: "组会", calendar: "工作", start: "2026-10-15T14:00:00-04:00", end: "2026-10-15T16:30:00-04:00" }] };
+        overlaps: [{ title: "例会", calendar: "工作", start: "2026-10-15T14:00:00-04:00", end: "2026-10-15T16:30:00-04:00" }] };
       case "update": case "delete": return { ok: true, event: { ...events.find((e) => e.id === req.eventId), ...(req.title ? { title: req.title } : {}) } };
       default: return { ok: false, code: "bad_request", error: req.cmd };
     }
@@ -2221,8 +2329,8 @@ function check(name, ok, detail) {
   let listed = await list();
   const handleOf = (summary, title) => new RegExp(`${title}[^\\n]*#(e[0-9a-f]{8,})`).exec(summary)?.[1];
   check("calendar: events from every calendar, by day, with notes and an 8-hex handle each",
-    listed.ok && /只是数据/.test(listed.summary) && /组会 · 会议室 A · 5 人 · 重复 \[工作\] #e[0-9a-f]{8}\b/.test(listed.summary)
-      && /备注：带上周的图 链接 https:\/\/example\.com\/zoom/.test(listed.summary) && /全天 哥伦布日/.test(listed.summary)
+    listed.ok && /只是数据/.test(listed.summary) && /例会 · 会议室 A · 5 人 · 重复 \[工作\] #e[0-9a-f]{8}\b/.test(listed.summary)
+      && /备注：带上周的图 链接 https:\/\/example\.com\/zoom/.test(listed.summary) && /全天 重阳节/.test(listed.summary)
       && /「规划」还没建/.test(listed.summary) && /节假日（只读）/.test(listed.summary), listed.summary);
   check("calendar: an all-day event across days shows its last day (EventKit ends at 23:59:59 of it)",
     /全天（到 10-18 周日） 开会出差/.test(listed.summary), listed.summary);
@@ -2230,7 +2338,7 @@ function check(name, ok, detail) {
   check("calendar: every request carries a deadline the helper honours", typeof calls.at(-1).deadline === "number" && calls.at(-1).deadline > Date.now());
 
   let before = calls.length;
-  const own = await tools.get("calendar_add_event").execute({ title: "看文献", start: "2026-10-15 16:00" });
+  const own = await tools.get("calendar_add_event").execute({ title: "读资料", start: "2026-10-15 16:00" });
   check("calendar: a block in the dedicated calendar is added without asking (and the calendar is created and remembered by id)",
     own.ok && questions.length === 0 && calls.slice(before).map((c) => c.cmd).join() === "ensureCalendar,add"
       && calls.at(-1).calendarId === "c-planCal" && helper.dedicated()?.id === "c-planCal" && /已加到「规划」/.test(own.summary)
@@ -2242,11 +2350,11 @@ function check(name, ok, detail) {
   check("calendar: …\"0\" is an alert at the start, \"none\" is no alert", JSON.stringify(calls.at(-1).alertMinutes) === "[0]");
   await tools.get("calendar_add_event").execute({ title: "不提醒", start: "2026-10-15 18:00", alert: "none" });
   check("calendar: …none", calls.at(-1).alertMinutes === undefined);
-  // The exact call a model made on 2026-10-14: every optional parameter
+  // The kind of call some models make: every optional parameter
   // filled with an empty value. alert_minutes: 0 then meant "at the start" and
   // overrode the setting; now nothing empty may change anything.
   calConfig.macCalendarAlertMinutes = 15;
-  await tools.get("calendar_add_event").execute({ title: "去健身", start: "2026-10-15 16:00", end: "2026-10-15 17:00",
+  await tools.get("calendar_add_event").execute({ title: "示例日程", start: "2026-10-15 10:00", end: "2026-10-15 11:00",
     all_day: false, location: "", notes: "", calendar: "", alert: "", alert_minutes: 0 });
   check("calendar: a model that fills every optional field with an empty value still gets the setting's alert (15)",
     JSON.stringify(calls.at(-1).alertMinutes) === "[15]" && calls.at(-1).location === undefined && calls.at(-1).notes === undefined
@@ -2268,18 +2376,18 @@ function check(name, ok, detail) {
   // Another calendar: asked first; the answer decides; a non-yes reaches the model word for word.
   answer = { status: "answered", reply: "不，改到周五下午三点" };
   before = calls.length;
-  const refusedAdd = await tools.get("calendar_add_event").execute({ title: "答辩彩排", start: "2026-10-15 16:00", calendar: "工作" });
+  const refusedAdd = await tools.get("calendar_add_event").execute({ title: "评审彩排", start: "2026-10-15 16:00", calendar: "工作" });
   check("calendar: another calendar asks the owner first; a no adds nothing and passes their words on",
     !refusedAdd.ok && questions.length === 1 && /加到你的「工作」日历（iCloud）吗/.test(questions[0])
       && /机主回复「不，改到周五下午三点」/.test(refusedAdd.summary) && !calls.slice(before).some((c) => c.cmd === "add"), refusedAdd.summary);
   answer = { status: "timeout" };
-  const silent = await tools.get("calendar_add_event").execute({ title: "答辩彩排", start: "2026-10-15 16:00", calendar: "工作" });
+  const silent = await tools.get("calendar_add_event").execute({ title: "评审彩排", start: "2026-10-15 16:00", calendar: "工作" });
   check("calendar: silence is reported as silence, not as a refusal", !silent.ok && /10 分钟没回复/.test(silent.summary));
   answer = { status: "undelivered", detail: "微信现在不让 bot 主动发消息" };
-  const undelivered = await tools.get("calendar_add_event").execute({ title: "答辩彩排", start: "2026-10-15 16:00", calendar: "工作" });
+  const undelivered = await tools.get("calendar_add_event").execute({ title: "评审彩排", start: "2026-10-15 16:00", calendar: "工作" });
   check("calendar: a question that never arrived executes nothing", !undelivered.ok && /问题没发到机主微信/.test(undelivered.summary));
   answer = { status: "answered", reply: "好的。" };
-  const okAdd = await tools.get("calendar_add_event").execute({ title: "答辩彩排", start: "2026-10-15 16:00", calendar: "工作" });
+  const okAdd = await tools.get("calendar_add_event").execute({ title: "评审彩排", start: "2026-10-15 16:00", calendar: "工作" });
   check("calendar: …and a yes adds it there", okAdd.ok && calls.at(-1).cmd === "add" && calls.at(-1).calendarId === "c-work");
   const asked = questions.length;
   const readOnly = await tools.get("calendar_add_event").execute({ title: "x", start: "2026-10-15 16:00", calendar: "节假日" });
@@ -2287,7 +2395,7 @@ function check(name, ok, detail) {
 
   // Changes.
   listed = await list();
-  const block = handleOf(listed.summary, "写论文");
+  const block = handleOf(listed.summary, "写报告");
   const moved = await tools.get("calendar_change_event").execute({ event: `#${block}`, action: "update", start: "2026-10-15 11:00" });
   check("calendar: moving its own block needs no question, and the helper is told where the event should be",
     moved.ok && questions.length === asked && calls.at(-1).cmd === "update" && calls.at(-1).expectCalendarId === "c-planCal"
@@ -2297,33 +2405,33 @@ function check(name, ok, detail) {
   check("calendar: a different calendar that merely shares the name is not the bot's: it asks",
     questions.length === asked + 1 && /删掉你「规划」日历里的「同名日历里的事」/.test(questions.at(-1)), other.summary);
   answer = { status: "answered", reply: "好" };
-  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "组会"), action: "delete" });
+  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "例会"), action: "delete" });
   check("calendar: deleting one occurrence says only this one, and deletes it at its own occurrence",
     /（只这一次）/.test(questions.at(-1)) && /5 位参与者/.test(questions.at(-1))
       && calls.at(-1).cmd === "delete" && calls.at(-1).span === "this" && calls.at(-1).occurrence === "2026-10-15T14:00:00-04:00", questions.at(-1));
   listed = await list();
-  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "组会"), action: "delete", scope: "future" });
+  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "例会"), action: "delete", scope: "future" });
   check("calendar: …deleting the series says so in the question",
     /连同之后的每一次一起删掉/.test(questions.at(-1)) && calls.at(-1).span === "future", questions.at(-1));
   listed = await list();
-  const meeting2 = handleOf(listed.summary, "组会");
+  const meeting2 = handleOf(listed.summary, "例会");
   const replace = await tools.get("calendar_change_event").execute({ event: meeting2, action: "update", notes: "带电脑" });
   check("calendar: shortened notes are not replaced wholesale by accident", !replace.ok && /add_notes/.test(replace.summary));
   await tools.get("calendar_change_event").execute({ event: meeting2, action: "update", add_notes: "带电脑" });
   check("calendar: …adding a line is appended by the helper", calls.at(-1).addNotes === "带电脑" && calls.at(-1).notes === undefined
     && /备注里加一句「带电脑」/.test(questions.at(-1)));
   listed = await list();
-  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "写论文"), action: "update", scope: "this",
-    title: "写论文第二章", start: "", end: "", all_day: false, location: "", clear_location: false, notes: "", clear_notes: false,
+  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "写报告"), action: "update", scope: "this",
+    title: "写报告第二章", start: "", end: "", all_day: false, location: "", clear_location: false, notes: "", clear_notes: false,
     add_notes: "", replace_notes: false, calendar: "", alert: "" });
   {
     const c = calls.at(-1);
     check("calendar: a change filled with empty values changes only what was asked (no wiped location, notes or alert, no all-day flip)",
-      c.cmd === "update" && c.title === "写论文第二章" && !("location" in c) && !("notes" in c) && !("allDay" in c) && !("alertMinutes" in c) && !("start" in c),
+      c.cmd === "update" && c.title === "写报告第二章" && !("location" in c) && !("notes" in c) && !("allDay" in c) && !("alertMinutes" in c) && !("start" in c),
       JSON.stringify(c));
   }
   listed = await list();
-  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "写论文"), action: "update", clear_location: true, alert: "none" });
+  await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "写报告"), action: "update", clear_location: true, alert: "none" });
   check("calendar: removing a location or the alert takes an explicit clear_location / alert:none",
     calls.at(-1).location === "" && JSON.stringify(calls.at(-1).alertMinutes) === "[]");
   check("calendar: parseAlert", cal.parseAlert("") === undefined && cal.parseAlert(0) === undefined && cal.parseAlert("0") === 0
@@ -2331,6 +2439,30 @@ function check(name, ok, detail) {
     && cal.parseAlert("soon") === undefined && cal.parseAlert(20) === 20);
   const unknown = await tools.get("calendar_change_event").execute({ event: "#e00000000", action: "delete" });
   check("calendar: an unknown handle says to look again", !unknown.ok && /先用 calendar_events/.test(unknown.summary));
+
+  // The owner can switch the asking off (macCalendarAsk, read live): their
+  // writable calendars are then changed directly, a change other attendees
+  // would be told about still asks, and read-only calendars stay refused.
+  calConfig.macCalendarAsk = false;
+  listed = await list();
+  {
+    const askedBefore = questions.length;
+    const add = await tools.get("calendar_add_event").execute({ title: "评审彩排", start: "2026-10-15 16:00", calendar: "工作" });
+    check("calendar: with asking off, another calendar gets the event without a question",
+      add.ok && questions.length === askedBefore && calls.at(-1).cmd === "add" && calls.at(-1).calendarId === "c-work", add.summary);
+    const change = await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "开会出差"), action: "update", title: "出差" });
+    const drop = await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "同名日历里的事"), action: "delete" });
+    check("calendar: …and its events are changed or deleted without one",
+      change.ok && drop.ok && questions.length === askedBefore && calls.at(-1).cmd === "delete", `${change.summary} / ${drop.summary}`);
+    await tools.get("calendar_change_event").execute({ event: handleOf(listed.summary, "例会"), action: "update", start: "2026-10-15 15:00" });
+    check("calendar: …but a change other attendees would be told about still asks",
+      questions.length === askedBefore + 1 && /5 位参与者/.test(questions.at(-1)), questions.at(-1));
+    const readOnly2 = await tools.get("calendar_add_event").execute({ title: "x", start: "2026-10-15 16:00", calendar: "节假日" });
+    check("calendar: …and a read-only calendar is still refused", !readOnly2.ok && /只读/.test(readOnly2.summary));
+    check("calendar: the tools tell the model never to ask on its own (the tool asks when it has to)",
+      /never ask separately/.test(tools.get("calendar_add_event").description) && /never ask separately/.test(tools.get("calendar_change_event").description));
+  }
+  delete calConfig.macCalendarAsk;
 
   // A calendar with the chosen name that the bot did not create: asked once, remembered by id.
   {
@@ -2376,6 +2508,13 @@ function check(name, ok, detail) {
   authorization = "denied";
   const denied = await tools.get("calendar_events").execute({});
   check("calendar: a refusal says where to turn it on", !denied.ok && /系统设置 → 隐私与安全性 → 日历/.test(denied.summary) && /Clawbot-Calendar/.test(denied.summary));
+  authorization = "notDetermined";
+  before = calls.length;
+  const undecided = await tools.get("calendar_events").execute({});
+  await sleep(20);
+  check("calendar: not authorized yet: it points at 一键授权 at the Mac, and puts up no prompt by itself (nobody may be there)",
+    !undecided.ok && /一键授权/.test(undecided.summary) && /Mac 前/.test(undecided.summary)
+      && !calls.slice(before).some((c) => c.cmd === "request" || c.cmd === "status"), undecided.summary);
   authorization = "fullAccess";
 
   check("calendar: a yes is a clear yes; silence and maybes are no",
@@ -2429,6 +2568,720 @@ function check(name, ok, detail) {
   setLogLevel("info");
 }
 
+// ------------------------------------------------------------- 全天候秘书 · 闹钟(2026-10-22)
+// 闹钟 = 「提醒事项」里的紧急提醒:到点像闹钟一样响(响在「查找」里作为“我的位置”的设备上,一般是 iPhone),
+// 不靠微信。放在机器人自己的闹钟清单里,第一次按「<日历名> 闹钟」建,之后按编号认;小程序经私有的
+// ReminderKit 去设(这里用假的小程序,不碰真的提醒事项)。
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const { setLogLevel } = await import(join(ROOT, "lib/ilink/util/logger.js"));
+  setLogLevel("error");
+  const calA = await import(join(ROOT, "lib/mac-calendar.js"));
+  const alarmsMod = await import(join(ROOT, "lib/mac-alarms.js"));
+  const { zonedDate } = await import(join(ROOT, "lib/localtime.js"));
+  const { createHash } = await import("node:crypto");
+  const aCalls = [];
+  let reminders = "fullAccess";
+  let lists = [];
+  let items = []; // { listId, id, title, due?, urgent, completed, notes? }
+  let oldHelper = false;
+  let urgentWorks = true;
+  let dropNext = false;
+  /** Answered once instead of the real thing (a thrown value when it is null or an Error). */
+  let failNext = null;
+  let nextId = 0;
+  const shown = (a) => {
+    const { listId: _listId, ...rest } = a;
+    return rest;
+  };
+  const aRunner = async (req) => {
+    aCalls.push(req);
+    if (failNext !== null && failNext.cmd === req.cmd) {
+      const res = failNext.res;
+      failNext = null;
+      if (res === null || res instanceof Error) throw res;
+      return res;
+    }
+    if (oldHelper && (req.cmd.startsWith("alarm") || req.cmd === "ensureAlarmList")) return { ok: false, code: "bad_request", error: `unknown command ${req.cmd}` };
+    if (req.cmd === "status") return { ok: true, authorization: "fullAccess", reminders, protocol: 3, alarms: "supported" };
+    if (reminders !== "fullAccess") return { ok: false, code: "reminders_not_authorized", error: reminders };
+    switch (req.cmd) {
+      case "ensureAlarmList": {
+        const known = lists.find((l) => l.id === req.knownId);
+        if (known) return { ok: true, list: known, created: false };
+        const same = lists.find((l) => l.name === req.name);
+        if (same) return { ok: true, list: same, created: false, adopted: true };
+        const list = { id: `L${++nextId}`, name: req.name, account: "iCloud" };
+        lists.push(list);
+        return { ok: true, list, created: true };
+      }
+      case "alarmAdd": {
+        if (dropNext) { dropNext = false; lists = []; }
+        if (!lists.some((l) => l.id === req.listId)) return { ok: false, code: "no_list", error: "the alarm list is gone" };
+        const a = {
+          listId: req.listId, id: `R${++nextId}`, title: req.title, urgent: urgentWorks,
+          due: /(?:Z|[+-]\d{2}:\d{2})$/.test(req.due) ? alarmsMod.isoAt(new Date(req.due)) : alarmsMod.isoAt(alarmsMod.parseAlarmTime(req.due).at),
+          completed: false, ...(req.notes ? { notes: req.notes } : {}),
+        };
+        items.push(a);
+        return { ok: true, alarm: shown(a) };
+      }
+      case "alarms":
+        if (!lists.some((l) => l.id === req.listId)) return { ok: false, code: "no_list", error: "the alarm list is gone" };
+        return { ok: true, alarms: items.filter((a) => a.listId === req.listId).map(shown), list: lists.find((l) => l.id === req.listId) };
+      case "alarmDelete": {
+        const a = items.find((x) => x.id === req.id && x.listId === req.listId);
+        if (a === undefined) return { ok: false, code: "no_alarm", error: "gone" };
+        items = items.filter((x) => x !== a);
+        return { ok: true, alarm: shown(a) };
+      }
+      case "alarmComplete": {
+        let n = 0;
+        for (const a of items) if (a.listId === req.listId && req.ids.includes(a.id) && !a.completed) { a.completed = true; n += 1; }
+        return { ok: true, completed: n };
+      }
+      default: return { ok: false, code: "bad_request", error: `unknown command ${req.cmd}` };
+    }
+  };
+  const aRoot = join(tmpdir(), `clawbot-alarms-${process.pid}`);
+  rmSync(aRoot, { recursive: true, force: true });
+  const aHelper = new calA.CalendarHelper(aRoot, join(ROOT, "native/macos-calendar/main.swift"), aRunner);
+  const aConfig = { macCalendarName: "", allowFrom: [] };
+  const service = new alarmsMod.AlarmService(aHelper, () => aConfig.macCalendarName);
+  const aTools = new Map();
+  let aSender = "owner@im.wechat";
+  let aOwner = "owner@im.wechat";
+  alarmsMod.registerAlarmTools({ tools: { register: (t) => aTools.set(t.name, t) } }, {
+    config: aConfig, getAccount: () => ({ configured: true, userId: aOwner }), activeSender: () => aSender, alarms: service,
+  });
+  check("alarms: three tools", ["alarm_set", "alarm_list", "alarm_cancel"].every((n) => aTools.has(n)));
+  const set = (args) => aTools.get("alarm_set").execute(args);
+  const listAlarms = () => aTools.get("alarm_list").execute({});
+  const cancel = (alarm) => aTools.get("alarm_cancel").execute({ alarm });
+  const tagOf = (summary, title) => new RegExp(`「${title}」[^\\n]*#(a[0-9a-f]{8,})`).exec(summary)?.[1];
+  // Days from today, so the tests keep working whenever they run.
+  const day = (n) => zonedDate(new Date(Date.now() + n * 86_400_000));
+  const at = (n, hm) => `${day(n)} ${hm}`;
+  const when = (text) => alarmsMod.alarmWhen(alarmsMod.parseAlarmTime(text).at);
+
+  let r = await set({ time: at(30, "07:00"), title: "起床" });
+  check("alarms: no calendar name yet: it says where to set one, and touches nothing",
+    !r.ok && /专用日历还没起名字/.test(r.summary) && /全天候秘书/.test(r.summary) && aCalls.length === 0, r.summary);
+  aConfig.macCalendarName = "规划";
+  r = await set({ time: "", title: "", note: "" });
+  check("alarms: a time is required (an empty one counts as missing)", !r.ok && /要给出响的时间/.test(r.summary) && aCalls.length === 0);
+  r = await set({ time: day(30) });
+  check("alarms: a date alone is not an alarm time", !r.ok && /一定要有钟点/.test(r.summary));
+  r = await set({ time: "2027-02-30 07:00" });
+  check("alarms: a date that does not exist is refused, not rolled over", !r.ok && /不是一个真实存在的时间/.test(r.summary));
+  r = await set({ time: "2020-01-01 07:00" });
+  check("alarms: a time in the past is refused", !r.ok && /已经过了/.test(r.summary) && aCalls.length === 0);
+  r = await set({ time: at(500, "07:00") });
+  check("alarms: more than a year ahead is refused (that belongs in the calendar)", !r.ok && /一年多以后/.test(r.summary) && aCalls.length === 0);
+
+  r = await set({ time: at(30, "07:00"), title: "起床", note: "" });
+  const add1 = aCalls.find((c) => c.cmd === "alarmAdd");
+  check("alarms: the first alarm makes the list 「规划 闹钟」, looks at what is set, and sends the wall clock (macOS works out the instant)",
+    r.ok && aCalls[0].cmd === "ensureAlarmList" && aCalls[0].name === "规划 闹钟" && aCalls[0].knownId === undefined
+      && aCalls[1].cmd === "alarms" && add1 !== undefined && add1.due === `${day(30)}T07:00` && add1.title === "起床" && !("notes" in add1)
+      && add1.listId === lists[0].id, JSON.stringify(add1));
+  check("alarms: the answer gives the day, the time, the list and a handle — and promises nothing about a phone it cannot see",
+    r.summary.includes(`已设闹钟：${when(at(30, "07:00"))}「起床」`) && /#a[0-9a-f]{8}\b/.test(r.summary) && /「规划 闹钟」/.test(r.summary)
+      && !/iPhone 上响/.test(r.summary), r.summary);
+  check("alarms: the list is remembered by id, with the name Reminders gave it",
+    aHelper.alarmList()?.id === lists[0].id && aHelper.alarmList()?.name === "规划 闹钟");
+  aCalls.length = 0;
+  r = await set({ time: `${day(29)}T06:30`, title: "", note: "带护照" });
+  const add2 = aCalls.find((c) => c.cmd === "alarmAdd");
+  check("alarms: the next one asks for the known list; an empty title becomes 闹钟; a note goes along",
+    r.ok && aCalls[0].knownId === lists[0].id && add2?.title === "闹钟" && add2?.notes === "带护照", r.summary);
+
+  // The same alarm twice (a retry after a timeout, a routine run twice): found, not set again.
+  aCalls.length = 0;
+  r = await set({ time: at(30, "07:00"), title: "起床" });
+  check("alarms: the same time and title is not set twice; it says it is already set",
+    r.ok && /已经设过了/.test(r.summary) && !aCalls.some((c) => c.cmd === "alarmAdd")
+      && items.filter((a) => a.title === "起床").length === 1, r.summary);
+  r = await set({ time: at(30, "07:00"), title: "吃药" });
+  check("alarms: …a different title at the same minute is a different alarm", r.ok && /已设闹钟/.test(r.summary), r.summary);
+
+  // What alarm_list shows.
+  const listId = lists[0].id;
+  const iso = (ms) => new Date(ms).toISOString();
+  items.push({ listId, id: "Rdone", title: "旧的", due: iso(Date.now() - 30 * 86_400_000), urgent: true, completed: true });
+  items.push({ listId, id: "Rplain", title: "普通提醒", due: alarmsMod.parseAlarmTime(at(31, "08:00")).at.toISOString(), urgent: false, completed: false });
+  items.push({ listId, id: "Rnotime", title: "护照放包里", urgent: true, completed: false });
+  items.push({ listId, id: "Rrang", title: "刚响过", due: iso(Date.now() - 3_600_000), urgent: true, completed: false });
+  items.push({ listId, id: "Rold", title: "很早响过", due: iso(Date.now() - 3 * 3_600_000), urgent: true, completed: false });
+  items.push({ listId, id: "Rtodo", title: "自己的待办", due: iso(Date.now() - 4 * 3_600_000), urgent: false, completed: false });
+  items.push({ listId, id: "Rforeign", title: "别人设的紧急提醒", due: iso(Date.now() - 5 * 3_600_000), urgent: true, completed: false });
+  aHelper.rememberCreatedAlarm("Rold");
+  aCalls.length = 0;
+  const listed = await listAlarms();
+  check("alarms: the list shows what has not rung yet, soonest first; completed ones are left out",
+    listed.ok && /还没响的闹钟（4 个）/.test(listed.summary)
+      && listed.summary.indexOf("06:30") < listed.summary.indexOf("「起床」") && !/旧的/.test(listed.summary), listed.summary);
+  check("alarms: …one that is not urgent says it will only notify", /普通提醒」（不是紧急提醒，只会通知/.test(listed.summary));
+  check("alarms: …one without a time is listed with a handle, not counted as rung",
+    /没有时间、不会响的（1 个）/.test(listed.summary) && tagOf(listed.summary, "护照放包里") !== undefined, listed.summary);
+  check("alarms: …ones whose time passed but are still open are listed with handles too",
+    /时间已经过了、还没勾掉的（4 个）/.test(listed.summary) && tagOf(listed.summary, "刚响过") !== undefined, listed.summary);
+  await sleep(20);
+  const tidied = aCalls.find((c) => c.cmd === "alarmComplete");
+  check("alarms: alarms the plugin set that rang hours ago are marked done in the background (not one that just rang, a to-do, or one it did not set)",
+    tidied !== undefined && tidied.ids.length === 1 && tidied.ids[0] === "Rold" && items.find((a) => a.id === "Rold").completed === true
+      && items.find((a) => a.id === "Rrang").completed === false && items.find((a) => a.id === "Rtodo").completed === false
+      && items.find((a) => a.id === "Rforeign").completed === false && !aHelper.createdAlarms().has("Rold"), JSON.stringify(tidied));
+  const tag = tagOf(listed.summary, "起床");
+  r = await cancel(`#${tag}`);
+  check("alarms: cancel by handle removes that one alarm",
+    r.ok && r.summary.includes(`已取消闹钟：${when(at(30, "07:00"))}「起床」`) && !items.some((a) => a.title === "起床"), r.summary);
+  r = await cancel(`#${tag}`);
+  check("alarms: the same handle again (or an unknown one) says to look again", !r.ok && /先用 alarm_list/.test(r.summary));
+  r = await cancel(`＃${tagOf(listed.summary, "吃药").toUpperCase()}`);
+  check("alarms: a handle typed in capitals, or with a full-width ＃, still works", r.ok, r.summary);
+
+  // The calendar renamed on the card: the alarms already set stay reachable (the list is kept by id).
+  r = await set({ time: at(40, "05:30"), title: "赶飞机" });
+  aConfig.macCalendarName = "计划";
+  aCalls.length = 0;
+  const afterRename = await listAlarms();
+  check("alarms: after renaming the calendar, the alarms already set are still listed (the list is kept by id)",
+    afterRename.ok && /「赶飞机」/.test(afterRename.summary) && aCalls[0].knownId === listId && lists.length === 1, afterRename.summary);
+  r = await cancel(`#${tagOf(afterRename.summary, "赶飞机")}`);
+  check("alarms: …and can be cancelled", r.ok && !items.some((a) => a.title === "赶飞机"), r.summary);
+  r = await set({ time: at(41, "05:30"), title: "又一个" });
+  check("alarms: …new ones go in the same list, named as Reminders has it",
+    r.ok && /「规划 闹钟」/.test(r.summary) && aHelper.alarmList()?.name === "规划 闹钟" && lists.length === 1, r.summary);
+
+  // The list deleted on the phone: the next alarm makes a new one, under the name now on the card.
+  lists = [];
+  items = [];
+  aCalls.length = 0;
+  r = await set({ time: at(42, "07:00"), title: "开会" });
+  check("alarms: a list deleted on the phone is made again (under the current name), and the alarm still lands",
+    r.ok && lists.length === 1 && lists[0].name === "计划 闹钟" && aHelper.alarmList()?.id === lists[0].id && /「计划 闹钟」/.test(r.summary), r.summary);
+  dropNext = true;
+  aCalls.length = 0;
+  r = await set({ time: at(42, "08:00"), title: "开会2" });
+  check("alarms: a list that vanishes between the check and the write is made again once",
+    r.ok && aCalls.filter((c) => c.cmd === "ensureAlarmList").length === 2 && aCalls.filter((c) => c.cmd === "alarmAdd").length === 2, r.summary);
+
+  urgentWorks = false;
+  r = await set({ time: at(43, "07:00"), title: "试试" });
+  check("alarms: when Reminders did not keep it urgent, the model is told to say so", r.ok && /没能设成紧急提醒/.test(r.summary));
+  urgentWorks = true;
+
+  // Timeouts say what may have happened, for what was being done.
+  const late = { ok: false, code: "timeout", error: "Clawbot-Calendar 没在 30 秒内回应" };
+  failNext = { cmd: "alarmAdd", res: late };
+  r = await set({ time: at(44, "07:00"), title: "超时" });
+  check("alarms: a set that timed out says it may be set, and that setting it again is safe",
+    !r.ok && /可能已经设上了/.test(r.summary) && /不会设两个/.test(r.summary), r.summary);
+  const l2 = await listAlarms();
+  failNext = { cmd: "alarmDelete", res: late };
+  r = await cancel(`#${tagOf(l2.summary, "开会2")}`);
+  check("alarms: a cancel that timed out says it may be cancelled (not 'set')", !r.ok && /可能已经取消了/.test(r.summary) && !/设上了/.test(r.summary), r.summary);
+  failNext = { cmd: "alarms", res: late };
+  r = await listAlarms();
+  check("alarms: a listing that timed out just says to try later", !r.ok && /稍后再试/.test(r.summary) && !/alarm_list/.test(r.summary), r.summary);
+
+  // Helper answers that make no sense are reported, not thrown.
+  failNext = { cmd: "ensureAlarmList", res: { ok: true } };
+  r = await set({ time: at(45, "07:00"), title: "坏回答" });
+  check("alarms: an answer without the list is a message, not a crash", !r.ok && /回答不完整/.test(r.summary), r.summary);
+  failNext = { cmd: "alarms", res: { ok: true, alarms: { not: "a list" } } };
+  r = await listAlarms();
+  check("alarms: alarms that are not a list read as none", r.ok && /没有还没响的闹钟/.test(r.summary), r.summary);
+  failNext = { cmd: "alarmAdd", res: { ok: true } };
+  r = await set({ time: at(45, "07:30"), title: "坏回答2" });
+  check("alarms: a set answered without the alarm says to look before trying again", !r.ok && /alarm_list/.test(r.summary), r.summary);
+  failNext = { cmd: "ensureAlarmList", res: null };
+  r = await set({ time: at(45, "08:00"), title: "抛了个空" });
+  check("alarms: a runner that throws no error at all is still a message", !r.ok && /闹钟操作失败/.test(r.summary), r.summary);
+
+  reminders = "notDetermined";
+  r = await set({ time: at(46, "07:00") });
+  check("alarms: no Reminders permission yet: it points at 一键授权, at the Mac", !r.ok && /一键授权/.test(r.summary) && /Mac 前/.test(r.summary), r.summary);
+  reminders = "denied";
+  r = await set({ time: at(46, "07:00") });
+  check("alarms: a refused permission says where to turn it on", !r.ok && /隐私与安全性 → 提醒事项/.test(r.summary));
+  reminders = "fullAccess";
+  oldHelper = true;
+  r = await set({ time: at(46, "07:00") });
+  check("alarms: a helper built before the alarms says to update it with 一键授权", !r.ok && /旧版/.test(r.summary) && /一键授权/.test(r.summary), r.summary);
+  oldHelper = false;
+
+  // While the Reminders prompt is on the Mac's screen, alarms answer "waiting" at once; the calendar goes ahead.
+  const calShared = globalThis[Symbol.for("clawbot.calendar")];
+  calShared.pending = { calendar: false, reminders: true };
+  aCalls.length = 0;
+  r = await set({ time: at(46, "07:00") });
+  await aHelper.call({ cmd: "events", from: "2026-10-15", to: "2026-10-16" });
+  calShared.pending = undefined;
+  check("alarms: while the Reminders prompt is up, alarm tools say so at once; the calendar's commands still go through",
+    !r.ok && /正在等 Mac 上的授权/.test(r.summary) && aCalls.every((c) => c.cmd === "events") && aCalls.length === 1, r.summary);
+
+  aSender = "friend@im.wechat";
+  r = await set({ time: at(46, "07:00") });
+  check("alarms: only the owner — and the refusal speaks of alarms, not the calendar", !r.ok && /闹钟只对机主开放/.test(r.summary));
+  aSender = undefined;
+  r = await listAlarms();
+  check("alarms: the owner using the bot's session from the web UI is allowed", r.ok, r.summary);
+  aSender = "owner@im.wechat";
+  aConfig.allowFrom = ["owner@im.wechat", "friend@im.wechat"];
+  r = await listAlarms();
+  check("alarms: with others on the allow list the tools refuse", !r.ok && /闹钟工具不开放/.test(r.summary));
+  aConfig.allowFrom = [];
+  aOwner = "";
+  r = await listAlarms();
+  check("alarms: with no known owner id the tools fail closed", !r.ok && /不知道机主是谁/.test(r.summary));
+  aOwner = "owner@im.wechat";
+
+  // Two sets of the same alarm at once (a retry racing the first try): one alarm, not two.
+  const [same1, same2] = await Promise.all([set({ time: at(47, "06:00"), title: "同时" }), set({ time: at(47, "06:00"), title: "同时" })]);
+  check("alarms: two sets of the same alarm at once make one alarm (the look and the add do not interleave)",
+    same1.ok && same2.ok && [same1, same2].filter((x) => /已经设过了/.test(x.summary)).length === 1
+      && items.filter((a) => a.title === "同时").length === 1, `${same1.summary} / ${same2.summary}`);
+
+  const desc = aTools.get("alarm_set").description;
+  check("alarms: the tool says when an alarm is right, where it rings, that it is never set twice, and how to move one",
+    /闹钟, 叫醒/.test(desc) && /stays a WeChat reminder \(schedule_create\)/.test(desc) && /does not go through WeChat/.test(desc)
+      && /Find My/.test(desc) && /never set twice/.test(desc) && /set the new time first, then cancel the old one/.test(desc));
+
+  // Times: the owner's wall clock in, the exact instant (with its offset) out to the helper.
+  check("alarms: parseAlarmTime takes a space or a T, and ignores seconds",
+    alarmsMod.parseAlarmTime("2027-01-15 07:00").wall === "2027-01-15T07:00" && alarmsMod.parseAlarmTime("2027-1-5T7:05:30").wall === "2027-01-05T07:05");
+  check("alarms: isoAt names the very same instant, with the owner's offset",
+    [0, 1, 2, 3, 4, 5, 6, 7].every((k) => {
+      const t = new Date(Date.UTC(2027, 0, 15 + k * 45, 12, 0));
+      return new Date(alarmsMod.isoAt(t)).getTime() === t.getTime() && /[+-]\d{2}:\d{2}$/.test(alarmsMod.isoAt(t));
+    }));
+  check("alarms: a due time the helper reports is shown by its own wall clock (macOS's time-zone rules, not Node's)",
+    alarmsMod.dueWhen("2026-11-15T07:00:00-05:00", new Date("2026-10-22T12:00:00Z")) === "11-15 周日 07:00"
+      && alarmsMod.dueWhen("2027-01-02T06:30:00+08:00", new Date("2026-10-22T12:00:00Z")) === "2027-01-02 周六 06:30"
+      && alarmsMod.dueWhen("nonsense") === "（没有时间）");
+  check("alarms: alarmWhen shows the year only when it is not this year's (so a year slip shows)",
+    alarmsMod.alarmWhen(new Date("2027-10-24T12:00:00Z"), new Date("2027-01-02T12:00:00Z")).startsWith("10-24 ")
+      && alarmsMod.alarmWhen(new Date("2027-10-24T12:00:00Z"), new Date("2026-10-22T12:00:00Z")).startsWith("2027-10-24 "));
+  {
+    check("alarms: the hour skipped when the clocks go forward is not a time (New York, 2027-03-14 02:30)",
+      "error" in alarmsMod.parseAlarmTime("2027-03-14 02:30") && !("error" in alarmsMod.parseAlarmTime("2027-03-14 03:30")));
+    check("alarms: a winter time reads back with the winter offset", alarmsMod.parseAlarmTime("2027-01-15 07:00").at.toISOString() === "2027-01-15T12:00:00.000Z");
+    const rep = alarmsMod.parseAlarmTime("2026-11-01 01:30");
+    check("alarms: a time in the hour repeated when the clocks go back names two instants; the first is used (New York, 2026-11-01 01:30)",
+      rep.at.toISOString() === "2026-11-01T05:30:00.000Z" && rep.repeated?.toISOString() === "2026-11-01T06:30:00.000Z"
+        && alarmsMod.isoAt(rep.at) === "2026-11-01T01:30:00-04:00" && alarmsMod.isoAt(rep.repeated) === "2026-11-01T01:30:00-05:00");
+    // In that hour, a time whose first instant has passed cannot be set: Reminders would read it back as the first.
+    const realNow = Date.now;
+    try {
+      Date.now = () => Date.parse("2026-11-01T06:05:00Z"); // 01:05 EST, the second time round
+      aCalls.length = 0;
+      r = await set({ time: "2026-11-01 01:40", title: "重复的那一小时" });
+      const refusedRepeat = !r.ok && /夏令时结束/.test(r.summary) && aCalls.length === 0;
+      Date.now = () => Date.parse("2026-11-01T05:05:00Z"); // 01:05 EDT, the first time round
+      r = await set({ time: "2026-11-01 01:40", title: "重复的那一小时" });
+      const addRepeat = aCalls.find((c) => c.cmd === "alarmAdd");
+      check("alarms: in the repeated hour, a time whose first instant passed is refused; one still ahead is set at that first instant",
+        refusedRepeat && r.ok && addRepeat?.due === "2026-11-01T01:40:00-04:00", r.summary);
+    } finally {
+      Date.now = realNow;
+    }
+  }
+  // Other zones, each in a child process: every quarter hour of each day the clocks change, against a brute-force scan.
+  {
+    const { execFileSync } = await import("node:child_process");
+    const probe = `
+      const m = await import(${JSON.stringify(pathToFileURL(join(ROOT, "lib/mac-alarms.js")).href)});
+      const fmt = new Intl.DateTimeFormat("en-US", { timeZone: process.env.TZ, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+      const wall = (ms) => { const p = Object.fromEntries(fmt.formatToParts(new Date(ms)).map((x) => [x.type, x.value])); return p.year + "-" + p.month + "-" + p.day + "T" + p.hour + ":" + p.minute; };
+      const pad = (n) => String(n).padStart(2, "0");
+      let bad = 0, checked = 0, repeated = 0, skipped = 0;
+      for (const [y, mo, d] of JSON.parse(process.env.DAYS)) {
+        for (let h = 0; h < 24; h += 1) for (let mi = 0; mi < 60; mi += 15) {
+          const text = y + "-" + pad(mo) + "-" + pad(d) + "T" + pad(h) + ":" + pad(mi);
+          const local = Date.UTC(y, mo - 1, d, h, mi);
+          const truth = [];
+          for (let ms = local - 15 * 3600e3; ms <= local + 15 * 3600e3; ms += 15 * 60e3) if (wall(ms) === text) truth.push(ms);
+          const got = m.parseAlarmTime(text);
+          checked += 1;
+          if (truth.length === 0) skipped += 1;
+          if (truth.length > 1) repeated += 1;
+          const ok = truth.length === 0
+            ? "error" in got
+            : !("error" in got) && got.at.getTime() === truth[0] && new Date(m.isoAt(got.at)).getTime() === truth[0]
+              && (truth.length > 1 ? got.repeated?.getTime() === truth[1] : got.repeated === undefined);
+          if (!ok) bad += 1;
+        }
+      }
+      console.log(JSON.stringify({ bad, checked, repeated, skipped }));
+    `;
+    const zones = {
+      "America/New_York": [[2026, 11, 1], [2027, 3, 14]],
+      "Europe/London": [[2026, 10, 25], [2027, 3, 28]],
+      "Australia/Lord_Howe": [[2027, 4, 4], [2026, 10, 4]],
+      "Pacific/Chatham": [[2027, 4, 4], [2026, 9, 27]],
+      "Asia/Shanghai": [[2026, 10, 25]],
+    };
+    for (const [zone, days] of Object.entries(zones)) {
+      let out;
+      try {
+        const text = execFileSync(process.execPath, ["--input-type=module", "-e", probe], {
+          env: { ...process.env, TZ: zone, DAYS: JSON.stringify(days) }, encoding: "utf-8",
+        });
+        out = JSON.parse(text.trim().split("\n").pop());
+      } catch (err) {
+        out = { bad: -1, error: String(err).slice(0, 200) };
+      }
+      check(`alarms: in ${zone}, wall-clock times on the days the clocks change read as the right instants (a repeated one as its first, a skipped one refused)`,
+        out.bad === 0 && out.checked > 0 && (zone === "Asia/Shanghai" || (out.repeated > 0 && out.skipped > 0)), JSON.stringify(out));
+    }
+  }
+  const now = new Date("2026-10-22T20:04:31Z");
+  const t = alarmsMod.testAlarmTime(now).getTime();
+  check("alarms: the test alarm is 2–3 minutes out, on a whole minute", t - now.getTime() >= 120_000 && t - now.getTime() < 180_000 && t % 60_000 === 0);
+
+  // The card's buttons.
+  const fakeRes = () => ({ status: 0, body: null, writeHead(code) { this.status = code; }, end(text) { this.body = JSON.parse(text); } });
+  const post = (headers) => ({ method: "POST", headers: { host: "127.0.0.1:3080", "content-type": "application/json", ...headers } });
+  const prepared = [];
+  let plan = { ask: ["reminders"], denied: [] };
+  const stubHelper = { prepare: async (force) => { prepared.push(force); }, invalidateStatus() {}, authorizePlan: async () => plan };
+  let on = true;
+  const cardDeps = { helper: stubHelper, alarms: service, enabled: () => on };
+  let res = fakeRes();
+  await alarmsMod.handleCardRoute("authorize", { method: "GET", headers: {} }, res, cardDeps);
+  check("card buttons: GET is refused", res.status === 405 && prepared.length === 0);
+  res = fakeRes();
+  await alarmsMod.handleCardRoute("authorize", post({ origin: "https://evil.example" }), res, cardDeps);
+  check("card buttons: another site's page is refused", res.status === 403 && prepared.length === 0);
+  for (const kind of ["authorize", "test"]) {
+    res = fakeRes();
+    aCalls.length = 0;
+    await alarmsMod.handleCardRoute(kind, post({ host: "evil.example:3080", origin: "http://evil.example:3080", "sec-fetch-site": "same-origin" }), res, cardDeps);
+    check(`card buttons: a rebound page (its own origin, on a domain pointed at this Mac) is refused — ${kind}`,
+      res.status === 403 && prepared.length === 0 && aCalls.length === 0);
+  }
+  res = fakeRes();
+  await alarmsMod.handleCardRoute("authorize", post({ "sec-fetch-site": "cross-site" }), res, cardDeps);
+  check("card buttons: a request the browser marks cross-site is refused", res.status === 403 && prepared.length === 0);
+  res = fakeRes();
+  await alarmsMod.handleCardRoute("authorize", { method: "POST", headers: { "content-type": "application/json" } }, res, cardDeps);
+  check("card buttons: a request without a Host is refused", res.status === 403 && prepared.length === 0);
+  if (process.platform === "darwin") {
+    on = false;
+    res = fakeRes();
+    await alarmsMod.handleCardRoute("authorize", post({}), res, cardDeps);
+    check("card buttons: nothing happens while 全天候秘书 is off", res.status === 409 && prepared.length === 0);
+    on = true;
+    res = fakeRes();
+    await alarmsMod.handleCardRoute("authorize", post({ host: "localhost:3080", origin: "http://localhost:3080" }), res, cardDeps);
+    check("card buttons: 一键授权 starts a forced round when there is something to ask, and answers with what it is doing",
+      res.status === 200 && res.body.started === true && prepared.length === 1 && prepared[0] === true && res.body.plan?.ask?.[0] === "reminders",
+      JSON.stringify(res.body));
+    plan = { ask: [], denied: ["reminders"] };
+    res = fakeRes();
+    await alarmsMod.handleCardRoute("authorize", post({}), res, cardDeps);
+    check("card buttons: …with nothing to ask (a refusal only System Settings can change), it starts nothing and says why",
+      res.status === 200 && res.body.started === false && prepared.length === 1 && res.body.plan?.denied?.[0] === "reminders");
+    plan = { build: "update", ask: ["calendar", "reminders"], denied: [] };
+    res = fakeRes();
+    await alarmsMod.handleCardRoute("authorize", post({}), res, cardDeps);
+    check("card buttons: …and an outdated helper is updated in that round", res.body.started === true && prepared.length === 2 && res.body.plan?.build === "update");
+    aCalls.length = 0;
+    res = fakeRes();
+    const res2 = fakeRes();
+    await Promise.all([alarmsMod.handleCardRoute("test", post({}), res, cardDeps), alarmsMod.handleCardRoute("test", post({}), res2, cardDeps)]);
+    check("card buttons: two presses of 测试闹钟 at once ring once (the second is told to wait)",
+      res2.status === 429 && aCalls.filter((c) => c.cmd === "alarmAdd").length === 1, JSON.stringify(res2.body));
+    const testAdd = aCalls.find((c) => c.cmd === "alarmAdd");
+    const testIn = testAdd === undefined ? NaN : new Date(testAdd.due).getTime() - Date.now();
+    check("card buttons: 测试闹钟 sets an urgent test alarm 2–3 minutes out, in the alarm list, saying what to check if it stays silent",
+      res.status === 200 && res.body.ok === true && res.body.list === aHelper.alarmList()?.name && /^\d{2}:\d{2}$/.test(res.body.at)
+        && testAdd?.title === "全天候秘书测试闹钟" && /我的位置/.test(testAdd?.notes ?? "") && /紧急/.test(testAdd?.notes ?? "")
+        && testIn > 60_000 && testIn < 185_000, JSON.stringify(res.body));
+    aCalls.length = 0;
+    res = fakeRes();
+    await alarmsMod.handleCardRoute("test", post({}), res, cardDeps);
+    check("card buttons: …at most one a minute (each one rings the phone)", res.status === 429 && aCalls.length === 0 && /秒后再试/.test(res.body.message));
+  }
+
+  // The helper's permission rounds (a fake helper: nothing launches).
+  {
+    const calls = [];
+    let st = { authorization: "notDetermined", reminders: "notDetermined", alarms: "supported", protocol: 3 };
+    let hold = null;
+    let slowStatus = null;
+    const runner = async (req) => {
+      calls.push(req);
+      if (req.cmd === "status") {
+        if (slowStatus === "wait") await new Promise((resolve) => { slowStatus = resolve; });
+        return { ok: true, ...st };
+      }
+      if (req.cmd === "request") {
+        if (req.reminders === true && hold === "wait") await new Promise((resolve) => { hold = resolve; });
+        if (req.calendar === true && st.authorization === "notDetermined") st = { ...st, authorization: "fullAccess" };
+        if (req.reminders === true && st.reminders === "notDetermined") st = { ...st, reminders: "fullAccess" };
+        return { ok: true, ...st };
+      }
+      if (req.cmd === "calendars") return { ok: true, calendars: [] };
+      return { ok: true };
+    };
+    const pRoot = join(tmpdir(), `clawbot-prepare-${process.pid}`);
+    rmSync(pRoot, { recursive: true, force: true });
+    const h = new calA.CalendarHelper(pRoot, join(ROOT, "native/macos-calendar/main.swift"), runner);
+    const shape = () => calls.map((c) => (c.cmd === "request" ? `request(${c.calendar === true ? "c" : ""}${c.reminders === true ? "r" : ""})` : c.cmd)).join();
+    await h.prepare();
+    check("permissions: a start-up round only looks — no prompt with nobody at the Mac", shape() === "status", shape());
+    let p = await h.authorizePlan();
+    check("permissions: 一键授权's plan names the two prompts it will put up", p.ask.join() === "calendar,reminders" && p.denied.length === 0 && p.build === undefined, JSON.stringify(p));
+    calls.length = 0;
+    await h.prepare(true);
+    check("permissions: a forced round puts up the calendar prompt, then the reminders one, one launch each", shape() === "status,request(c),request(r)", shape());
+    calls.length = 0;
+    await h.prepare(true);
+    check("permissions: with both decided, a forced round asks nothing", shape() === "status", shape());
+    p = await h.authorizePlan();
+    check("permissions: …and the plan says there is nothing to ask", p.ask.length === 0 && p.denied.length === 0, JSON.stringify(p));
+    st = { authorization: "fullAccess", reminders: "denied", alarms: "supported", protocol: 3 };
+    p = await h.authorizePlan();
+    check("permissions: a refused permission is in the plan as denied (only System Settings can change it), not as a prompt",
+      p.ask.length === 0 && p.denied.join() === "reminders", JSON.stringify(p));
+    st = { authorization: "fullAccess", reminders: "notDetermined", alarms: "unsupported", protocol: 3 };
+    p = await h.authorizePlan();
+    calls.length = 0;
+    await h.prepare(true);
+    check("permissions: where urgent reminders do not exist, no reminders prompt goes up",
+      p.ask.length === 0 && p.alarmsUnsupported === true && !calls.some((c) => c.cmd === "request"), `${JSON.stringify(p)} ${shape()}`);
+    // Per permission: while the reminders prompt is up, the calendar's commands go through; alarm ones wait.
+    st = { authorization: "fullAccess", reminders: "notDetermined", alarms: "supported", protocol: 3 };
+    hold = "wait";
+    calls.length = 0;
+    const round = h.prepare(true);
+    for (let i = 0; i < 100 && typeof hold !== "function"; i += 1) await sleep(5);
+    const during = await h.call({ cmd: "events", from: "2026-10-15", to: "2026-10-16" });
+    const alarmDuring = await h.call({ cmd: "alarms", listId: "x" });
+    h.invalidateStatus();
+    const statusDuring = await h.status();
+    if (typeof hold === "function") hold();
+    await round;
+    hold = null;
+    check("permissions: while only the Reminders prompt is up, the calendar works and alarms say they are waiting",
+      during.ok === true && calls.some((c) => c.cmd === "events") && !calls.some((c) => c.cmd === "alarms")
+        && alarmDuring.pending === true && alarmDuring.code === "reminders_not_authorized", JSON.stringify(alarmDuring));
+    check("permissions: …and the card hears that a prompt is up", statusDuring.prompting === true && statusDuring.authorization === "fullAccess", JSON.stringify(statusDuring));
+    // 一键授权 during a start-up look: its own forced round right after, not swallowed by the quick one.
+    st = { authorization: "notDetermined", reminders: "fullAccess", alarms: "supported", protocol: 3 };
+    slowStatus = "wait";
+    calls.length = 0;
+    const quick = h.prepare();
+    const forced = h.prepare(true);
+    for (let i = 0; i < 100 && typeof slowStatus !== "function"; i += 1) await sleep(5);
+    if (typeof slowStatus === "function") slowStatus();
+    await quick;
+    await forced;
+    slowStatus = null;
+    check("permissions: 一键授权 pressed during a start-up look still gets its own round, with the prompt", /request\(c\)/.test(shape()), shape());
+    st = { authorization: "fullAccess", reminders: "fullAccess", protocol: 2 };
+    h.invalidateStatus();
+    const old = await h.status();
+    check("status: a helper from before alarmComplete (protocol 2) is outdated — only then does the card ask for 一键授权",
+      old.outdated === true && old.protocol === 2, JSON.stringify(old));
+    st = { authorization: "fullAccess", reminders: "fullAccess", protocol: 3, alarms: "supported" };
+    h.invalidateStatus();
+    const cur = await h.status();
+    check("status: …a current one is not, and says whether alarms work on this macOS", cur.outdated === false && cur.alarms === "supported", JSON.stringify(cur));
+    rmSync(pRoot, { recursive: true, force: true });
+  }
+
+  // The helper side of it.
+  const calSrcA = readFileSync(join(ROOT, "src/mac-calendar.ts"), "utf-8");
+  const swiftSrc = readFileSync(join(ROOT, "native/macos-calendar/main.swift"), "utf-8");
+  check("helper: the app declares what it wants Reminders for (no usage string = no prompt at all)",
+    /NSRemindersFullAccessUsageDescription/.test(calSrcA) && /NSRemindersUsageDescription/.test(calSrcA));
+  check("helper: one prompt per launch (calendar / reminders flags), and no reminders prompt where urgent reminders do not exist",
+    /request\["calendar"\] as\? Bool \?\? true\) && authorization\(\) == "notDetermined"/.test(swiftSrc)
+      && /request\["reminders"\] as\? Bool \?\? true\) && remindersAuthorization\(\) == "notDetermined" && reminderKitCheck\(\)\.isEmpty/.test(swiftSrc));
+  check("helper: urgent is set through the change item's urgent context, after the due time",
+    /setDueDateComponentsWithAlarmsIfNeeded:[\s\S]{0,500}urgentAlarmContext[\s\S]{0,200}setIsUrgentStateEnabledForCurrentUser:/.test(swiftSrc));
+  check("helper: once an alarm is saved, a failed read-back is not a failure (the caller would set it again)",
+    /try RK\.save\(save\)[\s\S]{0,400}let saved = \(\(try\? remindersIn\(rem, list\)\) \?\? \[\]\)/.test(swiftSrc)
+      && /let made = \(\(try\? reminderLists\(rem\)\) \?\? \[\]\)/.test(swiftSrc));
+  check("helper: isUrgent has no fallback that crashes where the method is gone",
+    /func isUrgent\(_ reminder: NSObject\) -> Bool \{\s*\(try\? RK\.bool\(reminder, "isUrgentStateEnabledForCurrentUser"\)\) \?\? false\s*\}/.test(swiftSrc));
+  check("helper: status says whether alarms can work on this macOS", /"alarms": missing\.isEmpty \? "supported" : "unsupported"/.test(swiftSrc));
+  check("helper: a due time whose stored wall clock would read back as another instant is refused",
+    /instant\(parts as NSDateComponents\), abs\(back\.timeIntervalSince\(due\.date\)\) > 1/.test(swiftSrc) && /code: "ambiguous"/.test(swiftSrc));
+  check("helper: an absurd alert offset is dropped, not trapped", /func alertMinutes\(_ alarm: EKAlarm\) -> Int\?/.test(swiftSrc) && !/Int\(-\$0\.relativeOffset \/ 60\)/.test(swiftSrc));
+  check("helper: every ReminderKit call checks the method is there first (a missing one is an error, not a crash)",
+    /static func selector\(_ target: NSObject, _ name: String\) throws -> Selector \{\s*let sel = NSSelectorFromString\(name\)\s*guard answers\(target, sel\)/.test(swiftSrc));
+  check("helper: rkcheck covers what the alarm commands reach through forwarding",
+    ['("REMReminderStorage", "setIsUrgentStateEnabledForCurrentUser:")', '("REMReminderStorage", "notesAsString")', '("REMReminderStorage", "setCompleted:")',
+      '("REMReminderChangeItem", "setCompleted:")', '("REMList", "account")', '("REMAccountStorage", "objectID")'].every((s) => swiftSrc.includes(s)));
+  check("helper: the protocol numbers agree", new RegExp(`let helperProtocol = ${calA.HELPER_PROTOCOL}\\b`).test(swiftSrc));
+  {
+    // Every change to main.swift or the Info.plist template bumps helperProtocol: an installed helper is
+    // replaced only when its protocol is behind (the card asks, and 一键授权 rebuilds, only then).
+    const PIN = { protocol: 3, sha256: "5c6fd829b3c67c290378b30886de1e24d9bbda7bfb58025bc98046d2b6aaede6" };
+    const sha = createHash("sha256").update(readFileSync(join(ROOT, "native/macos-calendar/main.swift")))
+      .update(calA.infoPlist("0".repeat(32))).digest("hex");
+    check("helper: main.swift and the Info.plist template are the ones pinned to this protocol (changed either? bump helperProtocol and HELPER_PROTOCOL, then this pin)",
+      calA.HELPER_PROTOCOL === PIN.protocol && sha === PIN.sha256, `sha256 ${sha}`);
+  }
+  const bridgeSrcA = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("alarms: the bridge registers them with the calendar tools (one switch)",
+    /registerCalendarTools\(agentCtx, \{[\s\S]{0,400}registerAlarmTools\(agentCtx, \{/.test(bridgeSrcA));
+
+  // An outdated helper is kept (its permissions too) until the owner asks at the card, and a failed update keeps it.
+  {
+    const sRoot = join(tmpdir(), `clawbot-stale-${process.pid}`);
+    rmSync(sRoot, { recursive: true, force: true });
+    const exe = join(sRoot, "Clawbot-Calendar.app", "Contents", "MacOS", "Clawbot-Calendar");
+    mkdirSync(dirname(exe), { recursive: true });
+    writeFileSync(exe, "old build");
+    writeFileSync(join(sRoot, "source.sha256"), "an older source");
+    const broken = join(sRoot, "broken.swift");
+    writeFileSync(broken, "this is not swift {\n");
+    const stale = new calA.CalendarHelper(sRoot, broken);
+    let threw = false;
+    try { await stale.ensureBuilt(); } catch { threw = true; }
+    check("helper: a build from older source is not replaced behind the owner's back (that would void its permissions)",
+      !threw && stale.isStale() && readFileSync(exe, "utf-8") === "old build");
+    let failed = null;
+    try { await stale.ensureBuilt(true); } catch (err) { failed = err; }
+    check("helper: a forced update that fails to compile keeps the old helper (and its permissions) where it was",
+      failed !== null && readFileSync(exe, "utf-8") === "old build" && readFileSync(join(sRoot, "source.sha256"), "utf-8") === "an older source"
+        && !readdirSync(sRoot).some((n) => n.startsWith(".build-") || n.startsWith(".old-")), String(failed));
+    rmSync(sRoot, { recursive: true, force: true });
+  }
+  // Each Mac's build is its own app to macOS: a copy compiled elsewhere does not inherit the owner's grant.
+  {
+    const iRoot = join(tmpdir(), `clawbot-install-${process.pid}`);
+    rmSync(iRoot, { recursive: true, force: true });
+    const source = join(ROOT, "native/macos-calendar/main.swift");
+    const exe = join(iRoot, "Clawbot-Calendar.app", "Contents", "MacOS", "Clawbot-Calendar");
+    mkdirSync(dirname(exe), { recursive: true });
+    writeFileSync(exe, "built");
+    const id = "0123456789abcdef0123456789abcdef";
+    writeFileSync(join(iRoot, "install-id"), id);
+    writeFileSync(join(iRoot, "source.sha256"), createHash("sha256").update(readFileSync(source)).update(calA.infoPlist(id)).digest("hex"));
+    const h = new calA.CalendarHelper(iRoot, source);
+    const builtWithId = h.isBuilt();
+    writeFileSync(join(iRoot, "install-id"), "fedcba9876543210fedcba9876543210");
+    const withOther = h.isBuilt();
+    check("helper: each Mac's build carries its own installation id in its signed Info.plist",
+      builtWithId && !withOther && calA.infoPlist(id).includes(`<key>ClawbotInstallation</key><string>${id}</string>`)
+        && calA.infoPlist(id).includes("<string>io.github.alphainfix.wechat-clawbot.calendar</string>")
+        && calA.infoPlist(id, "x.test").includes("<string>x.test</string>"));
+    // A lost install-id is taken back from the built app: a new id would be a new app to macOS.
+    rmSync(join(iRoot, "install-id"));
+    writeFileSync(join(iRoot, "Clawbot-Calendar.app", "Contents", "Info.plist"), calA.infoPlist(id));
+    check("helper: a lost install-id is taken back from the built app, not minted anew",
+      h.isBuilt() && readFileSync(join(iRoot, "install-id"), "utf-8") === id);
+    rmSync(iRoot, { recursive: true, force: true });
+  }
+
+  // Two tool switches flipped in quick succession (off, then on): the listener must end up running WITH its
+  // bridge. Replays the real startMonitor/stopMonitor and the restart from lib/index.js with fake WeChat pieces.
+  {
+    const src = readFileSync(join(ROOT, "lib/index.js"), "utf-8");
+    const start = src.indexOf("let superseded = false;");
+    const end = src.indexOf("// Approval questions for WeChat sessions arrive in WeChat.");
+    const anchor = src.indexOf("await stopMonitor(`工具开关变了");
+    const iifeStart = anchor < 0 ? -1 : src.lastIndexOf("void (async () => {", anchor);
+    const iifeEnd = anchor < 0 ? -1 : src.indexOf("})().catch((err) => logger.warn(`重启微信监听失败", anchor);
+    if (start < 0 || end < 0 || iifeStart < 0 || iifeEnd < 0) {
+      check("restart: the listener code was found in lib/index.js", false);
+    } else {
+      const monitorCode = src.slice(start, end);
+      const iifeBody = src.slice(iifeStart + "void (async () => {".length, iifeEnd);
+      const harness = new Function("deps", `
+        let { ctx, config, sendText, codexPeer, pending, backlog, calendarHelper, alarms, uploadFileTo, fs,
+              pickAccount, WechatBridge, InboundRouter, runMonitor, logger, carryOverLegacyReminders } = deps;
+        let bridge = null, router = null, monitorTask = null, currentAccount = null, warmSession, abort = new AbortController();
+        ${monitorCode}
+        const restart = (hot) => {
+          const toolSwitches = hot.filter((key) => key === "macCalendar" || key === "codexPeer");
+          const superseded = false;
+          return (async () => {${iifeBody}})();
+        };
+        return { startMonitor, stopMonitor, restart, state: () => ({ bridge, router, monitorTask }) };
+      `);
+      for (const [slow, gap] of [[300, 100], [60, 10], [0, 0]]) {
+        const bridges = [];
+        class FakeBridge {
+          constructor() { this.disposed = false; bridges.push(this); }
+          async dispose() { await sleep(20); this.disposed = true; }
+          ensureAgent() { return new Promise(() => {}); }
+        }
+        const runMonitor = ({ signal }) => (async () => {
+          // Busy in onMessage (a media download, say) when the abort comes; then the loop sees it and ends.
+          await sleep(slow);
+          while (!signal.aborted) await sleep(5);
+        })();
+        const config = { macCalendar: true };
+        const hh = harness({
+          ctx: { inject() {} }, config, sendText: async () => {}, codexPeer: { close() {} },
+          pending: { abortAll() {}, close() {}, reopen() {} }, backlog: {}, calendarHelper: { prepare: async () => {} }, alarms: {},
+          uploadFileTo: async () => ({}), fs: {}, pickAccount: () => ({ accountId: "acct", configured: true, userId: "owner" }),
+          WechatBridge: FakeBridge, InboundRouter: class { handle() {} }, runMonitor,
+          logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {},
+        });
+        hh.startMonitor();
+        config.macCalendar = false;
+        const a = hh.restart(["macCalendar"]);
+        await sleep(gap);
+        config.macCalendar = true;
+        const b = hh.restart(["macCalendar"]);
+        await Promise.all([a, b]);
+        await sleep(gap + 30);
+        const s = hh.state();
+        const live = bridges.filter((x) => !x.disposed);
+        check(`restart: two switch flips in a row (${slow} ms busy, ${gap} ms apart) leave one running listener with its bridge`,
+          s.monitorTask !== null && s.router !== null && s.bridge !== null && live.length === 1 && live[0] === s.bridge,
+          `monitor ${s.monitorTask !== null} router ${s.router !== null} bridge ${s.bridge !== null} live ${live.length}`);
+        await hh.stopMonitor("test over");
+      }
+      // A stop whose turn waits on a WeChat answer (an approval): the answer is aborted first, so the stop ends.
+      {
+        let closed;
+        const answered = new Promise((resolve) => { closed = resolve; });
+        class WaitingBridge {
+          constructor() { this.disposed = false; }
+          async dispose() { await answered; this.disposed = true; }
+          ensureAgent() { return new Promise(() => {}); }
+        }
+        const hh = harness({
+          ctx: { inject() {} }, config: { macCalendar: true }, sendText: async () => {}, codexPeer: { close() {} },
+          pending: { abortAll() {}, close() { closed(); }, reopen() {} }, backlog: {}, calendarHelper: { prepare: async () => {} }, alarms: {},
+          uploadFileTo: async () => ({}), fs: {}, pickAccount: () => ({ accountId: "acct", configured: true, userId: "owner" }),
+          WechatBridge: WaitingBridge, InboundRouter: class { handle() {} },
+          runMonitor: ({ signal }) => (async () => { while (!signal.aborted) await sleep(5); })(),
+          logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {},
+        });
+        hh.startMonitor();
+        const ended = await Promise.race([hh.stopMonitor("switch").then(() => true), sleep(2000).then(() => false)]);
+        check("restart: a stop whose turn waits on a WeChat answer still ends (the answer is aborted first)", ended && hh.state().bridge === null);
+      }
+    }
+  }
+  rmSync(aRoot, { recursive: true, force: true });
+  {
+    const { PendingRegistry } = await import(join(ROOT, "lib/pending.js"));
+    const reg = new PendingRegistry();
+    const got = [];
+    reg.push({ tag: "approval", sender: "u1", resolve: (r) => got.push(["a", r]) });
+    reg.close();
+    reg.push({ tag: "question", sender: "u1", resolve: (r) => got.push(["b", r]) });
+    const whileClosed = reg.size;
+    reg.reopen();
+    reg.push({ tag: "question", sender: "u1", resolve: (r) => got.push(["c", r]) });
+    check("pending: closing for a stop aborts what waits and takes nothing new until reopened",
+      JSON.stringify(got) === JSON.stringify([["a", null], ["b", null]]) && whileClosed === 0 && reg.size === 1, JSON.stringify(got));
+  }
+  setLogLevel("info");
+}
+
 // ------------------------------------------------------------- 日程秘书(2026-10-14)
 // 规则写进 memory.md(和人设一样属于机主,不进插件提示词);只有翻开关时增删,
 // 关掉时留一份副本,再打开原样放回,机主自己改过的措辞不丢。
@@ -2453,7 +3306,7 @@ function check(name, ok, detail) {
     check("secretary: on a fresh install the memory file is created with the rules at the end",
       sec.addSecretaryRules() === "added" && /## 基本档案/.test(read()) && read().endsWith(`${sec.SECRETARY_RULES}\n`));
 
-    const before = "# 用户记忆（长期）\n\n## 基本档案\n- [2026-10-01] 住在波士顿\n\n## 偏好与习惯\n- [2026-10-02] 回复要短\n";
+    const before = "# 用户记忆（长期）\n\n## 基本档案\n- [2026-10-01] 喜欢爬山\n\n## 偏好与习惯\n- [2026-10-02] 回复要短\n";
     writeFileSync(memPath, before);
     check("secretary: switching on appends the default rules after everything else", sec.addSecretaryRules() === "added"
       && read() === `${before.trimEnd()}\n\n${sec.SECRETARY_RULES}\n` && sec.hasSecretaryRules());
@@ -2461,6 +3314,9 @@ function check(name, ok, detail) {
     check("secretary: switching on again changes nothing", sec.addSecretaryRules() === "present" && read() === once);
     check("secretary: the rules keep reminders out of the calendar",
       /提醒我/.test(sec.SECRETARY_RULES) && /只设微信提醒，不进日历/.test(sec.SECRETARY_RULES));
+    check("secretary: the section is called 全天候秘书 now; its rules say when to set an alarm, and that daily alarm planning is a 「任务」 the owner sets up",
+      sec.SECRETARY_HEADING === "## 全天候秘书" && sec.SECRETARY_RULES.startsWith("## 全天候秘书\n")
+      && /alarm_set/.test(sec.SECRETARY_RULES) && /「任务」提醒/.test(sec.SECRETARY_RULES) && !/每晚看第二天的日历定好，再说一声/.test(sec.SECRETARY_RULES));
 
     // Auto-memory keeps writing under its own headings; the section stays whole.
     mem.appendMemoryEntry("偏好与习惯", "喜欢早上写东西");
@@ -2471,10 +3327,10 @@ function check(name, ok, detail) {
     check("memory: appending never leaves blank lines piling up at the end of the file", read().endsWith(`${sec.SECRETARY_RULES}\n`));
 
     // The owner rewrites a rule; a section auto-memory created later sits after it.
-    writeFileSync(memPath, read().replace("60–90 分钟一块", "45 分钟一块") + "\n## 重要事实\n- [2026-10-03] 在写论文\n");
+    writeFileSync(memPath, read().replace("60–90 分钟一块", "45 分钟一块") + "\n## 重要事实\n- [2026-10-03] 在写报告\n");
     check("secretary: switching off moves the section out and keeps everything else",
-      sec.removeSecretaryRules() === "removed" && !/日程秘书|45 分钟一块/.test(read())
-      && /喜欢早上写东西/.test(read()) && /## 重要事实\n- \[2026-10-03\] 在写论文/.test(read()) && !/\n{3,}/.test(read()));
+      sec.removeSecretaryRules() === "removed" && !/全天候秘书|日程秘书|45 分钟一块/.test(read())
+      && /喜欢早上写东西/.test(read()) && /## 重要事实\n- \[2026-10-03\] 在写报告/.test(read()) && !/\n{3,}/.test(read()));
     check("secretary: …into a private copy, with the owner's wording",
       existsSync(copyPath) && /45 分钟一块/.test(readFileSync(copyPath, "utf-8")) && (statSync(copyPath).mode & 0o777) === 0o600);
     check("secretary: switching off again changes nothing", sec.removeSecretaryRules() === "absent" && !sec.hasSecretaryRules());
@@ -2487,15 +3343,59 @@ function check(name, ok, detail) {
     check("secretary: the 500-line memory cap keeps the rules", sec.hasSecretaryRules() && /45 分钟一块/.test(read()));
 
     // The owner retitles the section: still the same one (no second copy at the next start).
-    writeFileSync(memPath, "## 基本档案\n- 住在波士顿\n\n## 日程秘书（我的版本）\n- 早上不排会\n");
+    writeFileSync(memPath, "## 基本档案\n- 喜欢爬山\n\n## 全天候秘书（我的版本）\n- 早上不排会\n");
     check("secretary: a retitled section is still recognised (no second copy)",
-      sec.hasSecretaryRules() && sec.addSecretaryRules() === "present" && (read().match(/日程秘书/g) ?? []).length === 1);
+      sec.hasSecretaryRules() && sec.addSecretaryRules() === "present" && (read().match(/全天候秘书/g) ?? []).length === 1);
+    // A memory file from before the merge (the section was called 日程秘书): the same section, not a missing one.
+    writeFileSync(memPath, "## 基本档案\n- 喜欢爬山\n\n## 日程秘书（我的版本）\n- 早上不排会\n");
+    check("secretary: the section's old name (日程秘书) still counts: no second copy under the new name",
+      sec.hasSecretaryRules() && sec.addSecretaryRules() === "present" && !/全天候秘书/.test(read()) && (read().match(/日程秘书/g) ?? []).length === 1);
     check("secretary: …and switching off moves the retitled one out",
-      sec.removeSecretaryRules() === "removed" && !/日程秘书|早上不排会/.test(read()) && /住在波士顿/.test(read())
+      sec.removeSecretaryRules() === "removed" && !/日程秘书|早上不排会/.test(read()) && /喜欢爬山/.test(read())
       && /早上不排会/.test(readFileSync(copyPath, "utf-8")));
+    // The owner's own notes under a heading that only starts with the name are not the rules.
+    writeFileSync(memPath, "## 基本档案\n- 喜欢爬山\n\n## 日程秘书工作日志\n- 周一交了报告\n");
+    rmSync(copyPath, { force: true });
+    check("secretary: a heading that only starts with the name (「## 日程秘书工作日志」) is the owner's, not the rules",
+      !sec.hasSecretaryRules() && sec.addSecretaryRules() === "added" && /## 日程秘书工作日志\n- 周一交了报告/.test(read())
+      && read().endsWith(`${sec.SECRETARY_RULES}\n`));
+    check("secretary: …and switching off leaves it there", sec.removeSecretaryRules() === "removed" && /周一交了报告/.test(read()) && !/全天候秘书/.test(read()));
+    writeFileSync(memPath, "## 基本档案\n- 住址保密\n\n## 全天候秘书「我的版本」\n- 早上不排会\n");
+    check("secretary: a title with brackets after the name (「我的版本」) is still the section",
+      sec.hasSecretaryRules() && sec.addSecretaryRules() === "present" && (read().match(/全天候秘书/g) ?? []).length === 1);
+    for (const title of ["## 日程秘书规则", "## 全天候秘书v2"]) {
+      writeFileSync(memPath, `## 基本档案\n- 住址保密\n\n${title}\n- 早上不排会\n`);
+      check(`secretary: a retitle that runs on from the name (「${title.slice(3)}」) is still the section, not a reason for a second copy`,
+        sec.hasSecretaryRules() && sec.addSecretaryRules() === "present" && !read().includes(sec.SECRETARY_RULES));
+    }
+    for (const title of ["## 全天候秘书笔记", "## 日程秘书记录", "## 全天候秘书日志"]) {
+      writeFileSync(memPath, `## 基本档案\n- 住址保密\n\n${title}\n- 周一交了报告\n`);
+      check(`secretary: notes named after it (「${title.slice(3)}」) are the owner's, not the rules`, !sec.hasSecretaryRules());
+    }
+    writeFileSync(memPath, `## 基本档案\n- 住址保密\n\n${sec.EARLIER_RULES[1]}\n`);
+    check("secretary: switching on while an untouched earlier default is there brings it up to date",
+      sec.addSecretaryRules() === "present" && read().endsWith(`${sec.SECRETARY_RULES}\n`), read());
+    // Both names in one file: switching off takes both out (and keeps both), not just the first.
+    writeFileSync(memPath, "## 基本档案\n- 喜欢爬山\n\n## 日程秘书\n- 旧\n\n## 偏好与习惯\n- 短\n\n## 全天候秘书\n- 新\n");
+    check("secretary: with the old and the new section both there, switching off takes both out and keeps both",
+      sec.removeSecretaryRules() === "removed" && !sec.hasSecretaryRules() && /## 偏好与习惯\n- 短/.test(read())
+      && /- 旧/.test(readFileSync(copyPath, "utf-8")) && /- 新/.test(readFileSync(copyPath, "utf-8")));
+    // Untouched earlier defaults are brought up to date; an edited one is the owner's.
+    for (const [i, earlier] of sec.EARLIER_RULES.entries()) {
+      writeFileSync(memPath, `## 基本档案\n- 喜欢爬山\n\n${earlier}\n\n## 重要事实\n- 在写报告\n`);
+      check(`secretary: an untouched earlier default (version ${i + 1}) is brought up to the current rules, the rest left as it was`,
+        sec.upgradeSecretaryRules() === "upgraded" && read() === `## 基本档案\n- 喜欢爬山\n\n${sec.SECRETARY_RULES}\n\n## 重要事实\n- 在写报告\n`, read());
+    }
+    writeFileSync(memPath, `## 基本档案\n- 喜欢爬山\n\n${sec.EARLIER_RULES[1].replace("60–90 分钟一块", "45 分钟一块")}\n`);
+    const edited = read();
+    check("secretary: …an edited one is left exactly as it is", sec.upgradeSecretaryRules() === "kept" && read() === edited);
+    writeFileSync(memPath, "## 基本档案\n- 喜欢爬山\n");
+    writeFileSync(copyPath, `${sec.EARLIER_RULES[0]}\n`, { mode: 0o600 });
+    check("secretary: a saved copy that is an untouched earlier default comes back as the current rules",
+      sec.addSecretaryRules() === "added" && read().endsWith(`${sec.SECRETARY_RULES}\n`) && !/日程秘书/.test(read()), read());
 
     // A memory file that cannot be read is never written over (it would lose everything in it).
-    writeFileSync(memPath, "## 基本档案\n- 住在波士顿\n");
+    writeFileSync(memPath, "## 基本档案\n- 喜欢爬山\n");
     chmodSync(memPath, 0o000);
     let unreadable = false;
     try { readFileSync(memPath, "utf-8"); } catch { unreadable = true; }
@@ -2505,7 +3405,7 @@ function check(name, ok, detail) {
       const appended = mem.appendMemoryEntry("基本档案", "不该写进去的一条");
       chmodSync(memPath, 0o644);
       check("secretary + memory: an unreadable memory.md is left alone, not replaced by a fresh file",
-        threw && appended === false && read() === "## 基本档案\n- 住在波士顿\n" && !sec.hasSecretaryRules());
+        threw && appended === false && read() === "## 基本档案\n- 喜欢爬山\n" && !sec.hasSecretaryRules());
     } else {
       chmodSync(memPath, 0o644);
       check("secretary + memory: an unreadable memory.md is left alone (skipped: running as root)", true);
@@ -2532,6 +3432,16 @@ function check(name, ok, detail) {
     r = fakeRes();
     await sec.handleMemoryOpen(post({ "content-type": "application/json" }), r, async () => { throw new Error("no app"); });
     check("memory open: a failure comes back as a message for the card", r.status === 500 && /打不开：no app/.test(r.body.message));
+    r = fakeRes();
+    await sec.handleMemoryOpen(post({ "content-type": "application/json", host: "evil.example:3080", origin: "http://evil.example:3080" }), r, opener);
+    check("memory open: a rebound page (its own origin, on a domain pointed at this Mac) is refused", r.status === 403 && opened.length === 1);
+    const allowed = (headers) => sec.cardRequestAllowed({ headers: { "content-type": "application/json", ...headers } });
+    check("card requests: this Mac by any loopback name is the card; any other Host is not (DNS rebinding), whatever the Origin says",
+      allowed({ host: "127.0.0.1:3080", origin: "http://127.0.0.1:3080" }) && allowed({ host: "localhost:3080" })
+      && allowed({ host: "[::1]:3080", origin: "http://[::1]:3080" }) && allowed({ host: "127.0.0.2:3080" })
+      && !allowed({ host: "evil.example:3080", origin: "http://evil.example:3080" }) && !allowed({ host: "127.0.0.1.nip.io:3080" })
+      && !allowed({}) && !allowed({ host: "127.0.0.1:3080", "sec-fetch-site": "cross-site" })
+      && !allowed({ host: "127.0.0.1:3080", origin: "http://localhost:3080" }));
   } finally {
     if (prevState === undefined) delete process.env.CLAWBOT_STATE_DIR; else process.env.CLAWBOT_STATE_DIR = prevState;
     rmSync(state, { recursive: true, force: true });
@@ -2547,18 +3457,236 @@ function check(name, ok, detail) {
   const indexSrc = readFileSync(join(ROOT, "src/index.ts"), "utf-8");
   check("secretary: it needs the Mac calendar (and macOS)",
     /config\.secretary === true && config\.macCalendar === true && process\.platform === "darwin"/.test(indexSrc));
-  check("secretary: memory.md changes only when the switch (or the calendar) flips; a start-up only fills in a missing section",
+  check("secretary: memory.md changes only when the switch (or the calendar) flips; a start-up only fills in a missing section or upgrades an untouched one",
     /secretaryActive\(\) !== secretaryWas && !superseded/.test(indexSrc)
-    && /secretaryActive\(\) && !hasSecretaryRules\(\)/.test(indexSrc)
+    && /if \(secretaryActive\(\)\) \{\s*try \{\s*if \(!hasSecretaryRules\(\)\) addSecretaryRules\(\);\s*else upgradeSecretaryRules\(\);/.test(indexSrc)
     && (indexSrc.match(/removeSecretaryRules\(\)/g) ?? []).length === 1);
   check("secretary: the rules are not in the plugin's own prompt (they belong to the owner, in memory.md)",
-    !/日程秘书|建议主线/.test(readFileSync(join(ROOT, "src/prompt.ts"), "utf-8")));
+    !/日程秘书|全天候秘书|建议主线/.test(readFileSync(join(ROOT, "src/prompt.ts"), "utf-8")));
   const clientSrc = readFileSync(join(ROOT, "src/client.js"), "utf-8");
-  check("secretary: the card shows it off and locked while the calendar is off",
-    /on: v\.secretary === true && v\.macCalendar === true/.test(clientSrc)
-    && /disabled: disabled \|\| v\.macCalendar !== true/.test(clientSrc));
-  check("secretary: the status route says whether the rules are in memory",
-    /secretary: hasSecretaryRules\(\)/.test(indexSrc) && /others, secretary, helper/.test(readFileSync(join(ROOT, "src/mac-calendar.ts"), "utf-8")));
+  check("全天候秘书: one switch on the card sets the calendar and the rules together",
+    /label: "全天候秘书",[\s\S]{0,1200}set\("macCalendar", next\);\s*set\("secretary", next\);/.test(clientSrc)
+    && !/label: "日程秘书"/.test(clientSrc) && !/label: "Mac 日历"/.test(clientSrc));
+  check("全天候秘书: the card has 一键授权 and 测试闹钟, posting JSON to their routes",
+    /fetch\(url, \{ method: "POST", headers: \{ "content-type": "application\/json" \}/.test(clientSrc)
+    && /press\(AUTHORIZE_URL/.test(clientSrc) && /press\(TEST_ALARM_URL/.test(clientSrc)
+    && /registerCardRoutes\(ctx, \{ helper: calendarHelper, alarms, enabled: \(\) => config\.macCalendar === true \}\)/.test(indexSrc));
+  check("全天候秘书: the card tells the owner about the iPhone's own urgent-alarm permission, and that it rings on the Find My device",
+    /iPhone 上还要先在「提醒事项」里\"\s*\+\s*"手动把一条提醒设成「紧急」一次/.test(clientSrc) && /「查找」里作为“我的位置”的那台设备/.test(clientSrc));
+  check("secretary: the status route says whether the rules are in memory, and whether their switch is on",
+    /secretary: hasSecretaryRules\(\)/.test(indexSrc) && /secretaryOn: config\.secretary === true/.test(indexSrc)
+    && /others, secretary, secretaryOn, helper/.test(readFileSync(join(ROOT, "src/mac-calendar.ts"), "utf-8")));
+  const promptSrcS = readFileSync(join(ROOT, "src/prompt.ts"), "utf-8");
+  {
+    const sec2 = await import(join(ROOT, "lib/secretary.js"));
+    check("card routes: the status reads (calendar and MCP) answer this machine's page only (DNS rebinding)",
+      /if \(!localRequest\(req\)\)/.test(readFileSync(join(ROOT, "src/mac-calendar.ts"), "utf-8"))
+      && /if \(!localRequest\(req\)\)/.test(readFileSync(join(ROOT, "src/mcp-route.ts"), "utf-8"))
+      && sec2.localRequest({ headers: { host: "127.0.0.1:3080" } }) && sec2.localRequest({ headers: { host: "localhost:3080" } })
+      && !sec2.localRequest({ headers: { host: "evil.example:3080" } }) && !sec2.localRequest({ headers: { host: "127.0.0.1:3080", "sec-fetch-site": "cross-site" } }));
+  }
+  check("restart: a helper that fails to prepare after switching on is logged as that, not as a failed listener restart",
+    /void calendarHelper\.prepare\(true\)\.catch\(/.test(indexSrc));
+  {
+    const { occurrenceAt } = await import(join(ROOT, "lib/backlog.js"));
+    const batch = "[SCHEDULE REMINDER BATCH]\nThis is a scheduled message from the user\nreminders_json: "
+      + JSON.stringify([{ schedule_id: "a", occurrence_at: "2026-10-23T03:00:00.000Z", reminder_prompt: "任务:x" },
+        { schedule_id: "b", occurrence_at: "2026-10-23T01:00:00.000Z", reminder_prompt: "y" }]);
+    check("backlog: a recurring reminder (a batch) is stamped with when it was due, like a one-off",
+      occurrenceAt(batch) === "2026-10-23T03:00:00.000Z" && occurrenceAt("occurrence_at: 2026-10-22T13:00:00Z") === "2026-10-22T13:00:00.000Z"
+        && occurrenceAt("nothing here") === undefined);
+  }
+  check("rule G5: a 「任务」 that could not be done is always reported, needs no acknowledgment, and counts its days from when it was due",
+    /任务没能做成/.test(promptSrcS) && /任务回合不用先发确认/.test(promptSrcS) && /跨了日期的,后面紧跟一条「\[定时消息晚到\]」写明原定哪天,日子照它算/.test(promptSrcS));
+  check("restart: switching on prepares the helper only in the live instance; a login during a stop starts the listener once it is done",
+    /process\.platform === "darwin" && !superseded\) \{/.test(indexSrc) && /void stopping\.then\(\(\) => \{ if \(!monitorTask && !superseded\) startMonitor\(\); \}\);/.test(indexSrc)
+      && /pending\.close\(\);[\s\S]{0,400}await bridge\?\.dispose\(\);\s*\} finally \{/.test(indexSrc));
+  check("rule G5: a reminder whose content starts with 「任务」 is done when it fires, not forwarded — and that is how such tasks are made",
+    /例外:提醒内容以「任务:」开头的\(冒号全角半角都算\)/.test(promptSrcS) && /内容以「任务:」开头\(只是提醒一声的,内容不要这样开头\)/.test(promptSrcS)
+      && /一条都不发/.test(promptSrcS));
+  // The card's words, from the real lib/client.js (grant, assistantHint, authorizeText).
+  {
+    const lib = readFileSync(join(ROOT, "lib/client.js"), "utf-8");
+    const from = lib.indexOf("    /** One Mac permission as a short phrase. */");
+    const to = lib.indexOf("    function Switch(props) {");
+    const card = from < 0 || to < from ? null : new Function(`${lib.slice(from, to)}\nreturn { assistantHint, authorizeText };`)();
+    if (card === null) {
+      check("card words: found in lib/client.js", false);
+    } else {
+      const base = { ok: true, mac: true, enabled: true, others: 0, helper: "Clawbot-Calendar", built: true, secretary: true, secretaryOn: true,
+        authorization: "fullAccess", reminders: "fullAccess", protocol: 3, alarms: "supported", calendars: 5, dedicated: { name: "规划", account: "iCloud" } };
+      const hint = (over) => card.assistantHint({ ...base, ...over }, "规划", true);
+      check("card words: an outdated helper asks for 一键授权 at the Mac, and warns the calendar pauses until Allow is clicked",
+        /小程序要更新才能用闹钟：到 Mac 前点「一键授权」/.test(hint({ protocol: 1, reminders: "outdated", outdated: true, stale: true }))
+        && /小程序有更新：到 Mac 前点「一键授权」/.test(hint({ protocol: 2, outdated: true, stale: true }))
+        && /日历会停到点了「允许」为止/.test(hint({ protocol: 2, outdated: true, stale: true })));
+      check("card words: a newer source with the same protocol asks for nothing (no rebuild that would void two permissions)",
+        !/一键授权/.test(hint({ stale: true, outdated: false })) && /点「测试闹钟」试响一次/.test(hint({ stale: true, outdated: false })));
+      check("card words: a refusal points at System Settings, not at 一键授权 (it cannot undo one)",
+        /系统设置 → 隐私与安全性 → 提醒事项/.test(hint({ reminders: "denied" })) && !/一键授权/.test(hint({ reminders: "denied" })));
+      check("card words: an undecided permission points at 一键授权, at the Mac", /到 Mac 前点「一键授权」补上/.test(hint({ reminders: "notDetermined" })));
+      check("card words: the rules switched off in the config are said as such, not as a missing section",
+        /排日程的规则没开/.test(hint({ secretaryOn: false, secretary: false })) && !/没找到/.test(hint({ secretaryOn: false, secretary: false }))
+        && /没找到「## 全天候秘书」一节/.test(hint({ secretary: false })));
+      check("card words: where urgent reminders do not exist it says so, and asks for nothing more",
+        /没有紧急提醒（要 macOS 26 或更新）/.test(hint({ alarms: "unsupported", reminders: "notDetermined" }))
+        && !/一键授权/.test(hint({ alarms: "unsupported", reminders: "notDetermined" })));
+      check("card words: the first compile, a prompt on screen, and a failed update each say what is going on",
+        /第一次要编译/.test(hint({ preparing: true, built: false })) && /等你在 Mac 上点「允许」/.test(hint({ prompting: true, preparing: true }))
+        && /小程序更新没成功（旧版照常能用）：编译失败/.test(hint({ stale: true, outdated: true, updateError: "编译失败" })));
+      check("card words: while a prompt is up, it says which one",
+        /屏幕上有「Clawbot-Calendar」的「提醒事项」授权窗口/.test(hint({ prompting: true, waitingFor: ["reminders"] })));
+      check("card words: switched on with no calendar name, it asks for the name first",
+        /先在上面填专用日历的名字/.test(card.assistantHint({ ...base }, "", true)));
+      check("card words: a helper that does not answer is not promised a prompt",
+        /过一会儿再点一次/.test(card.authorizeText({ plan: { ask: [], denied: [], error: "timeout" } }))
+        && !/授权窗口/.test(card.authorizeText({ plan: { ask: [], denied: [], error: "timeout" } })));
+      check("card words: switching off and on to restore the rules says to do it at the Mac when it would also update the helper",
+        /在 Mac 前做/.test(hint({ secretaryOn: false, secretary: false, outdated: true, protocol: 2, stale: true }))
+        && !/在 Mac 前做/.test(hint({ secretaryOn: false, secretary: false })));
+      check("card words: the alarm list is shown by the name Reminders has, and survives a rename",
+        /闹钟清单「旧名 闹钟」在「iCloud」（改了名字也继续用它）/.test(hint({ alarmList: { name: "旧名 闹钟", account: "iCloud" } })));
+      check("card words: 一键授权 says what it is doing — the prompts, a refusal, an update, or nothing to do",
+        /「日历」、「提醒事项」的授权窗口/.test(card.authorizeText({ plan: { ask: ["calendar", "reminders"], denied: [] } }))
+        && /只能在 系统设置/.test(card.authorizeText({ plan: { ask: [], denied: ["reminders"] } }))
+        && /先更新小程序/.test(card.authorizeText({ plan: { build: "update", ask: ["calendar", "reminders"], denied: [] } }))
+        && card.authorizeText({ plan: { ask: [], denied: [] } }) === "都已经授权了，不用再点");
+    }
+  }
+}
+
+// ------------------------------------------------------------- 插件图标(2026-10-22)
+// DSH 的插件页读 package.json 的 "icon"(包里的相对路径;SVG/PNG/JPEG/WebP,不超过 256 KiB),
+// 当作 <img> 显示:详情页 36 px、列表 30 px,背景透明。不合规时宿主只记一条诊断、不显示图标。
+{
+  const pkgI = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
+  const icon = typeof pkgI.icon === "string" ? pkgI.icon : "";
+  const file = join(ROOT, icon);
+  const inside = icon !== "" && !icon.startsWith("/") && !/^[A-Za-z][A-Za-z\d+.-]*:/.test(icon) && !file.slice(ROOT.length).includes("..");
+  check("icon: package.json names a relative image inside the package, in a format DSH takes",
+    inside && /\.(svg|png|jpe?g|webp)$/i.test(icon) && existsSync(file) && statSync(file).isFile(), icon);
+  check("icon: it is under DSH's 256 KiB limit", existsSync(file) && statSync(file).size <= 256 * 1024);
+  check("icon: it ships in the package, and DSH can read package.json through the exports",
+    Array.isArray(pkgI.files) && pkgI.files.includes(icon.split("/")[0]) && pkgI.exports?.["./package.json"] === "./package.json");
+  const svg = existsSync(file) ? readFileSync(file, "utf-8") : "";
+  check("icon: a standalone SVG (it is shown as an image: it needs its namespace, and has no script)",
+    !/\.svg$/i.test(icon) || (/xmlns="http:\/\/www\.w3\.org\/2000\/svg"/.test(svg) && /viewBox="0 0 36 36"/.test(svg) && !/<script|on[a-z]+=/i.test(svg)));
+}
+
+// ------------------------------------------------------- 审查第三轮(2026-10-22)
+{
+  // A macOS without urgent reminders: the alarm tools say so, instead of sending the owner to 一键授权.
+  const calU = await import(join(ROOT, "lib/mac-calendar.js"));
+  const alarmsU = await import(join(ROOT, "lib/mac-alarms.js"));
+  for (const support of ["unsupported", "supported"]) {
+    const uRoot = join(tmpdir(), `clawbot-unsupported-${support}-${process.pid}`);
+    rmSync(uRoot, { recursive: true, force: true });
+    const calls = [];
+    const runner = async (req) => {
+      calls.push(req.cmd);
+      if (req.cmd === "status") return { ok: true, authorization: "fullAccess", reminders: "notDetermined", protocol: calU.HELPER_PROTOCOL, alarms: support };
+      if (req.cmd === "calendars") return { ok: true, calendars: [] };
+      return { ok: false, code: "reminders_not_authorized", error: "notDetermined" };
+    };
+    const h = new calU.CalendarHelper(uRoot, join(ROOT, "native/macos-calendar/main.swift"), runner);
+    const service = new alarmsU.AlarmService(h, () => "规划");
+    const r = await service.ensureList();
+    if (support === "unsupported") {
+      check("alarms: on a macOS without urgent reminders the tools say alarms cannot work here (一键授权 would never ask)",
+        !r.ok && /没有紧急提醒/.test(r.message) && !/一键授权/.test(r.message) && !/（）/.test(r.message), r.message);
+    } else {
+      check("alarms: …where alarms work, a missing permission still sends the owner to 一键授权",
+        !r.ok && /一键授权/.test(r.message), r.message);
+    }
+    rmSync(uRoot, { recursive: true, force: true });
+  }
+
+  // A status look never builds the helper: the first build takes a minute and the card would wait.
+  {
+    const nRoot = join(tmpdir(), `clawbot-noapp-${process.pid}`);
+    rmSync(nRoot, { recursive: true, force: true });
+    const h = new calU.CalendarHelper(nRoot, join(ROOT, "native/macos-calendar/main.swift"));
+    const t0 = Date.now();
+    const st = await h.status();
+    check("helper: a status look with no app answers at once and builds nothing",
+      st.built === false && st.error === undefined && Date.now() - t0 < 2000 && !h.hasApp
+        && !(existsSync(nRoot) && readdirSync(nRoot).some((n) => n.startsWith(".build-") || n.endsWith(".app"))), JSON.stringify(st));
+    const plan = await h.authorizePlan();
+    const darwin = Number((await import("node:os")).release().split(".")[0]);
+    check("helper: the first-build plan asks for Reminders only where macOS has urgent reminders (26+, Darwin 25+)",
+      plan.build === "first" && plan.ask[0] === "calendar" && plan.ask.includes("reminders") === (darwin >= 25)
+        && (plan.alarmsUnsupported === true) === (darwin < 25), JSON.stringify(plan));
+    rmSync(nRoot, { recursive: true, force: true });
+  }
+
+  // 「任务」 by its marker; a scheduled message made only of them runs without 「正在输入」.
+  const bl = await import(join(ROOT, "lib/backlog.js"));
+  const single = (prompt, at = "2026-10-23T03:00:00.000Z") => ["[SCHEDULE REMINDER]", "This is a scheduled message from the user",
+    'schedule_id_json: "s1"', `occurrence_at: ${at}`, `reminder_prompt_json: ${JSON.stringify(prompt)}`].join("\n");
+  const batchOf = (items) => ["[SCHEDULE REMINDER BATCH]", "This is a scheduled message from the user",
+    `reminders_json: ${JSON.stringify(items.map(([p, at], i) => ({ schedule_id: `s${i}`, occurrence_at: at, reminder_prompt: p })))}`].join("\n");
+  check("schedule: a 「任务」 is told by its marker, half- or full-width colon (「任务清单…」 is a plain reminder)",
+    bl.isTaskPrompt("任务:看明天的行程") && bl.isTaskPrompt(" 任务：排闹钟") && !bl.isTaskPrompt("任务清单记得交") && !bl.isTaskPrompt("提醒:任务:x"));
+  check("schedule: a message made only of 「任务」 runs quietly; one with a plain reminder does not",
+    bl.quietTask(single("任务：看第二天的行程，排闹钟")) && !bl.quietTask(single("提醒：交报告"))
+      && bl.quietTask(batchOf([["任务:a", "2026-10-23T03:00:00.000Z"], ["任务：b", "2026-10-23T03:00:00.000Z"]]))
+      && !bl.quietTask(batchOf([["任务:a", "2026-10-23T03:00:00.000Z"], ["喝水", "2026-10-23T03:00:00.000Z"]]))
+      && !bl.quietTask("没有提醒的消息") && bl.reminderPrompts(single("a \"引号\"\n第二行"))[0] === "a \"引号\"\n第二行");
+  const bridgeSrc4 = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("schedule: a quiet 「任务」 turn puts up no 「正在输入」 (and other reminder turns still do)",
+    /if \(!quietTask\(messageText\(event\.data\)\)\) this\.typing\.start\(owner\);/.test(bridgeSrc4));
+
+  // A scheduled message delivered on a later day than it was due: the bot is told which day it meant.
+  const late = bl.lateScheduleNote(single("任务:看第二天的行程"), new Date("2026-10-23T04:30:00Z"));
+  check("schedule: a nightly message delivered after midnight is told its own day, worked out (not left to UTC)",
+    typeof late === "string" && /^\[定时消息晚到\]/.test(late) && /原定 10-22 周四 23:00，10-23 周五 00:30 才送到/.test(late)
+      && /「今天」是 10-22 周四，「明天」「第二天」是 10-23 周五/.test(late), late);
+  check("schedule: one delivered the same day, or with no time on it, gets no such line",
+    bl.lateScheduleNote(single("x", "2026-10-22T13:00:00.000Z"), new Date("2026-10-22T14:30:00Z")) === undefined
+      && bl.lateScheduleNote("没有时间", new Date()) === undefined);
+  check("schedule: a recurring batch is dated by its latest occurrence",
+    /原定 10-22 周四 23:00/.test(bl.lateScheduleNote(batchOf([["任务:a", "2026-10-22T03:00:00.000Z"], ["任务:b", "2026-10-23T03:00:00.000Z"]]),
+      new Date("2026-10-23T11:00:00Z")) ?? ""));
+  const tc = await import(join(ROOT, "lib/time-context.js"));
+  const sched = { id: "m1", source: { kind: "schedule" }, content: [{ type: "text", text: single("任务:看第二天的行程") }] };
+  const other = { id: "m2", source: { kind: "plugin:wechat-clawbot" }, content: [{ type: "text", text: "在吗" }] };
+  const made = (text) => ({ id: "note", source: { kind: "plugin:wechat-clawbot" }, content: [{ type: "text", text }] });
+  const withNote = tc.withLateScheduleNotes({ kind: "enter", messages: [sched, other] }, made, new Date("2026-10-23T04:30:00Z"));
+  const onTime = { kind: "enter", messages: [sched] };
+  check("schedule: the line rides in the same step, right after the late message (the model has it before its first call)",
+    withNote.added === 1 && withNote.decision.messages.length === 3 && withNote.decision.messages[0] === sched
+      && withNote.decision.messages[1].id === "note" && withNote.decision.messages[2] === other
+      && tc.withLateScheduleNotes(onTime, made, new Date("2026-10-23T03:05:00Z")).decision === onTime
+      && tc.withLateScheduleNotes({ kind: "reject" }, made).added === 0);
+  check("schedule: the bridge adds the late-delivery line on the WeChat agent, next to the clock filter",
+    /registerLateScheduleNotes\(target, \(id\) => this\.isWechatSession\(id\), \(text\) => wechatUserMessage\(\[\{ type: "text", text \}\]\)\)/.test(bridgeSrc4));
+
+  // The calendar date after today: no slip where the zone is +13 or +14.
+  {
+    const { execFileSync } = await import("node:child_process");
+    const lt = pathToFileURL(join(ROOT, "lib/localtime.js")).href;
+    const out = execFileSync(process.execPath, ["--input-type=module", "-e",
+      `const m = await import(${JSON.stringify(lt)}); console.log(m.zonedDatePlus(1, new Date("2026-10-22T09:00:00Z")), m.zonedDatePlus(-1, new Date("2026-10-22T09:00:00Z")))`],
+      { env: { ...process.env, TZ: "Pacific/Kiritimati" }, encoding: "utf-8" }).trim();
+    check("time: tomorrow and yesterday are one calendar day away in a +14 zone too", out === "2026-10-23 2026-10-21", out);
+  }
+
+  // Start-up only looks (no prompt); the switch is the owner at the card.
+  const indexSrc4 = readFileSync(join(ROOT, "src/index.ts"), "utf-8");
+  check("restart: start-up prepares the helper without prompts, the switch with them",
+    /if \(config\.macCalendar === true && process\.platform === "darwin"\) \{[\s\S]{0,400}void calendarHelper\.prepare\(\)\.catch\(/.test(indexSrc4)
+      && /config\.macCalendar === true && process\.platform === "darwin" && !superseded\) \{[\s\S]{0,300}void calendarHelper\.prepare\(true\)\.catch\(/.test(indexSrc4));
+
+  // The card: on a macOS without alarms, the first build promises only the calendar prompt.
+  {
+    const lib = readFileSync(join(ROOT, "lib/client.js"), "utf-8");
+    const start = lib.indexOf("    function authorizeText(d) {");
+    const end = lib.indexOf("    function Switch(props) {");
+    const authorizeText = new Function(`${lib.slice(start, end)}; return authorizeText;`)();
+    const text = authorizeText({ plan: { build: "first", ask: ["calendar"], denied: [], alarmsUnsupported: true } });
+    check("card words: a first build on a macOS without alarms promises only the 「日历」 prompt",
+      /「日历」的授权窗口/.test(text) && !/提醒事项/.test(text) && /闹钟用不了/.test(text), text);
+  }
 }
 
 console.log(`宿主: dsh ${HOST_VERSION}  (${NPX})`);

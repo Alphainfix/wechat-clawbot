@@ -6,11 +6,11 @@
  * false when it is a task request / greeting / trivial message that should
  * NOT be remembered.
  *
- * Built from real WeChat usage patterns observed in this project.
+ * Synthetic samples modelled on typical WeChat requests.
  */
 export const MEMORY_EVAL_CASES: Array<{ text: string; expect: boolean }> = [
   // ── 应该捕获:身份 / 档案 ─────────────────────────────
-  { text: "我是一名研究生", expect: true },
+  { text: "我是一名设计师", expect: true },
   { text: "[微信消息] 我是大学生", expect: true },
   { text: "我在读计算机专业", expect: true },
   { text: "我是做前端开发的", expect: true },
@@ -32,7 +32,7 @@ export const MEMORY_EVAL_CASES: Array<{ text: string; expect: boolean }> = [
   // 「别忘了 / 记得」本身不是提醒:后面跟的是事实就该记。
   { text: "请记得我对花生过敏", expect: true },
   { text: "别忘了我不吃香菜", expect: true },
-  { text: "我每周三下午都有组会", expect: true },
+  { text: "我每周三下午都有例会", expect: true },
 
   // ── 不应该捕获:一次性提醒(归 schedule_create) ───────
   // 2026-09-23 之前这三条都是 expect: true —— 分类器当时就是按「记提醒」设计的,
@@ -41,15 +41,15 @@ export const MEMORY_EVAL_CASES: Array<{ text: string; expect: boolean }> = [
   { text: "请记得提醒我交报告", expect: false },
   { text: "别忘了明天上午十点开会", expect: false },
   { text: "到点提醒我喝水", expect: false },
-  { text: "三分钟后提醒我来找你", expect: false },
-  { text: "明天晚上10点提醒我做作业", expect: false },
+  { text: "三分钟后提醒我关火", expect: false },
+  { text: "明天晚上10点提醒我寄快递", expect: false },
   { text: "记得今晚十一点提醒我备份文件", expect: false },
 
   // ── 不应该捕获:任务请求 ──────────────────────────────
   { text: "帮我查一下今天的天气", expect: false },
   { text: "把这个文件发给我", expect: false },
-  { text: "请帮我搜一下洛克王国的最新时装", expect: false },
-  { text: "帮我看看这个是泡泡玛特的什么角色", expect: false },
+  { text: "请帮我搜一下某款游戏的最新活动", expect: false },
+  { text: "帮我看看这个是什么牌子的", expect: false },
   { text: "创建 hello.txt 然后发给我", expect: false },
   { text: "请列出桌面的文件", expect: false },
   { text: "帮我设置一个提醒", expect: false },
@@ -67,7 +67,7 @@ export const MEMORY_EVAL_CASES: Array<{ text: string; expect: boolean }> = [
   // ── 不应该捕获:对话性 / 信息查询(非自我陈述) ───────
   { text: "你觉得明天会下雨吗", expect: false },
   { text: "这个多少钱", expect: false },
-  { text: "洛克王国在哪里可以玩", expect: false },
+  { text: "这个游戏在哪里可以玩", expect: false },
   { text: "那是什么", expect: false },
   { text: "你叫什么名字", expect: false },
 

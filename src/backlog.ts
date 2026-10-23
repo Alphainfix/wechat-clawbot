@@ -18,7 +18,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
-import { zonedDate, zonedStamp, zonedWeekday } from "./localtime.js";
+import { zonedDate, zonedDatePlus, zonedStamp, zonedWeekday } from "./localtime.js";
 import { logger } from "./ilink/util/logger.js";
 
 /** Who sent a notification: Claude Code or Codex (MCP), or a DSH conversation (notify_wechat). */
@@ -62,9 +62,69 @@ export function isSendWindowClosed(err: unknown): boolean {
  */
 export function occurrenceAt(text: string): string | undefined {
   const m = /^occurrence_at:\s*(\S+)\s*$/m.exec(text);
-  if (m === null) return undefined;
-  const t = Date.parse(m[1]);
-  return Number.isNaN(t) ? undefined : new Date(t).toISOString();
+  if (m !== null) {
+    const t = Date.parse(m[1]);
+    return Number.isNaN(t) ? undefined : new Date(t).toISOString();
+  }
+  // A recurring reminder comes as a batch: `reminders_json: [{ occurrence_at, … }]`. The latest one.
+  const batch = /^reminders_json:\s*(\[.*\])\s*$/m.exec(text);
+  if (batch === null) return undefined;
+  try {
+    const times = (JSON.parse(batch[1]) as Array<{ occurrence_at?: unknown }>)
+      .map((r) => (typeof r?.occurrence_at === "string" ? Date.parse(r.occurrence_at) : Number.NaN))
+      .filter((t) => !Number.isNaN(t));
+    return times.length === 0 ? undefined : new Date(Math.max(...times)).toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+/** What each reminder in a scheduled message says (one, or a recurring batch). */
+export function reminderPrompts(text: string): string[] {
+  const one = /^reminder_prompt_json:\s*(".*")\s*$/m.exec(text);
+  try {
+    if (one !== null) {
+      const prompt = JSON.parse(one[1]) as unknown;
+      return typeof prompt === "string" ? [prompt] : [];
+    }
+    const batch = /^reminders_json:\s*(\[.*\])\s*$/m.exec(text);
+    if (batch === null) return [];
+    return (JSON.parse(batch[1]) as Array<{ reminder_prompt?: unknown }>)
+      .map((r) => r?.reminder_prompt)
+      .filter((p): p is string => typeof p === "string");
+  } catch {
+    return [];
+  }
+}
+
+/** A reminder that is a job for the bot (prompt rule G5.5): it starts with 「任务:」 or 「任务：」. */
+export function isTaskPrompt(prompt: string): boolean {
+  return /^\s*任务\s*[:：]/.test(prompt);
+}
+
+/** A scheduled message made only of 「任务」: it may end without a word to the owner. */
+export function quietTask(text: string): boolean {
+  const prompts = reminderPrompts(text);
+  return prompts.length > 0 && prompts.every(isTaskPrompt);
+}
+
+/**
+ * The line that goes with a scheduled message delivered on a later day than it
+ * was due (the Mac slept, DSH was down), or undefined. The message reads the
+ * same whenever it arrives and its only time is UTC, while the prompt's date
+ * line says today: a nightly 「任务」 about "the next day" would plan the wrong
+ * one. So the dates are worked out here, not left to the model.
+ */
+export function lateScheduleNote(text: string, now: Date = new Date()): string | undefined {
+  const due = occurrenceAt(text);
+  if (due === undefined) return undefined;
+  const at = new Date(due);
+  const day = zonedDate(at);
+  if (day >= zonedDate(now)) return undefined;
+  const next = zonedDatePlus(1, at);
+  const label = (d: string): string => `${d.slice(5)} ${zonedWeekday(d)}`;
+  return `[定时消息晚到] 上面这条定时消息原定 ${dueStamp(at)}，${dueStamp(now)} 才送到（电脑睡着了，或 DSH 没在运行）。`
+    + `照原定那天算：内容里的「今天」是 ${label(day)}，「明天」「第二天」是 ${label(next)}；要设的闹钟、要排的日程，时间已经过了的就跳过。`;
 }
 
 /** What a file is called in the digest: 图片 or 文件, and its name. */

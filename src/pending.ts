@@ -19,10 +19,29 @@ export interface PendingAnswer {
 
 export class PendingRegistry {
   private readonly queue: PendingAnswer[] = [];
+  private closed = false;
 
-  /** Register a pending interaction. */
+  /** Register a pending interaction (aborted at once while closed: nothing would answer it). */
   push(answer: PendingAnswer): void {
+    if (this.closed) {
+      answer.resolve(null);
+      return;
+    }
     this.queue.push(answer);
+  }
+
+  /**
+   * The listener is stopping: abort everything waiting for a WeChat answer and
+   * take nothing new until reopen(). A turn waiting on an approval would
+   * otherwise keep the bridge, and with it the stop, waiting for ever.
+   */
+  close(): void {
+    this.closed = true;
+    this.abortAll();
+  }
+
+  reopen(): void {
+    this.closed = false;
   }
 
   /** Whether the bot is waiting for this sender to answer something. */

@@ -75,6 +75,8 @@ window.__ModuleLoader__.load({
     const BRIDGE_URL = "/plugins/clawbot/mcp/status";
     const CALENDAR_URL = "/plugins/clawbot/calendar/status";
     const MEMORY_OPEN_URL = "/plugins/clawbot/memory/open";
+    const AUTHORIZE_URL = "/plugins/clawbot/secretary/authorize";
+    const TEST_ALARM_URL = "/plugins/clawbot/secretary/test-alarm";
 
     const cls = (n) => `clawbot-${n}`;
     const S = {
@@ -85,7 +87,7 @@ window.__ModuleLoader__.load({
       reset: cls("reset"), input: cls("input"), area: cls("area"), hint: cls("hint"),
       switch: cls("switch"), switchOn: cls("switch-on"), knob: cls("knob"),
       footer: cls("footer"), note: cls("note"), button: cls("button"),
-      failed: cls("failed"),
+      failed: cls("failed"), actions: cls("actions"),
     };
 
     let stylesInjected = false;
@@ -171,6 +173,7 @@ window.__ModuleLoader__.load({
   border-color: var(--dsw-alias-label-dimmed); }
 .${S.button}:disabled { opacity: .4; cursor: default; }
 .${S.failed} { color: var(--dsw-alias-state-error-primary); font-size: 12px; line-height: 1.5; }
+.${S.actions} { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 `;
       document.head.appendChild(el);
     }
@@ -235,54 +238,104 @@ window.__ModuleLoader__.load({
       return `MCP 客户端已调用 ${bridge.calls} 次，最近一次 ${ago(bridge.lastCallAt)}（${bridge.lastRoute}）${rejected}`;
     }
 
+    /** One Mac permission as a short phrase. */
+    function grant(state, what, app) {
+      switch (state) {
+        case "fullAccess": return `${what}已授权`;
+        case "notDetermined": return `${what}还没授权`;
+        case "denied": return `${what}被拒绝了（系统设置 → 隐私与安全性 → ${what} 里打开「${app}」）`;
+        case "writeOnly": return `${what}只有「仅添加」（系统设置 → 隐私与安全性 → ${what} 里改成完全访问）`;
+        case "restricted": return `${what}被这台 Mac 的管理策略限制了`;
+        case "outdated": return `${what}：要先更新小程序`;
+        default: return `${what}：${state || "读取中"}`;
+      }
+    }
+
     /**
-     * What the calendar row says under its switch. The interesting states are the
-     * ones that need the owner at the Mac: the permission prompt, or a refusal
-     * that only System Settings can undo.
+     * What the 全天候秘书 row says. The states that need the owner at the Mac
+     * come first (a prompt on screen, an outdated helper, a refusal): that is
+     * what has to be done before walking away from it.
      */
-    function calendarHint(status, name, on) {
-      const base = "打开后 bot 能读取 Mac「日历」里所有账户的日程（含备注），在这个专用日历里自主加、改、删；"
-        + "动别的日历会先在微信里问你。关着时不占 token。改开关会重启微信监听";
+    function assistantHint(status, name, on) {
+      const base = "打开后，bot 能读取 Mac「日历」里所有账户的日程（含备注）、在专用日历里自主安排，"
+        + "能设闹钟（紧急提醒：到点像闹钟一样响，不靠微信），并把排日程、定闹钟的规则写进 memory.md 的"
+        + "「## 全天候秘书」一节（可以直接改）。仅 macOS，关着时不占 token。打开时（或之后点「一键授权」）Mac 上会弹出"
+        + "「日历」和「提醒事项」两个授权，要在 Mac 前点「允许」";
       if (status === null) return base;
       if (status.unreachable === true) return "状态读不到（路由没注册？DSH 可能需要重启）";
       if (status.mac === false) return "只支持 macOS";
       if (!on) return name ? base : `先填专用日历的名字，再打开开关。${base}`;
-      if (status.others > 0) return "白名单里还有别人：大家共用这一个对话，日历内容会被看到，所以日历工具不开放";
-      if (status.error && status.authorization !== "fullAccess") return `还没就绪：${status.error}`;
+      if (!name) return "先在上面填专用日历的名字（闹钟清单第一次也按它起名），bot 才能排日程、定闹钟";
+      if (status.others > 0) return "白名单里还有别人：大家共用这一个对话，日历和闹钟会被看到，所以这些工具不开放";
       const app = status.helper || "Clawbot-Calendar";
-      if (status.prompting) return `等你在 Mac 上点「允许」：屏幕上有「${app}」想要访问日历的窗口`;
-      switch (status.authorization) {
-        case "fullAccess": {
-          const own = status.dedicated && status.dedicated.name === name
-            ? `专用日历「${name}」在「${status.dedicated.account || "本机"}」`
-            : `专用日历「${name}」第一次添加时创建（优先建在 iCloud；和已有日历重名会先在微信里问你）`;
-          return `已授权，能看到 ${status.calendars ?? "?"} 个日历（${status.accounts ?? "?"} 个账户）。${own}；`
-            + "改名字会另用一个日历，旧的不会删";
-        }
-        case "notDetermined":
-          return `等你在 Mac 上点「允许」：屏幕上应该有「${app}」想要访问日历的窗口。`
-            + "没看到就去 系统设置 → 隐私与安全性 → 日历";
-        case "denied":
-          return `授权被拒绝了：在 系统设置 → 隐私与安全性 → 日历 里打开「${app}」`;
-        case "writeOnly":
-          return `「${app}」只有「仅添加」权限，读不到日程：在 系统设置 → 隐私与安全性 → 日历 里改成完全访问`;
-        case "restricted":
-          return "这台 Mac 的日历访问被管理策略限制了";
-        default:
-          return status.built === false ? `正在准备「${app}」（第一次要编译，约一分钟）…` : "读取状态…";
+      if (status.preparing && status.built === false && !status.stale) {
+        return `正在准备「${app}」（第一次要编译，约一分钟），之后 Mac 上会弹出授权窗口`;
       }
+      if (status.prompting) {
+        const names = { calendar: "「日历」", reminders: "「提醒事项」" };
+        const which = (status.waitingFor || []).map((k) => names[k]).join("、");
+        return `等你在 Mac 上点「允许」：屏幕上有「${app}」的${which || ""}授权窗口（可能被别的窗口挡住）`;
+      }
+      if (status.preparing) return `正在准备「${app}」…`;
+      if (status.error && status.authorization !== "fullAccess") return `还没就绪：${status.error}`;
+      if (status.built === false && !status.stale) return `「${app}」还没编译：点「一键授权」`;
+      const unsupported = status.alarms === "unsupported";
+      const lines = [];
+      if (status.updateError) lines.push(`小程序更新没成功（旧版照常能用）：${status.updateError}`);
+      else if (status.outdated) {
+        // Protocol 1 has no alarms at all; protocol 2 has them, and only misses the newer pieces.
+        lines.push(`${(status.protocol ?? 1) < 2 ? "小程序要更新才能用闹钟" : "小程序有更新"}：到 Mac 前点「一键授权」`
+          + "（更新后「日历」「提醒事项」都要在 Mac 上再点一次「允许」，不在 Mac 前就先别点，日历会停到点了「允许」为止）");
+      }
+      lines.push(unsupported
+        ? `${grant(status.authorization, "日历", app)}；这台 Mac 的系统没有紧急提醒（要 macOS 26 或更新），闹钟用不了`
+        : `${grant(status.authorization, "日历", app)}；${grant(status.reminders, "提醒事项", app)}`);
+      if (status.authorization === "fullAccess") {
+        lines.push(status.dedicated && status.dedicated.name === name
+          ? `专用日历「${name}」在「${status.dedicated.account || "本机"}」，能看到 ${status.calendars ?? "?"} 个日历`
+          : `专用日历「${name}」第一次用到时创建（优先建在 iCloud）`);
+      }
+      if (status.reminders === "fullAccess" && !unsupported) {
+        lines.push(status.alarmList
+          ? `闹钟清单「${status.alarmList.name}」在「${status.alarmList.account || "iCloud"}」（改了名字也继续用它）`
+          : `闹钟清单「${name} 闹钟」第一次设闹钟时创建`);
+      }
+      if (status.secretaryOn === false) {
+        lines.push("排日程的规则没开（配置里 secretary 是关的）：日历和闹钟照常能用；要那套规则，就把开关关掉再打开一次"
+          + (status.outdated ? "（在 Mac 前做：重新打开会顺便更新小程序、弹出授权）" : ""));
+      } else if (status.secretary === false) {
+        lines.push("memory.md 里没找到「## 全天候秘书」一节：关掉再打开一次就会放回去");
+      }
+      const undecided = status.authorization === "notDetermined" || (!unsupported && status.reminders === "notDetermined");
+      const ready = status.authorization === "fullAccess" && !status.outdated
+        && (unsupported || status.reminders === "fullAccess");
+      if (ready && !unsupported) {
+        lines.push("闹钟只在「查找」里作为“我的位置”的那台设备上像闹钟一样响（一般是 iPhone）；iPhone 上还要先在「提醒事项」里"
+          + "手动把一条提醒设成「紧急」一次、允许弹出的授权，闹钟才会响。点「测试闹钟」试响一次");
+      } else if (undecided) {
+        lines.push("缺的授权到 Mac 前点「一键授权」补上；都允许之后点「测试闹钟」试响一次");
+      }
+      return lines.join("。");
     }
 
-    /** What the secretary row says: what the switch does, and whether the rules are in memory now. */
-    function secretaryHint(status, on, calendarOn) {
-      const what = "把一套排日程的规则写进长期记忆（memory.md 里的「## 日程秘书」一节）：你说待办、截止时间，"
-        + "bot 先查日历再排进专用日历，回复只说几点做什么、挪走了什么。规则可以直接在 memory.md 里改；"
-        + "关掉时移出记忆并留一份副本，再打开原样放回";
-      if (!calendarOn) return on ? "Mac 日历关着，秘书暂停（规则已移出记忆）；打开日历后自动恢复" : `要先打开 Mac 日历。${what}`;
-      if (!on) return what;
-      if (status && status.secretary === true) return "已开：规则在 memory.md 的「## 日程秘书」一节，可以直接改，下一条消息生效";
-      if (status && status.secretary === false) return "已开，但 memory.md 里没找到「## 日程秘书」一节：关掉再打开一次就会放回去";
-      return what;
+    /** What 一键授权 answered it is doing (the route's plan). */
+    function authorizeText(d) {
+      const p = (d && d.plan) || {};
+      const names = { calendar: "「日历」", reminders: "「提醒事项」" };
+      const list = (keys) => (keys || []).map((k) => names[k] || k).join("、");
+      const parts = [];
+      if (p.build === "first") parts.push("先编译小程序（第一次要一两分钟）");
+      if (p.build === "update") parts.push("先更新小程序（更新后两个授权都要重新点）");
+      if ((p.ask || []).length > 0) {
+        parts.push(`Mac 屏幕上会弹出${list(p.ask)}的授权窗口（可能被别的窗口挡住），都点「允许」`);
+      } else if (p.error) {
+        parts.push(`小程序这次没有回应（${p.error}）：过一会儿再点一次「一键授权」`);
+      }
+      if ((p.denied || []).length > 0) {
+        parts.push(`${list(p.denied)}之前被拒绝了，只能在 系统设置 → 隐私与安全性 里打开「Clawbot-Calendar」`);
+      }
+      if (p.alarmsUnsupported) parts.push("这台 Mac 的系统没有紧急提醒，闹钟用不了（日历不受影响）");
+      return parts.length > 0 ? parts.join("；") : "都已经授权了，不用再点";
     }
 
     function Switch(props) {
@@ -313,6 +366,13 @@ window.__ModuleLoader__.load({
       const [calName, setCalName] = useState(null);
       // The "打开 memory.md" button: null, "opening", "opened", or what went wrong.
       const [memoryOpen, setMemoryOpen] = useState(null);
+      // 一键授权 / 测试闹钟: { busy, text, kind, at } while one runs and after it answered; cleared once stale.
+      const [action, setAction] = useState(null);
+      // Bumped to look at the calendar status again at once (after 一键授权).
+      const [poke, setPoke] = useState(0);
+      // The switch, before the early return below: flipping it looks again at once
+      // (the off state counts as settled, so the next look would be a minute away).
+      const calendarOn = Boolean(state && state.value && state.value.macCalendar === true);
 
       // The model catalogue is a server fact, fetched the first time the card is
       // opened rather than on mount: it costs one resolveModelInfo per model, and
@@ -352,18 +412,31 @@ window.__ModuleLoader__.load({
         let timer = null;
         // Fast while the permission is still being decided, slow once it has
         // settled (or the switch is off): every look launches the helper app.
+        const final = ["fullAccess", "denied", "restricted", "writeOnly"];
         const settled = (d) => d && (d.enabled !== true
-          || ["fullAccess", "denied", "restricted", "writeOnly"].includes(d.authorization));
+          || (final.includes(d.authorization)
+            && (final.includes(d.reminders) || d.reminders === "outdated" || d.alarms === "unsupported")
+            && d.preparing !== true && d.prompting !== true));
         const next = (d) => { if (alive) timer = setTimeout(tick, settled(d) ? 60000 : 10000); };
         const tick = () => {
           fetch(CALENDAR_URL, { headers: { accept: "application/json" } })
             .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-            .then((d) => { if (!alive) return; if (d && d.ok) setCalendar(d); next(d && d.ok ? d : null); })
+            .then((d) => {
+              if (!alive) return;
+              if (d && d.ok) {
+                setCalendar(d);
+                // 一键授权's answer describes a round: once that round is over, the live hint says the rest.
+                if (d.preparing !== true && d.prompting !== true) {
+                  setAction((a) => (a && !a.busy && a.kind === "authorize" && Date.now() - a.at > 3000 ? null : a));
+                }
+              }
+              next(d && d.ok ? d : null);
+            })
             .catch(() => { if (alive) { setCalendar({ unreachable: true }); next(null); } });
         };
         tick();
         return () => { alive = false; if (timer) clearTimeout(timer); };
-      }, [open]);
+      }, [open, poke, calendarOn]);
 
       // Follow the saved name again once it changes (a save landed, or 重置).
       const savedName = state && state.value ? (state.value.macCalendarName || "") : "";
@@ -408,6 +481,28 @@ window.__ModuleLoader__.load({
           setMemoryOpen("打不开：路由读不到，DSH 可能需要重启");
         }
       };
+
+      /** POST one of the 全天候秘书 buttons; the answer is shown under the row. */
+      const press = async (url, running, done, kind) => {
+        if (action !== null && action.busy) return;
+        const at = Date.now();
+        setAction({ busy: true, text: running, kind, at });
+        try {
+          const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+          const d = await res.json().catch(() => null);
+          setAction({ busy: false, text: res.ok && d && d.ok ? done(d) : ((d && d.message) || `没成功（HTTP ${res.status}）`), kind, at });
+        } catch {
+          setAction({ busy: false, text: "没成功：路由读不到，DSH 可能需要重启", kind, at });
+        }
+        // The test alarm's line is about the next few minutes only.
+        if (kind === "test") setTimeout(() => setAction((a) => (a && a.at === at ? null : a)), 240000);
+        setPoke((n) => n + 1);
+      };
+      const authorize = () => press(AUTHORIZE_URL, "正在看要做什么…", authorizeText, "authorize");
+      const testAlarm = () => press(TEST_ALARM_URL, "正在设测试闹钟…",
+        (d) => d.urgent === false
+          ? `设上了（${d.at}），但没能设成紧急提醒，到点只会弹通知`
+          : `已设：${d.at} 在「${d.list}」里响，看 iPhone 是不是像闹钟一样响（没响就看这条提醒的备注）`, "test");
 
       const restartNow = async () => {
         if (restarting) return;
@@ -515,6 +610,18 @@ window.__ModuleLoader__.load({
             on: v.idleCompaction !== false, disabled,
             label: "空闲时整理对话",
             onChange: (next) => set("idleCompaction", next),
+          }),
+        }),
+        Field({
+          label: "空闲整理阈值",
+          hint: "万 token。上一次请求超过这个数，空闲时就整理。留空 = 宿主压缩阈值的 85%。只管 bot，网页会话不受影响",
+          overridden: isSet("idleCompactionTokens"), disabled,
+          onReset: () => clear("idleCompactionTokens"),
+          control: h("input", {
+            type: "number", className: S.input, min: 1, step: 1, disabled,
+            value: v.idleCompactionTokens === undefined ? "" : v.idleCompactionTokens / 10000,
+            placeholder: "自动",
+            onChange: (e) => num("idleCompactionTokens", e.target.value, 10000),
           }),
         }),
         Field({
@@ -657,35 +764,56 @@ window.__ModuleLoader__.load({
           }),
         }),
         Field({
-          label: "Mac 日历",
-          hint: calendarHint(calendar, (calName ?? v.macCalendarName ?? "").trim(), v.macCalendar === true),
-          overridden: isSet("macCalendar") || isSet("macCalendarName"), disabled,
-          onReset: () => { clear("macCalendar"); clear("macCalendarName"); setCalName(null); },
+          label: "全天候秘书",
+          hint: assistantHint(calendar, (calName ?? v.macCalendarName ?? "").trim(), v.macCalendar === true)
+            + (action !== null && action.text ? `（${action.text}）` : "")
+            + (memoryOpen !== null && memoryOpen !== "opening" && memoryOpen !== "opened" ? `（${memoryOpen}）` : ""),
+          overridden: isSet("macCalendar") || isSet("macCalendarName") || isSet("secretary"), disabled,
+          onReset: () => { clear("macCalendar"); clear("macCalendarName"); clear("secretary"); setCalName(null); },
           inline: h(Switch, {
-            label: "Mac 日历",
+            label: "全天候秘书",
             on: v.macCalendar === true,
-            // Turning it on needs a calendar name first (the one being typed
-            // counts); turning it off never does.
+            // Turning it on needs a name first (the one being typed counts);
+            // turning it off never does. Calendar, alarms and rules are one
+            // feature: the switch sets both fields.
             disabled: disabled || (v.macCalendar !== true
               && (!(calName ?? v.macCalendarName ?? "").trim() || (calendar !== null && calendar.mac === false))),
             onChange: (next) => {
               const typed = (calName ?? v.macCalendarName ?? "").trim();
               if (next && typed !== (v.macCalendarName || "").trim()) set("macCalendarName", typed);
               set("macCalendar", next);
+              set("secretary", next);
             },
           }),
-          control: h("input", {
-            type: "text", className: S.input, disabled,
-            value: calName ?? (v.macCalendarName || ""),
-            placeholder: "专用日历的名字，例如 规划",
-            maxLength: 60,
-            onChange: (e) => setCalName(String(e.target.value)),
-            onBlur: (e) => {
-              const name = String(e.target.value).trim();
-              if (name === (v.macCalendarName || "").trim()) return;
-              if (name === "") clear("macCalendarName"); else set("macCalendarName", name);
-            },
-          }),
+          control: h("div", null,
+            h("input", {
+              type: "text", className: S.input, disabled,
+              value: calName ?? (v.macCalendarName || ""),
+              placeholder: "专用日历的名字（闹钟清单第一次也用它），例如 规划",
+              maxLength: 60,
+              onChange: (e) => setCalName(String(e.target.value)),
+              onBlur: (e) => {
+                const name = String(e.target.value).trim();
+                if (name === (v.macCalendarName || "").trim()) return;
+                if (name === "") clear("macCalendarName"); else set("macCalendarName", name);
+              },
+            }),
+            h("div", { className: S.actions },
+              h("button", {
+                type: "button", className: S.button,
+                disabled: disabled || v.macCalendar !== true || (action !== null && action.busy),
+                onClick: authorize,
+              }, "一键授权"),
+              h("button", {
+                type: "button", className: S.button,
+                disabled: disabled || v.macCalendar !== true || (action !== null && action.busy)
+                  || !(calendar && calendar.reminders === "fullAccess" && !calendar.outdated && calendar.alarms !== "unsupported"),
+                onClick: testAlarm,
+              }, "测试闹钟"),
+              h("button", {
+                type: "button", className: S.button, disabled: disabled || memoryOpen === "opening", onClick: openMemory,
+              }, memoryOpen === "opened" ? "已在 Mac 上打开" : "打开 memory.md"),
+            )),
         }),
         Field({
           label: "日历提醒",
@@ -705,20 +833,14 @@ window.__ModuleLoader__.load({
           }),
         }),
         Field({
-          label: "日程秘书",
-          hint: secretaryHint(calendar, v.secretary === true, v.macCalendar === true)
-            + (memoryOpen !== null && memoryOpen !== "opening" && memoryOpen !== "opened" ? `（${memoryOpen}）` : ""),
-          control: h("div", null, h("button", {
-            type: "button", className: S.button, disabled: disabled || memoryOpen === "opening", onClick: openMemory,
-          }, memoryOpen === "opened" ? "已在 Mac 上打开" : "打开 memory.md")),
-          overridden: isSet("secretary"), disabled,
-          onReset: () => clear("secretary"),
+          label: "改别的日历前先问我",
+          hint: "bot 往专用日历以外的日历里加、改、删日程前，先在微信里问你、回「好」才动。"
+            + "关掉就直接改（只读和订阅的日历本来就改不了）；会通知其他参与者的改动仍会先问",
+          overridden: isSet("macCalendarAsk"), disabled,
+          onReset: () => clear("macCalendarAsk"),
           inline: h(Switch, {
-            label: "日程秘书",
-            // It leans on the calendar: off (and not switchable) while the calendar is off.
-            on: v.secretary === true && v.macCalendar === true,
-            disabled: disabled || v.macCalendar !== true || (calendar !== null && calendar.mac === false),
-            onChange: (next) => set("secretary", next),
+            label: "改别的日历前先问我", on: v.macCalendarAsk !== false, disabled,
+            onChange: (next) => set("macCalendarAsk", next),
           }),
         }),
         Field({
@@ -747,7 +869,7 @@ window.__ModuleLoader__.load({
             { className: S.headText },
             h("span", { className: S.name }, "微信 Bot"),
             h("span", { className: S.description },
-              "模型、图片、白名单、Mac 日历与日程秘书。大多改完立刻生效，微信连接不中断"),
+              "模型、图片、白名单、全天候秘书（日历和闹钟）。大多改完立刻生效，微信连接不中断"),
           ),
           h(
             "svg",

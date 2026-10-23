@@ -492,7 +492,7 @@ function registerMemoryTool(agentCtx: Context): void {
       description:
         "Append one durable fact about the user into long-term memory (a Markdown file). " +
         "Use this when the user tells you something worth remembering ACROSS conversations: " +
-        "personal background, preferences, habits, recurring needs (\"每周三下午组会\"). " +
+        "personal background, preferences, habits, recurring needs (\"每周三下午例会\"). " +
         "Test: will this still be true in a month? If not, do not store it. " +
         "Do NOT use it for one-off reminders or anything tied to a specific time (今天/明天/几点/几分钟后) — " +
         "use schedule_create for those; a stored reminder is wrong the next day and misleads your date math. " +

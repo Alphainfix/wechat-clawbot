@@ -6,9 +6,10 @@
  * triggers it: on 2026-10-04 a reply waited 17 s behind a compaction of ~30万
  * tokens. Here the same work moves into the quiet time after a reply: once a
  * turn has ended, typing has stopped and nothing new has arrived for a while,
- * and the last request was already close to the host's threshold, run the
- * host's own `/compact` on the session. The next message then finds a short
- * history and the host's pre-step check has nothing to do.
+ * and the last request was already close to the host's threshold (or past the
+ * owner's own `idleCompactionTokens`), run the host's own `/compact` on the
+ * session. The next message then finds a short history and the host's
+ * pre-step check has nothing to do.
  *
  * `/compact` folds the whole history into one summary (it keeps no verbatim
  * tail, unlike the pre-step compaction). That is why it waits for a quiet
@@ -51,6 +52,11 @@ export type IdleCompactDeps = {
   lastRequestTokens: () => number | undefined;
   /** The host's compaction threshold for the current route. */
   hostThreshold: () => Promise<number | undefined>;
+  /**
+   * The owner's own trigger (config `idleCompactionTokens`), read each time;
+   * when set it replaces ratio × host threshold.
+   */
+  fixedTrigger?: () => number | undefined;
   /** Run the host's `/compact` on the session; undefined when it is not available. */
   compact: (signal: AbortSignal) => Promise<{ ok: boolean; text: string } | undefined>;
   /** The history was just compacted: forget the last request size. */
@@ -106,24 +112,25 @@ export class IdleCompactor {
     if (this.disposed || this.running || !this.deps.enabled() || this.deps.isBusy()) return;
     const used = this.deps.lastRequestTokens();
     if (used === undefined || used <= 0) return;
+    const fixed = this.deps.fixedTrigger?.();
     let threshold: number | undefined;
     try {
       threshold = await this.deps.hostThreshold();
     } catch (err) {
       logger.debug(`idle-compact: threshold unavailable: ${String(err)}`);
-      return;
     }
-    if (threshold === undefined) return;
-    const trigger = Math.floor(threshold * (this.deps.ratio ?? IDLE_COMPACT_RATIO));
+    if (fixed === undefined && threshold === undefined) return;
+    const trigger = fixed ?? Math.floor(threshold! * (this.deps.ratio ?? IDLE_COMPACT_RATIO));
+    const basis = fixed !== undefined ? `configured trigger, host threshold ${threshold ?? "unknown"}` : `host threshold ${threshold}`;
     if (used < trigger) {
-      logger.debug(`idle-compact: ${used} tokens < ${trigger} (host threshold ${threshold}); nothing to do`);
+      logger.debug(`idle-compact: ${used} tokens < ${trigger} (${basis}); nothing to do`);
       return;
     }
     // The threshold lookup awaited; the owner may have written meanwhile.
     if (this.disposed || this.deps.isBusy()) return;
     this.running = true;
     try {
-      logger.info(`idle-compact: last request ${used} tokens >= ${trigger} (host threshold ${threshold}); compacting while idle`);
+      logger.info(`idle-compact: last request ${used} tokens >= ${trigger} (${basis}); compacting while idle`);
       const result = await this.deps.compact(AbortSignal.timeout(180_000));
       if (result === undefined) {
         logger.info("idle-compact: /compact is not available for this session; leaving it to the host's pre-step compaction");

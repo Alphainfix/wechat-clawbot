@@ -26,5 +26,9 @@
     # in the Plugins page. That bundle inserts its own `schedule` row after
     # this one and the later row wins: harmless while it stays on, but turning
     # off that bundle's "Task scheduling" row silences WeChat reminders too.
+    # DSH 0.2.1 moved the four schedule_* tools into @deepseek-ai/dsh-tool-schedule,
+    # which the standard/cordis/ptc presets mount in each agent's own scope (the
+    # WeChat agent gets the standard preset), and dsh-web-app ships this
+    # `schedule` row again. Both rows mount the same service; the later one wins.
     - id: schedule
       name: '@deepseek-ai/dsh-schedule'

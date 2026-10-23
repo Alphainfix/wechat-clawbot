@@ -3,9 +3,10 @@
  *
  * Every date this plugin writes or shows is the user's LOCAL date. That sounds
  * obvious and has been wrong twice, both times the same way: `toISOString()`
- * returns UTC, and after 20:00 local (US Eastern) UTC is already tomorrow. So a
- * memory entry appended at 22:31 on Aug 31 was stamped `[2026-09-01]`, and the
- * agent — which reads those stamps back — saw a fact dated in the future.
+ * returns UTC, and west of UTC the evening is already tomorrow there (after
+ * 20:00 at UTC−4). So a memory entry appended at 22:31 on Aug 31 was stamped
+ * `[2026-09-01]`, and the agent — which reads those stamps back — saw a fact
+ * dated in the future.
  *
  * Centralised so there is one function to get right rather than four call sites
  * to remember. If you need a date or a timestamp anywhere in this plugin, take
@@ -38,9 +39,9 @@ export function zonedDate(at: Date = new Date()): string {
  */
 export function zonedDatePlus(days: number, at: Date = new Date()): string {
   const [y, m, d] = zonedDate(at).split("-").map(Number);
-  // Noon UTC: far enough from either midnight that no zone offset can push the
-  // instant onto a neighbouring calendar day.
-  return zonedDate(new Date(Date.UTC(y, m - 1, d + days, 12)));
+  // Plain calendar arithmetic on that date (UTC only as a calendar): going back
+  // through a zone would slip a day where the offset is +13 or +14.
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
 }
 
 /** Chinese weekday for a `YYYY-MM-DD` zoned date, e.g. `周一`. */

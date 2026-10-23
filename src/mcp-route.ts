@@ -42,6 +42,7 @@ import { CodexProgressStore, type CodexProgressState } from "./codex-progress.js
 import type { Backlog } from "./backlog.js";
 import { eventText, listDshSessions, readDshSession, sendToDshSession, TAIL_TEXT_CAP } from "./dsh-sessions.js";
 import { notifyOwner } from "./owner-notify.js";
+import { localRequest } from "./secretary.js";
 
 /** The one method this file uses, structurally — see models-route.ts. */
 type WebServerLike = {
@@ -374,13 +375,18 @@ export function registerMcpRoutes(ctx: Context, deps: McpRouteDeps): void {
     // attacker gains from — no token, no ids, no message content, just whether
     // the bridge is on and whether anything has used it. It is also outside the
     // `mcpBridge` gate, because "is it off?" is the question you ask when it is
-    // off.
+    // off. It does name the token file's path, so only this machine's page gets
+    // an answer (a page rebound to 127.0.0.1 does not: see localRequest).
     scoped.effect(
       () =>
         server.register({
           kind: "exact",
           path: "/plugins/clawbot/mcp/status",
-          handler(_req: IncomingMessage, res: ServerResponse) {
+          handler(req: IncomingMessage, res: ServerResponse) {
+            if (!localRequest(req)) {
+              send(res, 403, { ok: false, error: "only this machine's settings card" });
+              return;
+            }
             let tokenReady = false;
             try {
               tokenReady = fs.readFileSync(tokenPath(), "utf-8").trim() !== "";

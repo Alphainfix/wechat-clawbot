@@ -16,7 +16,9 @@
  * process: the permission prompt names Clawbot-Calendar and the grant is its own.
  * One launch per request; request and response travel as 0600 JSON files. The
  * grant is tied to the build's signature (ad hoc), so a plugin update that
- * changes the Swift source needs one more click on the Mac.
+ * changes the Swift source needs one more click on the Mac. Each Mac's build
+ * carries a random installation id (infoPlist), so its signature is its own: a
+ * copy compiled anywhere else — a test's, say — does not get the owner's grant.
  *
  * ## What the bot may do
  *
@@ -28,6 +30,9 @@
  * waits — enforced here, not left to the model. The question goes to the
  * account owner only, is sent before anything listens for an answer, and says
  * what the change really covers (a whole recurring series, other attendees).
+ * The owner can switch that off (`macCalendarAsk`): their writable calendars
+ * are then changed directly, except a change other attendees would be told
+ * about, which still asks. Read-only and subscribed calendars stay untouched.
  * Only the owner can use these tools, and not at all while other people are on
  * the allow list: they share the conversation, so they would see the calendar.
  *
@@ -38,9 +43,10 @@
  * section — the rules live in the three tool descriptions.
  */
 import { execFile } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,18 +57,35 @@ import type { ResolvedWeixinAccount } from "./ilink/auth/accounts.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import { logger } from "./ilink/util/logger.js";
 import { USER_TIME_ZONE, zonedDate, zonedStamp, zonedWeekday } from "./localtime.js";
+import { localRequest } from "./secretary.js";
 
 /** The helper's name: the app bundle, its executable, and what the permission prompt shows. */
 export const HELPER_NAME = "Clawbot-Calendar";
 const BUNDLE_ID = "io.github.alphainfix.wechat-clawbot.calendar";
 const USAGE = "wechat-clawbot reads your calendars and schedules time in the calendar you chose. "
   + "微信 bot 会读取你的日历，并在你指定的专用日历里安排时间。";
+const REMINDERS_USAGE = "wechat-clawbot sets alarms for you: urgent reminders in a list of its own. "
+  + "微信 bot 会在它自己的清单里为你设闹钟（紧急提醒）。";
+/**
+ * What this plugin needs of the helper (main.swift `helperProtocol`): 2 = the
+ * alarm commands, 3 = alarmComplete and alarm support in `status`. An older
+ * build keeps working for what it knows; the card offers 一键授权 to update it.
+ */
+export const HELPER_PROTOCOL = 3;
 
-const INFO_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
+/**
+ * The app's Info.plist. `installation` is the random id kept beside the app
+ * (install-id): it goes into the signature, which the permissions are tied to,
+ * so every build of the same source on another Mac — or in a test's folder —
+ * is a different app to macOS. Without it they are byte-identical, and any copy
+ * compiled anywhere would get the owner's calendar and reminders.
+ */
+export function infoPlist(installation: string, bundleId = BUNDLE_ID): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
+  <key>CFBundleIdentifier</key><string>${bundleId}</string>
   <key>CFBundleName</key><string>${HELPER_NAME}</string>
   <key>CFBundleDisplayName</key><string>${HELPER_NAME}</string>
   <key>CFBundleExecutable</key><string>${HELPER_NAME}</string>
@@ -74,9 +97,13 @@ const INFO_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
   <key>NSCalendarsFullAccessUsageDescription</key><string>${USAGE}</string>
   <key>NSCalendarsUsageDescription</key><string>${USAGE}</string>
   <key>NSCalendarsWriteOnlyAccessUsageDescription</key><string>${USAGE}</string>
+  <key>NSRemindersFullAccessUsageDescription</key><string>${REMINDERS_USAGE}</string>
+  <key>NSRemindersUsageDescription</key><string>${REMINDERS_USAGE}</string>
+  <key>ClawbotInstallation</key><string>${installation}</string>
 </dict>
 </plist>
 `;
+}
 
 /** One response from the helper. */
 export type HelperResponse = { ok: boolean; code?: string; error?: string; [key: string]: unknown };
@@ -94,20 +121,50 @@ type EventInfo = {
 
 /** The dedicated calendar, remembered by identifier (state dir, 0600). */
 type DedicatedRecord = { name: string; id: string; account: string };
+/** The reminders list alarms go into, the same way. */
+export type AlarmListRecord = { name: string; id: string; account: string };
 
 /**
  * Process-wide state that must survive hot reloads (DSH re-applies the plugin
- * without disposing the old instance): one permission prompt at a time, and
- * no new prompt for a while after one went unanswered.
+ * without disposing the old instance): one round of preparing at a time, and
+ * which permission prompt is on the Mac's screen right now.
  */
-type CalendarGlobal = { preparing?: Promise<void>; promptOpen?: boolean; lastPromptAt?: number; lastPromptResult?: string };
+type CalendarGlobal = {
+  preparing?: { force: boolean; done: Promise<void> };
+  /** A forced round asked for while a quick one ran: it comes right after. */
+  queued?: Promise<void>;
+  pending?: { calendar: boolean; reminders: boolean };
+  /** Bumped whenever `pending` changes: a status read that straddles it is not cached. */
+  generation?: number;
+};
 const GLOBAL_KEY = Symbol.for("clawbot.calendar");
 const shared = ((globalThis as unknown as Record<symbol, CalendarGlobal | undefined>)[GLOBAL_KEY] ??= {});
 
-/** After an unanswered prompt, wait this long before putting up another one. */
-const PROMPT_BACKOFF_MS = 10 * 60_000;
-/** A failed build is not retried more often than this (unless the switch is flipped again). */
+function setPending(pending: CalendarGlobal["pending"]): void {
+  shared.pending = pending;
+  shared.generation = (shared.generation ?? 0) + 1;
+}
+
+/** A failed build is not retried more often than this (unless the owner asks at the card). */
 const BUILD_RETRY_MS = 10 * 60_000;
+
+/** Commands that need each permission: while its prompt is up they answer "waiting" at once. */
+const CALENDAR_COMMANDS = new Set(["calendars", "events", "ensureCalendar", "add", "update", "delete"]);
+const ALARM_COMMANDS = new Set(["ensureAlarmList", "alarmAdd", "alarms", "alarmDelete", "alarmComplete"]);
+
+/** What 一键授权 is about to do, for the card to say. */
+export type AuthorizePlan = {
+  /** "first": compile the helper (first use); "update": replace an older build, which starts both permissions over. */
+  build?: "first" | "update";
+  /** Prompts that will go up on the Mac's screen. */
+  ask: Array<"calendar" | "reminders">;
+  /** Refused before: only System Settings can change these. */
+  denied: Array<"calendar" | "reminders">;
+  /** This macOS has no urgent reminders: no alarms, so no reminders prompt. */
+  alarmsUnsupported?: boolean;
+  /** The helper could not be asked (it says why). */
+  error?: string;
+};
 
 function execFileP(file: string, args: readonly string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
@@ -127,11 +184,16 @@ export class CalendarHelper {
   private statusInFlight: Promise<CalendarStatus> | null = null;
   private counts: { at: number; calendars: number; accounts: number } | null = null;
 
+  private readonly bundleId: string;
+
   constructor(
     private readonly root: string = path.join(resolveStateDir(), "calendar-helper"),
     private readonly source: string = fileURLToPath(new URL("../native/macos-calendar/main.swift", import.meta.url)),
     private readonly runner?: HelperRunner,
+    /** Tests build under their own bundle id, so not even a prompt there could touch the owner's grant. */
+    options: { bundleId?: string } = {},
   ) {
+    this.bundleId = options.bundleId ?? BUNDLE_ID;
     this.sweep();
   }
 
@@ -143,22 +205,78 @@ export class CalendarHelper {
     return path.join(this.appPath, "Contents", "MacOS", HELPER_NAME);
   }
 
-  /** Request/response files a timed-out helper may have written after the caller left. */
+  /**
+   * Request/response files a timed-out helper may have written after the
+   * caller left, and the folders of a build that was cut off halfway.
+   */
   private sweep(): void {
-    const dir = path.join(this.root, "calls");
+    const old = (file: string): boolean => Date.now() - fs.statSync(file).mtimeMs > 3_600_000;
     try {
+      const dir = path.join(this.root, "calls");
       for (const name of fs.readdirSync(dir)) {
         const file = path.join(dir, name);
-        if (Date.now() - fs.statSync(file).mtimeMs > 3_600_000) fs.rmSync(file, { force: true });
+        if (old(file)) fs.rmSync(file, { force: true });
       }
     } catch {
       // nothing to sweep
     }
+    try {
+      for (const name of fs.readdirSync(this.root)) {
+        const dir = path.join(this.root, name);
+        if (/^\.(build|old)-/.test(name) && old(dir)) fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } catch {
+      // no helper folder yet
+    }
+  }
+
+  /**
+   * This Mac's installation id (see infoPlist); "" before the first build,
+   * unless `create`. A lost or damaged file is taken back from the built app
+   * rather than minted anew: a new id is a new app to macOS, both permissions
+   * gone.
+   */
+  private installation(create: boolean): string {
+    const file = path.join(this.root, "install-id");
+    const read = (): string => {
+      try {
+        const id = fs.readFileSync(file, "utf-8").trim();
+        return /^[0-9a-f]{32}$/.test(id) ? id : "";
+      } catch {
+        return "";
+      }
+    };
+    const known = read();
+    if (known !== "") return known;
+    try {
+      const plist = fs.readFileSync(path.join(this.appPath, "Contents", "Info.plist"), "utf-8");
+      const built = /<key>ClawbotInstallation<\/key><string>([0-9a-f]{32})<\/string>/.exec(plist)?.[1];
+      if (built !== undefined) {
+        fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(file, built, { mode: 0o600 });
+        return built;
+      }
+    } catch {
+      // no app built yet
+    }
+    if (!create) return "";
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    try {
+      // Exclusive: two processes starting at once must not each mint their own.
+      fs.writeFileSync(file, randomBytes(16).toString("hex"), { mode: 0o600, flag: "wx" });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    // The other process may still be writing its id.
+    for (let i = 0; i < 50 && read() === ""; i += 1) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    const id = read();
+    if (id === "") throw new Error(`${file} does not hold an installation id`);
+    return id;
   }
 
   /** What the built app was made from: a rebuild only when this changes. */
-  private fingerprint(): string {
-    return createHash("sha256").update(fs.readFileSync(this.source)).update(INFO_PLIST).digest("hex");
+  private fingerprint(installation = this.installation(false)): string {
+    return createHash("sha256").update(fs.readFileSync(this.source)).update(infoPlist(installation, this.bundleId)).digest("hex");
   }
 
   /** Whether the app exists and matches the current source. */
@@ -171,15 +289,38 @@ export class CalendarHelper {
     }
   }
 
-  /** Compile and sign the helper if it is missing or stale. A recent failure is reported, not retried. */
+  /** Whether there is a helper to ask (a test's runner counts); a status look never builds one. */
+  get hasApp(): boolean {
+    return this.runner !== undefined || fs.existsSync(this.exePath);
+  }
+
+  /** An app built from an older source: it still works for what it knows. */
+  isStale(): boolean {
+    return this.runner === undefined && fs.existsSync(this.exePath) && !this.isBuilt();
+  }
+
+  /**
+   * Compile and sign the helper if it is missing, or stale and `force`. A recent failure is reported, not retried.
+   *
+   * A rebuild changes the ad-hoc signature, and macOS takes the new build for a
+   * new app: the calendar and reminders permissions start over, and someone has
+   * to click Allow at the Mac. So an existing helper is replaced only when the
+   * owner asks at the settings card (the switch, or 一键授权) — never behind
+   * their back, when they may be far from the Mac.
+   */
   async ensureBuilt(force = false): Promise<void> {
-    if (this.runner !== undefined || this.isBuilt()) return;
-    const print = this.fingerprint();
+    if (this.runner !== undefined) return;
+    // A build under way finishes first: the app is swapped in whole, never seen half-made.
+    while (this.building !== null) await this.building.catch(() => undefined);
+    if (this.isBuilt()) return;
+    if (!force && fs.existsSync(this.exePath)) return;
+    const installation = this.installation(true);
+    const print = this.fingerprint(installation);
     const failed = this.buildFailure;
     if (!force && failed !== null && failed.fingerprint === print && Date.now() - failed.at < BUILD_RETRY_MS) {
       throw new Error(failed.message);
     }
-    this.building ??= this.build(print)
+    this.building = this.build(print, installation)
       .catch((err: unknown) => {
         this.buildFailure = { fingerprint: print, at: Date.now(), message: String((err as Error).message ?? err) };
         throw err;
@@ -188,36 +329,56 @@ export class CalendarHelper {
     return this.building;
   }
 
-  private async build(print: string): Promise<void> {
-    const macos = path.join(this.appPath, "Contents", "MacOS");
-    fs.rmSync(this.appPath, { recursive: true, force: true });
-    fs.mkdirSync(macos, { recursive: true, mode: 0o700 });
+  /**
+   * Compile into a folder beside the app and swap the finished, signed bundle
+   * in whole. A build that fails — the command line tools broken by a macOS
+   * update, say — leaves the old helper where it was, still working, with its
+   * permissions.
+   */
+  private async build(print: string, installation: string): Promise<void> {
+    const staging = path.join(this.root, `.build-${process.pid}-${randomUUID().slice(0, 8)}`);
+    const app = path.join(staging, `${HELPER_NAME}.app`);
+    const exe = path.join(app, "Contents", "MacOS", HELPER_NAME);
+    fs.mkdirSync(path.dirname(exe), { recursive: true, mode: 0o700 });
     logger.info(`calendar: building ${HELPER_NAME}.app (first use, or the plugin's Swift source changed)`);
     try {
-      await execFileP("xcrun", ["swiftc", "-O", "-framework", "EventKit", this.source, "-o", this.exePath], 600_000);
-    } catch (err) {
-      const e = err as { code?: unknown; stderr?: unknown };
-      if (e.code === "ENOENT" || /xcrun: error|no developer tools|CommandLineTools/i.test(String(e.stderr ?? ""))) {
-        throw new Error("编译 Clawbot-Calendar 需要 Xcode 命令行工具：在终端运行 xcode-select --install");
+      try {
+        await execFileP("xcrun", ["swiftc", "-O", "-framework", "EventKit", this.source, "-o", exe], 600_000);
+      } catch (err) {
+        const e = err as { code?: unknown; stderr?: unknown };
+        if (e.code === "ENOENT" || /xcrun: error|no developer tools|CommandLineTools/i.test(String(e.stderr ?? ""))) {
+          throw new Error("编译 Clawbot-Calendar 需要 Xcode 命令行工具：在终端运行 xcode-select --install");
+        }
+        throw new Error(`编译 Clawbot-Calendar 失败：${String(e.stderr ?? err).trim().slice(-300)}`);
       }
-      throw new Error(`编译 Clawbot-Calendar 失败：${String(e.stderr ?? err).trim().slice(-300)}`);
+      fs.writeFileSync(path.join(app, "Contents", "Info.plist"), infoPlist(installation, this.bundleId));
+      // Ad-hoc signature: required on Apple silicon, and what the permission grant is tied to.
+      await execFileP("codesign", ["--force", "--sign", "-", app], 60_000);
+      const old = path.join(this.root, `.old-${process.pid}-${randomUUID().slice(0, 8)}`);
+      if (fs.existsSync(this.appPath)) fs.renameSync(this.appPath, old);
+      fs.renameSync(app, this.appPath);
+      fs.rmSync(old, { recursive: true, force: true });
+      fs.writeFileSync(path.join(this.root, "source.sha256"), print, { mode: 0o600 });
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
     }
-    fs.writeFileSync(path.join(this.appPath, "Contents", "Info.plist"), INFO_PLIST);
-    // Ad-hoc signature: required on Apple silicon, and what the permission grant is tied to.
-    await execFileP("codesign", ["--force", "--sign", "-", this.appPath], 60_000);
-    fs.writeFileSync(path.join(this.root, "source.sha256"), print, { mode: 0o600 });
     this.buildFailure = null;
     logger.info(`calendar: built ${this.appPath}`);
   }
 
   /**
    * Run one request. Requests are serialized: two EventKit writers at once help
-   * nobody. While the permission prompt is up, calendar reads and writes answer
-   * "not authorized" at once instead of queueing behind it.
+   * nobody. While a permission prompt is up, what needs that permission
+   * answers "waiting for you at the Mac" at once instead of queueing behind
+   * it; the other permission's commands go ahead.
    */
   call(request: Record<string, unknown>, timeoutMs = 30_000, signal?: AbortSignal): Promise<HelperResponse> {
-    if (shared.promptOpen === true && request.cmd !== "status" && request.cmd !== "request") {
+    const cmd = String(request.cmd ?? "");
+    if (shared.pending?.calendar === true && CALENDAR_COMMANDS.has(cmd)) {
       return Promise.resolve({ ok: false, code: "not_authorized", error: "notDetermined", pending: true });
+    }
+    if (shared.pending?.reminders === true && ALARM_COMMANDS.has(cmd)) {
+      return Promise.resolve({ ok: false, code: "reminders_not_authorized", error: "notDetermined", pending: true });
     }
     const run = this.chain.then((): Promise<HelperResponse> | HelperResponse => (signal?.aborted
       ? { ok: false, code: "stopped", error: "the turn was stopped" }
@@ -279,15 +440,37 @@ export class CalendarHelper {
   }
 
   private async readStatus(): Promise<CalendarStatus> {
+    const generation = shared.generation ?? 0;
     let value: CalendarStatus;
-    try {
-      if (shared.promptOpen === true) {
-        value = { authorization: "notDetermined", built: true, prompting: true };
-      } else {
+    if (!this.hasApp) {
+      // Looking builds nothing: a build takes a minute, and the card would wait on it.
+      // The switch and 一键授权 build (prepare); one that failed says why.
+      const lastFailure = this.buildFailure;
+      value = { authorization: "unknown", built: false, ...(lastFailure !== null ? { error: lastFailure.message } : {}) };
+    } else {
+      try {
+        // Asking for the state puts up no prompt, so it is fine while one is on screen.
         const res = await this.call({ cmd: "status" }, 20_000);
-        value = { authorization: String(res.authorization ?? res.code ?? "unknown"), built: this.runner !== undefined || this.isBuilt() };
+        const protocol = typeof res.protocol === "number" ? res.protocol : 1;
+        value = {
+          authorization: String(res.authorization ?? res.code ?? "unknown"),
+          // A build from before the alarms reports no reminders state at all.
+          reminders: typeof res.reminders === "string" ? res.reminders : "outdated",
+          protocol,
+          built: this.runner !== undefined || this.isBuilt(),
+          stale: this.isStale(),
+          outdated: res.ok === true && protocol < HELPER_PROTOCOL,
+        };
+        if (res.alarms === "supported" || res.alarms === "unsupported") value.alarms = res.alarms;
+        const pending = shared.pending;
+        if (pending !== undefined) {
+          value.prompting = true;
+          value.waitingFor = [...(pending.calendar ? ["calendar" as const] : []), ...(pending.reminders ? ["reminders" as const] : [])];
+        }
         if (res.ok !== true && res.error !== undefined) value.error = String(res.error);
-        if (value.authorization === "fullAccess") {
+        const failed = this.buildFailure;
+        if (value.stale === true && failed !== null && failed.fingerprint === this.fingerprint()) value.updateError = failed.message;
+        if (value.authorization === "fullAccess" && shared.pending?.calendar !== true) {
           if (this.counts === null || Date.now() - this.counts.at > 5 * 60_000) {
             const cals = await this.call({ cmd: "calendars" }, 20_000);
             const list = (cals.calendars as CalendarInfo[] | undefined) ?? [];
@@ -296,48 +479,132 @@ export class CalendarHelper {
           value.calendars = this.counts.calendars;
           value.accounts = this.counts.accounts;
         }
+      } catch (err) {
+        value = { authorization: "unknown", built: this.isBuilt(), error: String((err as Error).message ?? err).slice(0, 240) };
       }
-    } catch (err) {
-      value = { authorization: "unknown", built: this.isBuilt(), error: String((err as Error).message ?? err).slice(0, 240) };
     }
     const dedicated = this.dedicated();
     if (dedicated !== null) value.dedicated = { name: dedicated.name, account: dedicated.account };
-    this.lastStatus = { at: Date.now(), value };
+    const alarms = this.alarmList();
+    if (alarms !== null) value.alarmList = { name: alarms.name, account: alarms.account };
+    // A prompt went up or came down while this look ran: it may describe the other side of that.
+    // A look without an app launched nothing: not kept, so a build that ends shows at once.
+    if ((shared.generation ?? 0) === generation && this.hasApp) this.lastStatus = { at: Date.now(), value };
     return value;
   }
 
+  /** Forget the cached status: the next look asks the helper again. */
+  invalidateStatus(): void {
+    this.lastStatus = null;
+  }
+
   /**
-   * Build the helper and, if the owner has not answered yet, put the permission
-   * prompt on the Mac's screen — one prompt at a time process-wide, and not
-   * again within a while of one that went unanswered (unless `force`, which is
-   * the switch being turned on).
+   * Get the helper ready. Without `force` (start-up) it is built if missing
+   * and asked for its state — never a prompt: nobody may be at the Mac, and a
+   * prompt nobody answers only blocks what waits on it. `force` is the owner at
+   * the settings card (the switch, or 一键授权): it also replaces a helper built
+   * from older source (which starts the permissions over, see ensureBuilt) and
+   * puts up a prompt for each permission still undecided — the calendar, then
+   * reminders (for alarms). One round at a time, process-wide.
    */
   prepare(force = false): Promise<void> {
-    shared.preparing ??= this.prepareNow(force).finally(() => { shared.preparing = undefined; });
-    return shared.preparing;
+    const running = shared.preparing;
+    if (running !== undefined) {
+      if (!force || running.force) return running.done;
+      // 一键授权 during a quick start-up look: its own round right after it.
+      shared.queued ??= running.done.catch(() => undefined).then(() => {
+        shared.queued = undefined;
+        return this.prepare(true);
+      });
+      return shared.queued;
+    }
+    const done: Promise<void> = this.prepareNow(force).finally(() => {
+      if (shared.preparing?.done === done) shared.preparing = undefined;
+    });
+    shared.preparing = { force, done };
+    return done;
+  }
+
+  /** Whether a round is under way (the card shows it). */
+  get preparing(): boolean {
+    return shared.preparing !== undefined || shared.queued !== undefined;
   }
 
   private async prepareNow(force: boolean): Promise<void> {
-    await this.ensureBuilt(force);
+    // A new build resets both permissions, so a forced round replaces only a helper older than this
+    // plugin needs (its protocol), or one that does not answer; a build that merely differs stays.
+    let rebuild = force;
+    if (force && this.runner === undefined && this.isStale()) {
+      const before = await this.callNow({ cmd: "status" }, 20_000);
+      rebuild = before.ok !== true || (typeof before.protocol === "number" ? before.protocol : 1) < HELPER_PROTOCOL;
+    }
+    try {
+      await this.ensureBuilt(rebuild);
+    } catch (err) {
+      // A failed update keeps the old helper: still ask with that one. The card shows why it was not replaced.
+      if (!force || this.runner !== undefined || !fs.existsSync(this.exePath)) throw err;
+      logger.warn(`calendar: could not update ${HELPER_NAME}, keeping the old one: ${String((err as Error).message ?? err).slice(0, 300)}`);
+    }
+    this.lastStatus = null;
     const first = await this.callNow({ cmd: "status" }, 20_000);
-    if (first.authorization !== "notDetermined") {
-      logger.info(`calendar: ${HELPER_NAME} authorization = ${String(first.authorization ?? first.error)}`);
+    const state = `calendar ${String(first.authorization ?? first.error)}, reminders ${String(first.reminders ?? "(old build)")}`;
+    const calendar = force && first.authorization === "notDetermined";
+    const reminders = force && first.reminders === "notDetermined" && first.alarms !== "unsupported";
+    if (!calendar && !reminders) {
+      logger.info(`calendar: ${HELPER_NAME} authorization = ${state}`);
       return;
     }
-    const recent = shared.lastPromptAt !== undefined && Date.now() - shared.lastPromptAt < PROMPT_BACKOFF_MS;
-    if (recent && !force) return;
-    logger.info(`calendar: asking for calendar access (a prompt for ${HELPER_NAME} is on the Mac's screen)`);
-    shared.promptOpen = true;
-    shared.lastPromptAt = Date.now();
+    logger.info(`calendar: asking for access (${Number(calendar) + Number(reminders)} prompt(s) for ${HELPER_NAME} on the Mac's screen)`);
+    // Outside the queue, one prompt per launch: while one is up, what needs it
+    // answers "waiting" (call above), and the calendar is free again as soon
+    // as its own prompt is answered.
+    setPending({ calendar, reminders });
     try {
-      // Outside the queue: reads and writes answer "not authorized" meanwhile.
-      const res = await this.callNow({ cmd: "request", waitSeconds: 120 }, 150_000);
-      shared.lastPromptResult = String(res.authorization ?? res.error);
-      logger.info(`calendar: authorization after the prompt = ${shared.lastPromptResult}`);
+      if (calendar) {
+        const res = await this.callNow({ cmd: "request", calendar: true, reminders: false, waitSeconds: 120 }, 140_000);
+        logger.info(`calendar: calendar access after the prompt = ${String(res.authorization ?? res.error)}`);
+        setPending({ calendar: false, reminders });
+        this.lastStatus = null;
+      }
+      if (reminders) {
+        const res = await this.callNow({ cmd: "request", calendar: false, reminders: true, waitSeconds: 120 }, 140_000);
+        logger.info(`calendar: reminders access after the prompt = ${String(res.reminders ?? res.error)}`);
+      }
     } finally {
-      shared.promptOpen = false;
+      setPending(undefined);
       this.lastStatus = null;
     }
+  }
+
+  /**
+   * What 一键授权 would do right now: build or update the helper, which
+   * prompts go up, and what only System Settings can fix. One fresh look at
+   * the helper (no prompt).
+   */
+  async authorizePlan(): Promise<AuthorizePlan> {
+    if (!this.hasApp) {
+      // Urgent reminders came with macOS 26 (Darwin 25): before it there are no alarms, so no Reminders prompt.
+      const alarmsUnsupported = Number(os.release().split(".")[0]) < 25;
+      return { build: "first", ask: alarmsUnsupported ? ["calendar"] : ["calendar", "reminders"], denied: [], ...(alarmsUnsupported ? { alarmsUnsupported } : {}) };
+    }
+    const res = await this.call({ cmd: "status" }, 20_000);
+    if (res.ok !== true) return { ask: [], denied: [], error: String(res.error ?? res.code ?? "没有回应") };
+    const alarmsUnsupported = res.alarms === "unsupported";
+    // Only an older build is replaced (see prepareNow): a new build starts both permissions over.
+    if (this.isStale() && (typeof res.protocol === "number" ? res.protocol : 1) < HELPER_PROTOCOL) {
+      // A new build is a new app to macOS: both start over, refusals included.
+      return { build: "update", ask: alarmsUnsupported ? ["calendar"] : ["calendar", "reminders"], denied: [], ...(alarmsUnsupported ? { alarmsUnsupported } : {}) };
+    }
+    const refused = (state: unknown): boolean => state === "denied" || state === "restricted" || state === "writeOnly";
+    const ask: AuthorizePlan["ask"] = [];
+    const denied: AuthorizePlan["denied"] = [];
+    if (res.authorization === "notDetermined") ask.push("calendar");
+    else if (refused(res.authorization)) denied.push("calendar");
+    if (!alarmsUnsupported) {
+      if (res.reminders === "notDetermined") ask.push("reminders");
+      else if (refused(res.reminders)) denied.push("reminders");
+    }
+    return { ask, denied, ...(alarmsUnsupported ? { alarmsUnsupported } : {}) };
   }
 
   /** The dedicated calendar this plugin uses, or null before it was created or approved. */
@@ -356,15 +623,70 @@ export class CalendarHelper {
     fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(this.root, "dedicated.json"), JSON.stringify(record), { mode: 0o600 });
   }
+
+  /** The reminders list alarms go into, or null before the first alarm. */
+  alarmList(): AlarmListRecord | null {
+    try {
+      const rec = JSON.parse(fs.readFileSync(path.join(this.root, "alarm-list.json"), "utf-8")) as Partial<AlarmListRecord>;
+      return typeof rec.id === "string" && typeof rec.name === "string"
+        ? { name: rec.name, id: rec.id, account: typeof rec.account === "string" ? rec.account : "" }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  rememberAlarmList(record: AlarmListRecord): void {
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(this.root, "alarm-list.json"), JSON.stringify(record), { mode: 0o600 });
+  }
+
+  /** The alarms this plugin set (by id): the only ones it ever ticks off by itself. */
+  createdAlarms(): Set<string> {
+    try {
+      const ids = JSON.parse(fs.readFileSync(path.join(this.root, "alarms-created.json"), "utf-8")) as unknown;
+      return new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  rememberCreatedAlarm(id: string): void {
+    this.writeCreated([...this.createdAlarms(), id].slice(-1000));
+  }
+
+  forgetCreatedAlarms(ids: readonly string[]): void {
+    const gone = new Set(ids);
+    this.writeCreated([...this.createdAlarms()].filter((id) => !gone.has(id)));
+  }
+
+  private writeCreated(ids: readonly string[]): void {
+    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(this.root, "alarms-created.json"), JSON.stringify(ids), { mode: 0o600 });
+  }
 }
 
 export type CalendarStatus = {
   authorization: string;
+  /** Reminders (alarms): an EventKit state, or "outdated" for a build from before the alarms. */
+  reminders?: string;
+  protocol?: number;
   built: boolean;
+  /** Built from an older source: 一键授权 replaces it (and the permissions start over). */
+  stale?: boolean;
+  /** Older than what this plugin needs (HELPER_PROTOCOL): only then does the card ask for 一键授权. */
+  outdated?: boolean;
+  /** Whether urgent reminders exist on this macOS (a protocol-3 helper says). */
+  alarms?: "supported" | "unsupported";
+  /** Why the last update of an older helper failed (the old one still works). */
+  updateError?: string;
   prompting?: boolean;
+  /** Which prompts are on the Mac's screen now. */
+  waitingFor?: Array<"calendar" | "reminders">;
   calendars?: number;
   accounts?: number;
   dedicated?: { name: string; account: string };
+  alarmList?: { name: string; account: string };
   error?: string;
 };
 
@@ -376,8 +698,11 @@ export type OwnerAnswer =
   | { status: "no_owner" | "undelivered" | "timeout" | "stopped"; detail?: string };
 
 export type CalendarToolDeps = {
-  /** The LIVE config, read per call: the name, the alert settings and the allow list are hot fields. */
-  config: { macCalendarName: string; macCalendarAlert?: boolean; macCalendarAlertMinutes?: number; allowFrom?: string[] };
+  /** The LIVE config, read per call: the name, the alert and asking settings and the allow list are hot fields. */
+  config: {
+    macCalendarName: string; macCalendarAlert?: boolean; macCalendarAlertMinutes?: number; macCalendarAsk?: boolean;
+    allowFrom?: string[];
+  };
   getAccount: () => ResolvedWeixinAccount | null;
   /** Who the current turn answers (undefined for a web-UI turn of the bot's session). */
   activeSender: () => string | undefined;
@@ -393,6 +718,24 @@ type Handle = {
   notesTruncated: boolean;
 };
 const HANDLE_LIMIT = 2_000;
+
+/**
+ * Refuse anyone but the account owner — and everyone while friends are on the
+ * allow list: they share this one conversation, so whatever the calendar (or
+ * the alarm list) says would be in front of them.
+ */
+export function notOwnerReason(
+  deps: Pick<CalendarToolDeps, "config" | "getAccount" | "activeSender">,
+  what = "日历",
+): string | undefined {
+  const owner = deps.getAccount()?.userId;
+  if (owner === undefined || owner === "") return `不知道机主是谁（登录信息里没有用户 id），${what}工具不开放。重新扫码登录一次再试。`;
+  const others = (deps.config.allowFrom ?? []).filter((id) => id !== owner);
+  if (others.length > 0) return `白名单里还有别人，大家共用这一个对话，${what}内容会被看到，所以${what}工具不开放。`;
+  const sender = deps.activeSender();
+  if (sender !== undefined && sender !== owner) return `${what}只对机主开放，不能替别人查看或修改。`;
+  return undefined;
+}
 
 /** A yes on WeChat. Anything else is a no: silence must never write to someone's calendar. */
 export function isYes(reply: string | null): boolean {
@@ -477,29 +820,20 @@ export function registerCalendarTools(agentCtx: Context, deps: CalendarToolDeps)
     return rec !== null && rec.name === dedicatedName() ? rec.id : undefined;
   };
   const isDedicated = (calendarId: string): boolean => dedicatedId() === calendarId;
+  /** Whether a change to another calendar waits for the owner's yes (the default). */
+  const askFirst = (): boolean => deps.config.macCalendarAsk !== false;
 
-  /**
-   * Refuse anyone but the account owner — and everyone while friends are on the
-   * allow list: they share this one conversation, so whatever the calendar
-   * says would be in front of them.
-   */
-  const notOwner = (): string | undefined => {
-    const owner = deps.getAccount()?.userId;
-    if (owner === undefined || owner === "") return "不知道机主是谁（登录信息里没有用户 id），日历工具不开放。重新扫码登录一次再试。";
-    const others = (deps.config.allowFrom ?? []).filter((id) => id !== owner);
-    if (others.length > 0) return "白名单里还有别人，大家共用这一个对话，日历内容会被看到，所以日历工具不开放。";
-    const sender = deps.activeSender();
-    if (sender !== undefined && sender !== owner) return "日历只对机主开放，不能替别人查看或修改。";
-    return undefined;
-  };
+  const notOwner = (): string | undefined => notOwnerReason(deps);
 
   /** Turn a helper failure into a sentence the owner can act on. */
   const explain = (res: HelperResponse, writing = false): string => {
     if (res.code === "not_authorized") {
+      if (res.pending === true) {
+        return `正在等 Mac 上的授权：屏幕上有「${HELPER_NAME}」想要访问日历的窗口，点「允许」之后再试。`;
+      }
       if (res.error === "notDetermined") {
-        void deps.helper.prepare().catch((err: unknown) => logger.warn(`calendar: prepare failed: ${String(err).slice(0, 200)}`));
-        return `还没授权：Mac 屏幕上应该有「${HELPER_NAME}」想要访问日历的窗口，要在电脑前点「允许」`
-          + "（插件更新后小程序重新编译过的话，也要再点一次）。没看到就去 系统设置 → 隐私与安全性 → 日历 打开它。";
+        // No prompt from here: the owner may be far from the Mac, and a prompt nobody answers helps nobody.
+        return "还没授权日历：到 Mac 前，在设置卡片「全天候秘书」上点「一键授权」，在弹出的窗口里点「允许」。";
       }
       if (res.error === "writeOnly") return `「${HELPER_NAME}」只有「仅添加」权限，读不到日程：在 系统设置 → 隐私与安全性 → 日历 里改成完全访问。`;
       return `「${HELPER_NAME}」没有日历权限（${String(res.error)}）：在 Mac 的 系统设置 → 隐私与安全性 → 日历 里打开它。`;
@@ -547,7 +881,7 @@ export function registerCalendarTools(agentCtx: Context, deps: CalendarToolDeps)
    */
   const ensureDedicated = async (signal?: AbortSignal): Promise<{ calendar?: CalendarInfo; error?: string }> => {
     const name = dedicatedName();
-    if (name === "") return { error: "专用日历还没起名字：在设置卡片「Mac 日历」里填上再试。" };
+    if (name === "") return { error: "专用日历还没起名字：在设置卡片「全天候秘书」里填上再试。" };
     const known = dedicatedId();
     let res = await run({ cmd: "ensureCalendar", name, ...(known === undefined ? {} : { knownId: known }) }, signal);
     if (!res.ok && res.code === "name_taken") {
@@ -709,8 +1043,8 @@ export function registerCalendarTools(agentCtx: Context, deps: CalendarToolDeps)
         + "block, a meeting, an appointment, a trip) or when the owner asks for a calendar entry. "
         + "Without `calendar` it goes into the bot's own planning calendar "
         + "(named in the settings, created on first use): use that for the time blocks you plan, no need to ask. "
-        + "Naming any other calendar makes this tool ask the owner on WeChat and wait for their answer, so do not "
-        + "ask separately beforehand. It cannot invite anyone. The result lists events the new one overlaps. "
+        + "Another writable calendar can be named too; when the owner wants to be asked first, this tool asks on "
+        + "WeChat and waits by itself, so never ask separately beforehand. It cannot invite anyone. The result lists events the new one overlaps. "
         + "A calendar alert is added as set in the settings; pass `alert` only when the owner asked for a specific one. "
         + "It does not replace your WeChat reminder: for a to-do the owner should be reminded "
         + "of, still create one with schedule_create; both firing is fine.",
@@ -755,7 +1089,7 @@ export function registerCalendarTools(agentCtx: Context, deps: CalendarToolDeps)
           if (!found.calendar.writable) return { ok: false, summary: `「${found.calendar.title}」是只读日历，加不进去。` };
           target = found.calendar;
         }
-        if (!isDedicated(target.id)) {
+        if (!isDedicated(target.id) && askFirst()) {
           const span = a.end ? `${a.start} 到 ${a.end}` : String(a.start);
           const ok = await ask(`要把「${title}」（${span}${a.all_day ? "，全天" : ""}）加到你的「${target.title}」日历（${target.account || "本机"}）吗？`, exec?.signal);
           if (!ok.ok) return { ok: false, summary: `${ok.why}。` };
@@ -786,8 +1120,9 @@ export function registerCalendarTools(agentCtx: Context, deps: CalendarToolDeps)
       name: "calendar_change_event",
       description:
         "Move, edit or delete one event, named by its handle (#e…) from calendar_events or calendar_add_event. "
-        + "Events in the bot's own planning calendar are changed directly. For any other calendar this tool asks "
-        + "the owner on WeChat first and waits, so do not ask separately. A recurring event changes only this "
+        + "Events in the bot's own planning calendar are changed directly. For other calendars this tool itself asks "
+        + "the owner on WeChat and waits when that is needed (as the owner set it, or when other attendees would be "
+        + "told), so never ask separately. A recurring event changes only this "
         + "occurrence; scope \"future\" changes this and every later one — use it only when the owner said so. "
         + "A timed event stays timed and an all-day one stays all-day unless all_day says otherwise.",
       parameters: {
@@ -859,7 +1194,8 @@ export function registerCalendarTools(agentCtx: Context, deps: CalendarToolDeps)
         }
         const label = `「${h.calendar}」日历里的「${h.title}」（${when(h.start, h.end, h.allDay)}）`;
         const touchesOthers = !isDedicated(h.calendarId) || (move !== undefined && !isDedicated(move.id));
-        if (touchesOthers) {
+        // With asking switched off, a change other attendees would be told about still asks.
+        if (touchesOthers && (askFirst() || h.attendees > 0)) {
           const reach = future ? "（这是重复日程：会连同之后的每一次一起" + (action === "delete" ? "删掉）" : "改）") : (h.recurring ? "（只这一次）" : "");
           const people = h.attendees > 0
             ? `这个日程有 ${h.attendees} 位参与者，${action === "delete" ? "删掉" : "改动"}可能会通知他们${h.organizerIsMe ? "" : "（你不是组织者）"}。`
@@ -928,7 +1264,8 @@ export const CALENDAR_STATUS_PATH = "/plugins/clawbot/calendar/status";
  */
 export function registerCalendarStatusRoute(
   ctx: Context,
-  read: () => { enabled: boolean; name: string; others: number; secretary: boolean },
+  /** `secretary`: the rules are in memory.md; `secretaryOn`: their switch is on in the config. */
+  read: () => { enabled: boolean; name: string; others: number; secretary: boolean; secretaryOn: boolean },
   helper: CalendarHelper,
 ): void {
   ctx.inject(["webServer"], (scoped) => {
@@ -938,10 +1275,20 @@ export function registerCalendarStatusRoute(
         server.register({
           kind: "exact",
           path: CALENDAR_STATUS_PATH,
-          async handler(_req: IncomingMessage, res: ServerResponse) {
-            const { enabled, name, others, secretary } = read();
+          async handler(req: IncomingMessage, res: ServerResponse) {
+            // Names and counts, and every look launches the helper: this machine's page only (DNS rebinding).
+            if (!localRequest(req)) {
+              res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+              res.end(JSON.stringify({ ok: false, message: "只接受本机设置卡片的请求" }));
+              return;
+            }
+            const { enabled, name, others, secretary, secretaryOn } = read();
             const mac = process.platform === "darwin";
-            const body: Record<string, unknown> = { ok: true, platform: process.platform, mac, enabled, name, others, secretary, helper: HELPER_NAME };
+            const body: Record<string, unknown> = {
+              ok: true, platform: process.platform, mac, enabled, name, others, secretary, secretaryOn, helper: HELPER_NAME,
+              // What 一键授权 brings the helper up to, and whether a round of prompts is under way now.
+              wantProtocol: HELPER_PROTOCOL, preparing: helper.preparing,
+            };
             if (mac && enabled) Object.assign(body, await helper.status());
             res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
             res.end(JSON.stringify(body));

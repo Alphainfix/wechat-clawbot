@@ -27,13 +27,14 @@ import { registerModelsRoute } from "./models-route.js";
 import { registerMcpRoutes } from "./mcp-route.js";
 import { registerOwnerNotifyTool } from "./owner-notify.js";
 import { CalendarHelper, HELPER_NAME, registerCalendarStatusRoute } from "./mac-calendar.js";
+import { AlarmService, registerCardRoutes } from "./mac-alarms.js";
 import { CodexPeer } from "./codex-peer.js";
 import { claimInstance } from "./instance-guard.js";
 import { CodexProgressStore } from "./codex-progress.js";
 import { Backlog } from "./backlog.js";
 import { uploadFileTo } from "./tool.js";
 import { ensureMemoryFile } from "./memory.js";
-import { addSecretaryRules, hasSecretaryRules, registerMemoryOpenRoute, removeSecretaryRules } from "./secretary.js";
+import { addSecretaryRules, hasSecretaryRules, registerMemoryOpenRoute, removeSecretaryRules, upgradeSecretaryRules } from "./secretary.js";
 import { isHostSchedule, migrateLegacyReminders, type HostSchedule } from "./schedule-migrate.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import {
@@ -125,11 +126,15 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     if (toolSwitches.length > 0 && !superseded) {
       if (hot.includes("codexPeer") && config.codexPeer !== true) codexPeer.close();
       void (async () => {
+        // Overlapping restarts share one stop (stopMonitor), then the first start
+        // wins; it reads the config as it is by then, every flip included.
         await stopMonitor(`工具开关变了 [${toolSwitches.join(", ")}]`);
         if (!superseded) startMonitor();
-        if (hot.includes("macCalendar") && config.macCalendar === true && process.platform === "darwin") {
+        if (hot.includes("macCalendar") && config.macCalendar === true && process.platform === "darwin" && !superseded) {
           // The owner is at the settings card right now: put the permission prompt up.
-          await calendarHelper.prepare(true);
+          // Its own catch: a failed build is not a failed listener restart.
+          void calendarHelper.prepare(true).catch((err: unknown) =>
+            logger.warn(`calendar: could not prepare ${HELPER_NAME}: ${String((err as Error).message ?? err).slice(0, 300)}`));
         }
       })().catch((err: unknown) => logger.warn(`重启微信监听失败: ${String((err as Error).message ?? err).slice(0, 200)}`));
     }
@@ -195,13 +200,15 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // dynamic memory section (registered above, order 79) has content to inject.
   ensureMemoryFile();
   // The secretary switched on but its rules missing (first start after the
-  // switch was set in the config file): put them in. Switched off, nothing is
-  // removed here — only flipping the switch does that.
-  if (secretaryActive() && !hasSecretaryRules()) {
+  // switch was set in the config file): put them in; present but still an
+  // earlier default word for word: bring them up to date. Switched off,
+  // nothing is removed here — only flipping the switch does that.
+  if (secretaryActive()) {
     try {
-      addSecretaryRules();
+      if (!hasSecretaryRules()) addSecretaryRules();
+      else upgradeSecretaryRules();
     } catch (err) {
-      logger.warn(`secretary: could not add the rules to memory.md: ${String((err as Error).message ?? err).slice(0, 200)}`);
+      logger.warn(`secretary: could not update the rules in memory.md: ${String((err as Error).message ?? err).slice(0, 200)}`);
     }
   }
 
@@ -231,9 +238,12 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   const backlog = new Backlog();
   /** The macOS Calendar helper (mac-calendar.ts); built and asked for permission only when switched on. */
   const calendarHelper = new CalendarHelper();
+  /** Alarms (urgent reminders) in the list named after the bot's calendar; part of 全天候秘书. */
+  const alarms = new AlarmService(calendarHelper, () => config.macCalendarName);
   if (config.macCalendar === true && process.platform === "darwin") {
-    // Switching it on restarts this fiber, so this is where the permission
-    // prompt gets put on screen — while the owner is still at the settings card.
+    // Build the helper if it is missing and log its state — no prompt: a start
+    // happens with nobody at the Mac (a crash, the menu-bar app, a 3 a.m.
+    // restart). The prompts come from the settings card (the switch, 一键授权).
     void calendarHelper.prepare().catch((err: unknown) =>
       logger.warn(`calendar: could not prepare ${HELPER_NAME}: ${String((err as Error).message ?? err).slice(0, 300)}`));
   }
@@ -339,9 +349,12 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     // Others on the allow list share the conversation: the calendar tools refuse then.
     others: (config.allowFrom ?? []).filter((id) => id !== currentAccount?.userId).length,
     secretary: hasSecretaryRules(),
+    secretaryOn: config.secretary === true,
   }), calendarHelper);
   // The card's "打开 memory.md" button (the secretary's rules live in that file).
   registerMemoryOpenRoute(ctx);
+  // The card's 一键授权 (every Mac permission, while the owner is at the Mac) and 测试闹钟.
+  registerCardRoutes(ctx, { helper: calendarHelper, alarms, enabled: () => config.macCalendar === true });
 
   /** Pick the first bound account (v1 supports a single account). */
   const pickAccount = (): ResolvedWeixinAccount | null => {
@@ -379,6 +392,7 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       pending,
       backlog,
       calendarHelper,
+      alarms,
       // A kept file goes through the same compression and CDN checks as send_wechat_file.
       sendFile: async (to, file) => {
         const bound = currentAccount;
@@ -447,23 +461,49 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     );
   };
 
-  /** Stop the monitor and release the agent handle (idempotent). */
-  const stopMonitor = async (reason: string): Promise<void> => {
-    if (!monitorTask) return;
-    logger.info(`stopMonitor: ${reason}`);
-    abort.abort();
-    try {
-      await monitorTask;
-    } catch (err) {
-      logger.warn(`stopMonitor: task error ${String(err)}`);
-    }
-    monitorTask = null;
-    warmSession = undefined;
-    await bridge?.dispose();
-    bridge = null;
-    router = null;
-    currentAccount = null;
-    pending.abortAll();
+  /** The stop under way: a second stop joins it, and nothing starts until it is done. */
+  let stopping: Promise<void> | null = null;
+
+  /**
+   * Stop the monitor and release the agent handle (idempotent).
+   *
+   * One at a time, and `monitorTask` stays set until the old bridge is fully
+   * disposed: two tool switches flipped in quick succession each restart the
+   * listener, and a start slipping in while the first stop still waited on
+   * the bridge used to be wiped by that stop's cleanup — the monitor kept
+   * polling with no bridge or router, so every message was lost until DSH
+   * restarted. (The old bridge has to release its tools before a new one
+   * registers the same names, so the two cannot overlap either.)
+   */
+  const stopMonitor = (reason: string): Promise<void> => {
+    if (stopping !== null) return stopping;
+    if (!monitorTask) return Promise.resolve();
+    const task = monitorTask;
+    stopping = (async () => {
+      logger.info(`stopMonitor: ${reason}`);
+      abort.abort();
+      // Nothing answers on WeChat from here on: a turn waiting on an approval or a question would
+      // keep the bridge's dispose, and this stop, waiting for ever.
+      pending.close();
+      try {
+        try {
+          await task;
+        } catch (err) {
+          logger.warn(`stopMonitor: task error ${String(err)}`);
+        }
+        warmSession = undefined;
+        await bridge?.dispose();
+      } finally {
+        monitorTask = null;
+        bridge = null;
+        router = null;
+        currentAccount = null;
+        pending.reopen();
+      }
+    })().finally(() => {
+      stopping = null;
+    });
+    return stopping;
   };
 
   // Approval questions for WeChat sessions arrive in WeChat.
@@ -496,6 +536,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     const ids = listIndexedWeixinAccountIds();
     if (ids.length === 0) {
       void stopMonitor("account removed (logout)");
+    } else if (stopping !== null) {
+      // A stop under way (a switch flipped): start once it is done, or a fresh login is dropped.
+      void stopping.then(() => { if (!monitorTask && !superseded) startMonitor(); });
     } else if (!monitorTask) {
       startMonitor();
     }

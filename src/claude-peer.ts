@@ -1,6 +1,6 @@
 /**
  * Tools that let the DSH agent see and poke the Claude Code sessions running on
- * this machine — the reverse of `dsh-mcp-bridge`, which points the other way.
+ * this machine — the reverse of the MCP routes (mcp-route.ts), which point the other way.
  *
  * ## Why the three tools use two completely different mechanisms
  *
@@ -192,8 +192,8 @@ const RESUME_TIMEOUT_MS = 300_000;
  * A bare `execFile("claude", …)` looks it up on PATH, and that is exactly what
  * broke: the harness runs under whatever node the menu-bar app picked — nvm's
  * NEWEST version — while `claude` happened to be installed under an OLDER one.
- * So the harness PATH carried `…/v24.19.0/bin` while the binary lived in
- * `…/v24.16.0/bin`, and every send failed with a bare "Command failed" that
+ * So the harness PATH carried the newer node's `bin` while the binary lived in
+ * the older one's, and every send failed with a bare "Command failed" that
  * named no reason.
  *
  * Same lesson as the whale's node discovery, from the other side: on a machine
@@ -428,8 +428,8 @@ const META_TAIL_RETRY_BYTES = 512 * 1024;
  * Cheap metadata for a transcript, without parsing the whole thing.
  *
  * `readTail` reads the file WHOLE — fine for the two or three live sessions,
- * hopeless here: this machine has 61 transcripts totalling 206MB, one of them
- * 62MB, and the roster is rebuilt on every resolve. So the dormant scan reads
+ * hopeless here: a machine easily keeps dozens of transcripts and hundreds of
+ * MB, single ones of tens of MB, and the roster is rebuilt on every resolve. So the dormant scan reads
  * only the last 64KB and takes what happens to be in it.
  *
  * The first line of that window is almost always a fragment, so it is dropped.
@@ -836,13 +836,13 @@ function resolve(handle: string): { session?: PeerSession; error?: string } {
   );
   // Then the TITLE, as a substring. Titles are the stable handle here: derived
   // names churn (one session went proj-96 → proj-35 → proj-ef → claude-44 →
-  // claude-90 inside a day) while a title like "论文插件调试" keeps meaning the
+  // claude-90 inside a day) while a title like "插件调试" keeps meaning the
   // same conversation. It is also how a person refers to it.
   if (hits.length === 0) {
     hits = all.filter((c) => (c.title ?? "").toLowerCase().includes(needle));
   }
   // Then the directory. A closed session is usually remembered by its project
-  // ("那个 Zotero 的"), and a dormant entry often has no name at all.
+  // ("那个网站项目的"), and a dormant entry often has no name at all.
   if (hits.length === 0) {
     hits = all.filter((c) => (c.session.cwd ?? "").toLowerCase().includes(needle));
   }
@@ -1518,7 +1518,7 @@ async function reviveAndSend(
     // STDOUT as well as stderr. This file already knew that `claude` reports
     // authentication on stdout, and the auth check above reads both — then this
     // block was written reading stderr only, and on 2026-09-09 it cost a whole
-    // morning: two resumes into the Zotero session failed and the only thing
+    // morning: two resumes into one session failed and the only thing
     // reported to WeChat was "exit=1". The actual reason was sitting on stdout:
     //   API Error: 400 Claude Code 2.1.246 does not support this model;
     //   version 2.1.251 or newer is required. Run 'claude update' …
@@ -1584,7 +1584,7 @@ export function registerClaudePeerTools(
       async execute() {
         const sessions = listSessions();
         // Closed sessions are listed too, because they are reachable: see
-        // `listDormant`. Without them the answer to "message my Zotero session"
+        // `listDormant`. Without them the answer to "message my website session"
         // was "there are none" whenever the user had closed their terminal.
         const dormant = listDormant(new Set(sessions.map((s) => s.sessionId)));
         if (sessions.length === 0 && dormant.length === 0) {
@@ -1657,7 +1657,7 @@ export function registerClaudePeerTools(
           required: true,
           description:
             "Any of: the session name (e.g. 'claude-90'), a session-id prefix, "
-            + "or a word from its title (e.g. 'Zotero'). Titles are the most reliable — "
+            + "or a word from its title (e.g. 'website'). Titles are the most reliable — "
             + "names are derived and change while a session runs. A handle that matches "
             + "nothing, or more than one, comes back with the full current roster so you "
             + "can pick without calling list_claude_sessions first.",
@@ -1737,7 +1737,7 @@ export function registerClaudePeerTools(
           required: true,
           description:
             "Any of: the session name (e.g. 'claude-90'), a session-id prefix, "
-            + "or a word from its title (e.g. 'Zotero'). Titles are the most reliable — "
+            + "or a word from its title (e.g. 'website'). Titles are the most reliable — "
             + "names are derived and change while a session runs. A handle that matches "
             + "nothing, or more than one, comes back with the full current roster so you "
             + "can pick without calling list_claude_sessions first.",

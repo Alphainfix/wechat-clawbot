@@ -246,8 +246,8 @@ check("the send has a timeout",
 
 // The binary is DISCOVERED, never taken from PATH. This is the bug that took
 // the feature down in production: the harness ran under nvm's newest node
-// (v24.19.0, chosen by the menu-bar app) while `claude` was installed under an
-// older one (v24.16.0), so PATH did not contain it and every send failed with a
+// (chosen by the menu-bar app) while `claude` was installed under an older
+// one, so PATH did not contain it and every send failed with a
 // bare "Command failed" naming no cause.
 check("the claude binary is resolved, not looked up on PATH",
   /findClaude\(\)/.test(src) && !/run\(\s*"claude"/.test(src),
@@ -509,11 +509,11 @@ check("a stale CLI is named as such, with the fix",
 check("a resume gets a longer ceiling than a relay",
   /RESUME_TIMEOUT_MS = 300_000/.test(src) && /RESUME_TIMEOUT_MS\)/.test(src),
   "replaying a long transcript takes minutes; the relay's 120s would call that a failure");
-// The dormant scan must not read whole transcripts: this machine has 61 of
-// them totalling 206MB, one 62MB, and the roster is rebuilt on every resolve.
+// The dormant scan must not read whole transcripts: a machine easily keeps
+// dozens of them, hundreds of MB in all, and the roster is rebuilt on every resolve.
 check("the dormant scan reads only a tail, not whole transcripts",
   /META_TAIL_BYTES = 64 \* 1024/.test(src) && /fs\.readSync\(/.test(src),
-  "readTail reads the file whole — fine for 2 live sessions, hopeless for 206MB");
+  "readTail reads the file whole — fine for 2 live sessions, hopeless for hundreds of MB");
 check("the dormant list is capped and newest-first",
   /DORMANT_LIMIT = 8/.test(src) && /found\.sort\(\(a, b\) => b\.mtime - a\.mtime\)/.test(src));
 // A closed session reported as running would be sent to over the socket, which

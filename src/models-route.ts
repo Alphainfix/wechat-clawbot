@@ -7,7 +7,7 @@
  * registered adapters and provider config), and the browser has no way to ask
  * for them: the client-side `modelDirectories` service reports the *current*
  * selection for a session, not the catalogue. So the plugin publishes what it
- * knows, the same way `dsh-balance-sidebar` publishes `/api/model-balance`.
+ * knows, on a route of its own.
  *
  * Everything here is name/metadata only — no keys, no endpoints, no counts.
  */

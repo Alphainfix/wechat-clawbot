@@ -55,7 +55,7 @@ function pickSection(text: string): string {
 
 /**
  * A specific, one-off occasion: a relative day, or a clock time / countdown.
- * Recurring markers (每天 / 每周三) are deliberately absent — "每周三下午有组会"
+ * Recurring markers (每天 / 每周三) are deliberately absent — "每周三下午有例会"
  * is a durable fact.
  */
 const ONE_OFF_TIME =
@@ -86,8 +86,8 @@ function mightContainFact(text: string): boolean {
   // Use specific patterns, not bare single characters (是/在/叫 alone are
   // too broad: "那是什么", "在吗", "你叫什么" would all false-positive).
   // 「我」和动词之间允许一个语气副词。要求紧挨着会漏掉很自然的说法:
-  // 2026-09-22 实测「你知道吗,我**其实**可以吃肉桂」整条被挡掉,而
-  // 「我可以吃肉桂」能过 —— 差别只有那两个字。用显式副词表而不是通配的
+  // 实测「你知道吗,我**其实**可以吃辣」整条被挡掉,而
+  // 「我可以吃辣」能过 —— 差别只有那两个字。用显式副词表而不是通配的
   // `我.{0,3}`,后者会把「我们公司可以」这种也放进来。
   const ADV = "(?:其实|真的|确实|平常|一向|向来|从来|基本|大概|可能|也|都|还|就|才|只|挺|很|比较|不太)?";
   return new RegExp(
@@ -114,7 +114,7 @@ function judgePrompt(cleaned: string): string {
     `标准:一个月后这条还成立吗?不成立就不记。` +
     `忽略:一次性任务请求、问候、闲聊、对当前对话内容的指代;` +
     `**以及一次性的提醒和安排**(某个时间点要做的事、今天/明天/几点的计划)——那些由定时提醒功能处理,不进长期记忆。` +
-    `固定的周期性安排(如"每周三下午组会")算长期事实,可以记。\n\n` +
+    `固定的周期性安排(如"每周三下午例会")算长期事实,可以记。\n\n` +
     `消息: ${cleaned}\n\n` +
     `如果值得记住,输出一行 JSON: {"section": "基本档案|偏好与习惯|重要事实", "fact": "一句简洁的中文事实,第三人称描述用户,不要带今天/明天这类相对时间"}\n` +
     `如果不值得记住,输出: null\n` +
