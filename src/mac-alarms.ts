@@ -234,7 +234,7 @@ export class AlarmService {
       return `Mac 上的「${HELPER_NAME}」还是旧版，没有闹钟功能：到 Mac 前在设置卡片「全天候秘书」上点「一键授权」更新它（会再弹出两次授权，都点「允许」）。`;
     }
     if (code === "reminderkit_missing") {
-      return `这台 Mac 的「提醒事项」没有紧急提醒（要 macOS 26 或更新；系统更新后也可能变了），闹钟用不了；日历不受影响。${error ? `（${error}）` : ""}`;
+      return `这台 Mac 的「提醒事项」没有紧急提醒（要 macOS 26.2 或更新；也可能是系统更新改了接口），闹钟用不了；日历不受影响。${error ? `（${error}）` : ""}`;
     }
     if (code === "no_icloud") return "「提醒事项」里没有登录 iCloud：闹钟要靠 iCloud 才能到 iPhone 上响。";
     if (code === "no_urgent") return "这个 iCloud 账户不支持紧急提醒，闹钟设不了。";
@@ -436,8 +436,9 @@ export function registerAlarmTools(agentCtx: Context, deps: AlarmToolDeps): void
         + "time goes in the calendar. The same time with the same title is never set twice (it answers that it is already "
         + "set), so retrying, or a routine that plans alarms, can simply set what it wants. To move an alarm, set the new "
         + "time first, then cancel the old one. Say back the time it will ring, as the result gives it. If the owner says "
-        + "one did not ring: Reminders on that iPhone must be allowed to ring urgent reminders (it asks the first time a "
-        + "reminder is marked urgent there by hand), and Find My's My Location must be that iPhone.",
+        + "one did not ring: that iPhone must be on iOS 26.2 or later; Reminders there must be allowed to ring alarms "
+        + "(Settings → Apps → Reminders → Alarms; it also asks the first time a reminder is marked urgent there by hand); "
+        + "and Find My's My Location must be that iPhone.",
       parameters: {
         time: { type: "string", required: true, description: "When it rings: a date and a time of day in the owner's time zone, e.g. 2026-10-23 07:00." },
         title: { type: "string", description: "What it is for, shown when it rings, e.g. 起床. Default 闹钟." },
@@ -570,7 +571,8 @@ export function testAlarmTime(now: Date = new Date()): Date {
 
 /** What the test alarm says when it rings: what to check on the phone if it did not. */
 export const TEST_ALARM_NOTE = "像闹钟一样响了，就说明一切就绪，这条可以删掉。没响的话看 iPhone：①「设置 → 你的名字 → 查找 → 我的位置」"
-  + "要是这台 iPhone（紧急提醒只在这台设备上像闹钟一样响）；②在「提醒事项」里手动把一条提醒设成紧急一次，允许弹出的授权。";
+  + "要是这台 iPhone（紧急提醒只在这台设备上像闹钟一样响）；②「设置 → App → 提醒事项」里的「闹钟」要开着，没有这一项就在「提醒事项」里"
+  + "手动把一条提醒设成紧急一次，允许弹出的授权；③iPhone 要 iOS 26.2 或更新。";
 
 /** A test alarm at most this often: each one rings the owner's phone. */
 const TEST_ALARM_EVERY_MS = 60_000;

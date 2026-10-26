@@ -461,7 +461,7 @@ export const BaseConfig = Schema.object({
     .description("【改动会重启微信监听】Codex CLI 路径,留空自动查找"),
   macCalendar: Schema.boolean()
     .default(false)
-    .description("【全天候秘书】【改动会重启微信监听】让 bot 读取 Mac「日历」里所有账户的日程(含备注)、在专用日历里自主安排,并能设闹钟(紧急提醒:到点像闹钟一样响,响在「查找」里作为“我的位置”的设备上,一般是 iPhone)。仅 macOS,默认关;关着时不占 token。打开后在 Mac 前点设置卡片上的「一键授权」。设置卡片上的开关会连同 secretary 一起拨"),
+    .description("【全天候秘书】【改动会重启微信监听】让 bot 读取 Mac「日历」里所有账户的日程(含备注)、在专用日历里自主安排,并能设闹钟(紧急提醒,到点在「查找」里设为「我的位置」的设备上像闹钟一样响,一般是 iPhone)。排日程要 macOS 14 或更新,闹钟要 macOS 26.2 和 iOS 26.2 或更新。仅 macOS,默认关;关着时不占 token。打开时 Mac 上会弹出「日历」和「提醒事项」的授权,要在 Mac 前点「允许」;没弹出或之后要补,点设置卡片上的「一键授权」。设置卡片上的开关会连同 secretary 一起拨"),
   macCalendarName: Schema.string()
     .default("")
     .description("bot 专用日历的名字(例如「规划」)。bot 在这个日历里自主加、改、删;动别的日历前问不问你,看「改别的日历前先问我」。第一次用到时自动创建。闹钟清单第一次设闹钟时按它起名(「规划 闹钟」),之后改名字也继续用那个清单(已经设的闹钟不会丢)"),

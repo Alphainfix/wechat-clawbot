@@ -257,10 +257,10 @@ window.__ModuleLoader__.load({
      * what has to be done before walking away from it.
      */
     function assistantHint(status, name, on) {
-      const base = "打开后，bot 能读取 Mac「日历」里所有账户的日程（含备注）、在专用日历里自主安排，"
-        + "能设闹钟（紧急提醒：到点像闹钟一样响，不靠微信），并把排日程、定闹钟的规则写进 memory.md 的"
-        + "「## 全天候秘书」一节（可以直接改）。仅 macOS，关着时不占 token。打开时（或之后点「一键授权」）Mac 上会弹出"
-        + "「日历」和「提醒事项」两个授权，要在 Mac 前点「允许」";
+      const base = "打开后，bot 能读 Mac「日历」里所有账户的日程（含备注），在专用日历里自己安排，还能设闹钟（紧急提醒，到点像闹钟一样响，不靠微信）。"
+        + "闹钟要 macOS 26.2 和 iOS 26.2 或更新。排日程、定闹钟的规则写在 memory.md 的「## 全天候秘书」一节，可以直接改。"
+        + "仅 macOS，关着时不占 token。打开时（或之后点「一键授权」）Mac 上会弹出「日历」和「提醒事项」两个授权"
+        + "（macOS 早于 26.2 时只有「日历」），要在 Mac 前点「允许」";
       if (status === null) return base;
       if (status.unreachable === true) return "状态读不到（路由没注册？DSH 可能需要重启）";
       if (status.mac === false) return "只支持 macOS";
@@ -288,7 +288,7 @@ window.__ModuleLoader__.load({
           + "（更新后「日历」「提醒事项」都要在 Mac 上再点一次「允许」，不在 Mac 前就先别点，日历会停到点了「允许」为止）");
       }
       lines.push(unsupported
-        ? `${grant(status.authorization, "日历", app)}；这台 Mac 的系统没有紧急提醒（要 macOS 26 或更新），闹钟用不了`
+        ? `${grant(status.authorization, "日历", app)}；这台 Mac 的系统没有紧急提醒（要 macOS 26.2 或更新），闹钟用不了`
         : `${grant(status.authorization, "日历", app)}；${grant(status.reminders, "提醒事项", app)}`);
       if (status.authorization === "fullAccess") {
         lines.push(status.dedicated && status.dedicated.name === name
@@ -311,7 +311,7 @@ window.__ModuleLoader__.load({
         && (unsupported || status.reminders === "fullAccess");
       if (ready && !unsupported) {
         lines.push("闹钟只在「查找」里作为“我的位置”的那台设备上像闹钟一样响（一般是 iPhone）；iPhone 上还要先在「提醒事项」里"
-          + "手动把一条提醒设成「紧急」一次、允许弹出的授权，闹钟才会响。点「测试闹钟」试响一次");
+          + "手动把一条提醒设成「紧急」一次、允许弹出的授权，闹钟才会响（之后在「设置 → App → 提醒事项」的「闹钟」里能看到它）。点「测试闹钟」试响一次");
       } else if (undecided) {
         lines.push("缺的授权到 Mac 前点「一键授权」补上；都允许之后点「测试闹钟」试响一次");
       }

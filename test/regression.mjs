@@ -3529,7 +3529,7 @@ function check(name, ok, detail) {
         /排日程的规则没开/.test(hint({ secretaryOn: false, secretary: false })) && !/没找到/.test(hint({ secretaryOn: false, secretary: false }))
         && /没找到「## 全天候秘书」一节/.test(hint({ secretary: false })));
       check("card words: where urgent reminders do not exist it says so, and asks for nothing more",
-        /没有紧急提醒（要 macOS 26 或更新）/.test(hint({ alarms: "unsupported", reminders: "notDetermined" }))
+        /没有紧急提醒（要 macOS 26\.2 或更新）/.test(hint({ alarms: "unsupported", reminders: "notDetermined" }))
         && !/一键授权/.test(hint({ alarms: "unsupported", reminders: "notDetermined" })));
       check("card words: the first compile, a prompt on screen, and a failed update each say what is going on",
         /第一次要编译/.test(hint({ preparing: true, built: false })) && /等你在 Mac 上点「允许」/.test(hint({ prompting: true, preparing: true }))
@@ -3612,10 +3612,14 @@ function check(name, ok, detail) {
       st.built === false && st.error === undefined && Date.now() - t0 < 2000 && !h.hasApp
         && !(existsSync(nRoot) && readdirSync(nRoot).some((n) => n.startsWith(".build-") || n.endsWith(".app"))), JSON.stringify(st));
     const plan = await h.authorizePlan();
-    const darwin = Number((await import("node:os")).release().split(".")[0]);
-    check("helper: the first-build plan asks for Reminders only where macOS has urgent reminders (26+, Darwin 25+)",
-      plan.build === "first" && plan.ask[0] === "calendar" && plan.ask.includes("reminders") === (darwin >= 25)
-        && (plan.alarmsUnsupported === true) === (darwin < 25), JSON.stringify(plan));
+    const [dMajor, dMinor] = (await import("node:os")).release().split(".").map(Number);
+    const urgent = dMajor > 25 || (dMajor === 25 && dMinor >= 2);
+    check("helper: the first-build plan asks for Reminders only where macOS has urgent reminders (26.2+, Darwin 25.2+)",
+      plan.build === "first" && plan.ask[0] === "calendar" && plan.ask.includes("reminders") === urgent
+        && (plan.alarmsUnsupported === true) === !urgent, JSON.stringify(plan));
+    check("requirements: urgent reminders are said to need macOS / iOS 26.2 (they came with the 26.2 updates, not 26.0)",
+      ["src/mac-alarms.ts", "src/client.js", "src/config.ts", "src/mac-calendar.ts"].every((f) => !/(macOS|iOS) 26 或更新|macOS 26 \(Darwin 25\)/.test(readFileSync(join(ROOT, f), "utf-8")))
+        && /要 macOS 26\.2 和 iOS 26\.2 或更新/.test(readFileSync(join(ROOT, "lib/client.js"), "utf-8")));
     rmSync(nRoot, { recursive: true, force: true });
   }
 

@@ -583,8 +583,9 @@ export class CalendarHelper {
    */
   async authorizePlan(): Promise<AuthorizePlan> {
     if (!this.hasApp) {
-      // Urgent reminders came with macOS 26 (Darwin 25): before it there are no alarms, so no Reminders prompt.
-      const alarmsUnsupported = Number(os.release().split(".")[0]) < 25;
+      // Urgent reminders came with macOS 26.2 (Darwin 25.2): before it there are no alarms, so no Reminders prompt.
+      const [major, minor] = os.release().split(".").map(Number);
+      const alarmsUnsupported = major < 25 || (major === 25 && minor < 2);
       return { build: "first", ask: alarmsUnsupported ? ["calendar"] : ["calendar", "reminders"], denied: [], ...(alarmsUnsupported ? { alarmsUnsupported } : {}) };
     }
     const res = await this.call({ cmd: "status" }, 20_000);
