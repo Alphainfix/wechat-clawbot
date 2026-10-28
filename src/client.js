@@ -64,7 +64,7 @@ window.__ModuleLoader__.load({
     })();
     const react = require("react");
     const h = react.createElement;
-    const { useState, useEffect } = react;
+    const { useState, useEffect, useRef } = react;
 
     /** Loader entry id; since DSH 0.1.7 also the settings form id. */
     const NAMESPACE = "clawbot";
@@ -77,6 +77,9 @@ window.__ModuleLoader__.load({
     const MEMORY_OPEN_URL = "/plugins/clawbot/memory/open";
     const AUTHORIZE_URL = "/plugins/clawbot/secretary/authorize";
     const TEST_ALARM_URL = "/plugins/clawbot/secretary/test-alarm";
+    const PERMISSIONS_URL = "/plugins/clawbot/permissions";
+    const PERMISSIONS_SETTINGS_URL = "/plugins/clawbot/permissions/open-settings";
+    const PERMISSIONS_REVEAL_URL = "/plugins/clawbot/permissions/reveal";
 
     const cls = (n) => `clawbot-${n}`;
     const S = {
@@ -87,7 +90,7 @@ window.__ModuleLoader__.load({
       reset: cls("reset"), input: cls("input"), area: cls("area"), hint: cls("hint"),
       switch: cls("switch"), switchOn: cls("switch-on"), knob: cls("knob"),
       footer: cls("footer"), note: cls("note"), button: cls("button"),
-      failed: cls("failed"), actions: cls("actions"),
+      failed: cls("failed"), actions: cls("actions"), attention: cls("attention"),
     };
 
     let stylesInjected = false;
@@ -174,6 +177,8 @@ window.__ModuleLoader__.load({
 .${S.button}:disabled { opacity: .4; cursor: default; }
 .${S.failed} { color: var(--dsw-alias-state-error-primary); font-size: 12px; line-height: 1.5; }
 .${S.actions} { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.${S.attention} { color: var(--dsw-alias-state-warn-label, var(--dsw-alias-state-warn-primary));
+  font-size: 12px; line-height: 1.5; }
 `;
       document.head.appendChild(el);
     }
@@ -219,6 +224,43 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * GET one of the card's status routes. With no answer to show it rejects
+     * with { status, message, platform }; status is missing when DSH was not
+     * reached at all, platform unless the route said which system DSH runs on.
+     */
+    function getStatus(url) {
+      return fetch(url, { headers: { accept: "application/json" } }).then(async (r) => {
+        const d = await r.json().catch(() => null);
+        if (r.ok && d && d.ok) return d;
+        throw {
+          status: r.status,
+          message: d && typeof d.message === "string" ? d.message : undefined,
+          platform: d && typeof d.platform === "string" ? d.platform : undefined,
+        };
+      });
+    }
+
+    /**
+     * What a status row keeps when getStatus has no answer (not `failed`: the card has a state by that name).
+     * `hostPlatform`: the system DSH runs on, when a refusal said so — kept apart from `platform`, which is an answer's.
+     */
+    function noAnswer(e) {
+      if (!e || typeof e.status !== "number") return { unreachable: true };
+      return { unreachable: true, status: e.status, message: e.message, ...(e.platform ? { hostPlatform: e.platform } : {}) };
+    }
+
+    /**
+     * A status row's words when there is no answer. 403 is not a missing route:
+     * these routes name programs and paths, so they answer only a page opened on
+     * DSH's own computer, and a restart changes nothing.
+     */
+    function unreachableText(s) {
+      if (s.status === 403) return "这一项只在运行 DSH 的那台电脑上能看（在那台电脑上用 127.0.0.1 打开这个页面）";
+      if (s.status >= 500 && s.message) return `状态读不到：${s.message}`;
+      return "状态读不到（路由没注册？DSH 可能需要重启）";
+    }
+
+    /**
      * What the bridge row says under its switch.
      *
      * The useful distinction is not on/off but *has Claude actually called in* —
@@ -228,7 +270,7 @@ window.__ModuleLoader__.load({
      */
     function bridgeHint(bridge) {
       if (bridge === null) return "读取状态…";
-      if (bridge.unreachable === true) return "状态读不到（路由没注册？DSH 可能需要重启）";
+      if (bridge.unreachable === true) return unreachableText(bridge);
       if (bridge.enabled !== true) return "已关闭：MCP 路由都返回 403。开关立刻生效，不用重启";
       if (bridge.tokenReady !== true) return `token 还没生成（${bridge.tokenPath}）`;
       const rejected = bridge.rejected > 0 ? `；另有 ${bridge.rejected} 次 token 不对被拒` : "";
@@ -243,8 +285,9 @@ window.__ModuleLoader__.load({
       switch (state) {
         case "fullAccess": return `${what}已授权`;
         case "notDetermined": return `${what}还没授权`;
-        case "denied": return `${what}被拒绝了（系统设置 → 隐私与安全性 → ${what} 里打开「${app}」）`;
-        case "writeOnly": return `${what}只有「仅添加」（系统设置 → 隐私与安全性 → ${what} 里改成完全访问）`;
+        // 隐私与安全: macOS 27's name, and the start of 隐私与安全性 (macOS 13–26).
+        case "denied": return `${what}被拒绝了（系统设置 → 隐私与安全 → ${what} 里打开「${app}」）`;
+        case "writeOnly": return `${what}只有「仅添加」（系统设置 → 隐私与安全 → ${what} 里改成完全访问）`;
         case "restricted": return `${what}被这台 Mac 的管理策略限制了`;
         case "outdated": return `${what}：要先更新小程序`;
         default: return `${what}：${state || "读取中"}`;
@@ -262,7 +305,7 @@ window.__ModuleLoader__.load({
         + "仅 macOS，关着时不占 token。打开时（或之后点「一键授权」）Mac 上会弹出「日历」和「提醒事项」两个授权"
         + "（macOS 早于 26.2 时只有「日历」），要在 Mac 前点「允许」";
       if (status === null) return base;
-      if (status.unreachable === true) return "状态读不到（路由没注册？DSH 可能需要重启）";
+      if (status.unreachable === true) return unreachableText(status);
       if (status.mac === false) return "只支持 macOS";
       if (!on) return name ? base : `先填专用日历的名字，再打开开关。${base}`;
       if (!name) return "先在上面填专用日历的名字（闹钟清单第一次也按它起名），bot 才能排日程、定闹钟";
@@ -332,10 +375,102 @@ window.__ModuleLoader__.load({
         parts.push(`小程序这次没有回应（${p.error}）：过一会儿再点一次「一键授权」`);
       }
       if ((p.denied || []).length > 0) {
-        parts.push(`${list(p.denied)}之前被拒绝了，只能在 系统设置 → 隐私与安全性 里打开「Clawbot-Calendar」`);
+        parts.push(`${list(p.denied)}之前被拒绝了，只能在 系统设置 → 隐私与安全 里打开「Clawbot-Calendar」`);
       }
       if (p.alarmsUnsupported) parts.push("这台 Mac 的系统没有紧急提醒，闹钟用不了（日历不受影响）");
       return parts.length > 0 ? parts.join("；") : "都已经授权了，不用再点";
+    }
+
+    /** Whether this page is open on the computer DSH runs on: the 电脑权限 buttons act on that computer. */
+    function onThisComputer() {
+      if (typeof location === "undefined" || location.protocol === "dsh-app:") return true;
+      const host = location.hostname;
+      return host === "localhost" || host === "[::1]" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+    }
+
+    /**
+     * How the card names what DSH's access is held against: 「终端」（Terminal）,
+     * 「DSH小鲸鱼」（DSHWhale.app） — Finder lists a bundle by its file name, which
+     * can differ from the app's own name — 「node」…, or null when it is not known.
+     */
+    function starterName(l) {
+      if (!l || l.kind === "unknown") return null;
+      if (l.kind !== "app") return `「${l.name}」`;
+      const file = (l.file || "").replace(/\.app$/, "");
+      const also = [];
+      if (l.localName) also.push(l.name);
+      if (file !== "" && file !== l.name && file !== l.localName) also.push(l.file);
+      return `「${l.localName || l.name}」${also.length > 0 ? `（${also.join("，")}）` : ""}`;
+    }
+
+    /** The name Finder shows for it, for the 在访达中显示 button. */
+    function finderName(l) {
+      if (l.kind !== "app") return l.name;
+      return l.localName || (l.file ? l.file.replace(/\.app$/, "") : l.name);
+    }
+
+    /**
+     * The 电脑权限 row. On a Mac the bot's file access belongs to whatever started
+     * DSH (or to DSH's own program), so the text names it; without Full Disk
+     * Access every protected folder puts a dialog on the Mac's screen, and the bot
+     * waits for someone to click. System Settings' words are quoted as they read
+     * in Chinese (「完全磁盘访问权限」, 「以后」).
+     */
+    function permissionHint(p, here) {
+      if (p === null) return "读取中…";
+      if (p.unreachable === true) return unreachableText(p);
+      const away = here ? "" : "。下面的按钮在运行 DSH 的那台电脑上打开";
+      if (p.platform === "win32") {
+        const base = "Windows 不用单独授权：bot 能读你能读的所有文件，不会弹窗问";
+        if (p.folderGuard !== "on") return base;
+        // Windows Security has used both names over the years; English too, in case it renames them again.
+        return `${base}。不过这台电脑开着「文件夹限制访问」（勒索软件防护，也叫「受控文件夹访问」，英文 Controlled folder access）：`
+          + "bot 在文档、图片、视频、音乐这些受保护的文件夹（桌面通常也在内）里新建、修改文件会被拦（读不受影响），"
+          + "Windows 安全中心会弹出「未经授权的更改被阻止」。"
+          + `被拦的主要是两个程序：DSH 自己的读写工具算 ${p.program}，bot 跑的命令算 PowerShell（装了 PowerShell 7 是 pwsh.exe，否则是 powershell.exe）；`
+          + "命令里再运行的其他程序也可能按它自己的名字被拦。"
+          + "要放行，点「打开 Windows 安全中心」→「通过文件夹限制访问允许某个应用」→「添加允许的应用」→「最近阻止的应用」，把列出的这些加进去"
+          + "（会弹出用户帐户控制，要管理员确认）；加好以后重启一次 DSH（桌面版退出再打开），DSH 自己的工具才放行。"
+          // DSH's own program is node.exe under `dsh web`, the app itself under DSH Desktop.
+          + `注意：放行 PowerShell 或 ${String(p.program || "node.exe").split(/[\\/]/).pop()}，等于让用它们运行的所有脚本都能改这些文件夹；`
+          + `不想放行，就让 bot 把文件存到别处（「下载」默认不受保护）${away}`;
+      }
+      if (p.platform !== "darwin") return "这台电脑不用单独授权";
+      const l = p.launcher || { kind: "unknown" };
+      const who = starterName(l);
+      const holder = l.kind === "program" && l.own ? ` DSH 自己的程序${who}` : `启动 DSH 的程序${who || ""}`;
+      const unsigned = l.signing === "adhoc" || l.signing === "unsigned";
+      const unstable = who !== null && unsigned ? `${who}没有正式签名：它每更新一次，macOS 就当它是新程序，要回这里再开一次` : null;
+      if (p.fullDisk === "granted") {
+        const lines = [`完全磁盘访问权限已开${who ? `（开给了${who}）` : ""}：bot 读下载、桌面、文稿、照片图库都不会再弹窗`];
+        if (p.fullDiskHere === "denied") lines.push("DSH 是在开之前启动的，它自己的读文件工具要重启一次 DSH 才用得上（bot 跑的命令已经可以了）");
+        if (unstable) lines.push(unstable);
+        return lines.join("。");
+      }
+      const lines = [p.fullDisk === "denied"
+        ? `还没开「完全磁盘访问权限」：macOS 把 bot 读文件的授权算在${holder}头上。没开时 bot 每进一个受保护的文件夹`
+          + "（下载、桌面、文稿、照片图库……），Mac 上都会弹窗，没人点「允许」它就一直卡着"
+        : `查不出「完全磁盘访问权限」开没开（探测没有得到回答）${who ? `；要开就开给${holder}` : ""}`];
+      const admin = "（要管理员确认一次：触控 ID 或登录密码）";
+      if (l.kind === "app") {
+        // "Quit & Reopen" on Terminal or DSH Desktop would take DSH down with it; the bot's
+        // commands are new processes and have the access at once, so 以后 (Later) is enough.
+        lines.push(`点「打开设置」，在列表里把它打开；列表里没有就点「+」添加，或者把访达里选中的它拖进去${admin}。`
+          + "提示「…将无法完全访问磁盘，直至退出」时点「以后」（英文系统是 Later），不要点「退出并重新打开」。开好后这里会自动变成「已开」");
+        if (!l.dsh) lines.push("注意：开了以后，在它里面运行的其他程序也都能读你的全部文件");
+        if (unstable) lines.push(unstable);
+      } else if (l.kind === "program") {
+        // The card's own probe leaves it in the list, switched off — next to any other node of the same name.
+        lines.push(`它是 ${l.path}${l.own ? "（macOS 没把它算在哪个 App 头上：DSH 由 launchd 直接运行，或者启动它的程序把授权交给了 DSH 自己，都是这样）" : ""}。`
+          + `点「打开设置」：列表里多半已经有一个关着的「${l.name}」（同名的可能不止一个，要的是这个路径），把它打开；`
+          + `没有就点「+」，按 ⌘⇧G 粘贴这个路径${admin}。`
+          + (unsigned ? "它没有正式签名，每更新一次都要回来重新开" : "换了版本、路径变了要重新开"));
+        lines.push(`注意：开了以后，不经过 App、直接用这个「${l.name}」运行的其他程序也都能读你的全部文件`);
+      } else {
+        lines.push(`没认出启动 DSH 的程序（${l.reason || "原因不明"}）：在终端里运行就给「终端」，用 DSH 桌面版就给「DeepSeek Harness」，`
+          + `用小鲸鱼就给「DSH小鲸鱼」（DSHWhale.app）${p.own ? `，由 launchd 直接运行就给 DSH 自己的程序 ${p.own}` : ""}。点「打开设置」去开`);
+      }
+      return lines.join("。") + away;
     }
 
     function Switch(props) {
@@ -370,6 +505,13 @@ window.__ModuleLoader__.load({
       const [action, setAction] = useState(null);
       // Bumped to look at the calendar status again at once (after 一键授权).
       const [poke, setPoke] = useState(0);
+      // The 电脑权限 row: what started DSH and whether it has Full Disk Access (macOS),
+      // or Controlled folder access (Windows). null until the first answer.
+      const [perm, setPerm] = useState(null);
+      // 打开设置 / 在访达中显示: { busy, text, at } while one runs and for a while after.
+      const [permAction, setPermAction] = useState(null);
+      // Set at the click itself: two clicks before React re-renders would both still see permAction idle.
+      const permPressing = useRef(false);
       // The switch, before the early return below: flipping it looks again at once
       // (the off state counts as settled, so the next look would be a minute away).
       const calendarOn = Boolean(state && state.value && state.value.macCalendar === true);
@@ -394,10 +536,9 @@ window.__ModuleLoader__.load({
         if (!open) return;
         let alive = true;
         const load = () => {
-          fetch(BRIDGE_URL, { headers: { accept: "application/json" } })
-            .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-            .then((d) => { if (alive && d && d.ok) setBridge(d); })
-            .catch(() => { if (alive) setBridge({ unreachable: true }); });
+          getStatus(BRIDGE_URL)
+            .then((d) => { if (alive) setBridge(d); })
+            .catch((e) => { if (alive) setBridge(noAnswer(e)); });
         };
         load();
         const timer = setInterval(load, 5000);
@@ -419,24 +560,74 @@ window.__ModuleLoader__.load({
             && d.preparing !== true && d.prompting !== true));
         const next = (d) => { if (alive) timer = setTimeout(tick, settled(d) ? 60000 : 10000); };
         const tick = () => {
-          fetch(CALENDAR_URL, { headers: { accept: "application/json" } })
-            .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+          getStatus(CALENDAR_URL)
             .then((d) => {
               if (!alive) return;
-              if (d && d.ok) {
-                setCalendar(d);
-                // 一键授权's answer describes a round: once that round is over, the live hint says the rest.
-                if (d.preparing !== true && d.prompting !== true) {
-                  setAction((a) => (a && !a.busy && a.kind === "authorize" && Date.now() - a.at > 3000 ? null : a));
-                }
+              setCalendar(d);
+              // 一键授权's answer describes a round: once that round is over, the live hint says the rest.
+              if (d.preparing !== true && d.prompting !== true) {
+                setAction((a) => (a && !a.busy && a.kind === "authorize" && Date.now() - a.at > 3000 ? null : a));
               }
-              next(d && d.ok ? d : null);
+              next(d);
             })
-            .catch(() => { if (alive) { setCalendar({ unreachable: true }); next(null); } });
+            .catch((e) => { if (alive) { setCalendar(noAnswer(e)); next(null); } });
         };
         tick();
         return () => { alive = false; if (timer) clearTimeout(timer); };
       }, [open, poke, calendarOn]);
+
+      // Full Disk Access is given in System Settings, outside this page. One look even
+      // while the card is folded (the header says when it is missing); while open, a
+      // look every few seconds until it is there, and whenever the window gets focus
+      // back — so the row turns 已开 by itself once the owner has switched it on.
+      useEffect(() => {
+        let alive = true;
+        let timer = null;
+        // The pace an answer calls for: every few seconds while Full Disk Access is missing, else a minute.
+        // A look that got nothing back (DSH restarting, a dropped connection) is tried again in a few
+        // seconds, so the row does not say 状态读不到 for a minute after DSH is back; a refusal (403:
+        // this page is not on DSH's computer) is an answer of its own and keeps the pace.
+        let waiting = false;
+        // Looks overlap (the timer and a focus); only an answer newer than the one shown counts.
+        let asked = 0;
+        let shown = 0;
+        const next = (d, retry) => {
+          if (!alive || !open) return;
+          if (timer !== null) clearTimeout(timer);
+          if (d !== null) waiting = d.platform === "darwin" && d.fullDisk !== "granted";
+          timer = setTimeout(tick, retry ? 5000 : waiting ? 4000 : 60000);
+        };
+        const tick = () => {
+          const n = ++asked;
+          const fresh = () => {
+            if (!alive || n <= shown) return false;
+            shown = n;
+            return true;
+          };
+          getStatus(PERMISSIONS_URL)
+            .then((d) => {
+              if (!fresh()) return;
+              setPerm(d);
+              // Done once it is there: what a button said is about the way there.
+              if (d.platform === "darwin" && d.fullDisk === "granted") setPermAction((a) => (a && !a.busy ? null : a));
+              next(d);
+            })
+            .catch((e) => {
+              if (!fresh()) return;
+              const lost = noAnswer(e);
+              setPerm(lost);
+              next(null, lost.status !== 403);
+            });
+        };
+        tick();
+        const onFocus = () => tick();
+        if (typeof window !== "undefined") window.addEventListener("focus", onFocus);
+        return () => {
+          alive = false;
+          if (timer !== null) clearTimeout(timer);
+          if (typeof window !== "undefined") window.removeEventListener("focus", onFocus);
+        };
+      }, [open]);
 
       // Follow the saved name again once it changes (a save landed, or 重置).
       const savedName = state && state.value ? (state.value.macCalendarName || "") : "";
@@ -504,6 +695,53 @@ window.__ModuleLoader__.load({
           ? `设上了（${d.at}），但没能设成紧急提醒，到点只会弹通知`
           : `已设：${d.at} 在「${d.list}」里响，看 iPhone 是不是像闹钟一样响（没响就看这条提醒的备注）`, "test");
 
+      /** 打开设置 / 在访达中显示: the card's own JSON POST; the answer shows under the row for a while. */
+      const pressPermission = async (url, done) => {
+        if (permPressing.current) return;
+        permPressing.current = true;
+        const at = Date.now();
+        setPermAction({ busy: true, text: "正在打开…", at });
+        let text;
+        try {
+          const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+          const d = await res.json().catch(() => null);
+          text = res.ok && d && d.ok ? done : ((d && d.message) || `没打开（HTTP ${res.status}）`);
+        } catch {
+          text = "没打开：路由读不到，DSH 可能需要重启";
+        } finally {
+          permPressing.current = false;
+        }
+        setPermAction({ busy: false, text, at });
+        setTimeout(() => setPermAction((a) => (a && a.at === at ? null : a)), 20000);
+      };
+      const permBusy = permAction !== null && permAction.busy;
+      const starter = perm !== null && perm.platform === "darwin" ? starterName(perm.launcher) : null;
+      const permButtons = [];
+      if (perm !== null && perm.platform === "darwin" && perm.fullDisk !== "granted") {
+        permButtons.push(h("button", {
+          key: "settings", type: "button", className: S.button, disabled: permBusy,
+          onClick: () => pressPermission(PERMISSIONS_SETTINGS_URL, "已打开「完全磁盘访问权限」那一页"),
+        }, "打开设置"));
+        if (starter !== null) {
+          const short = finderName(perm.launcher);
+          permButtons.push(h("button", {
+            key: "reveal", type: "button", className: S.button, disabled: permBusy,
+            onClick: () => pressPermission(PERMISSIONS_REVEAL_URL, `已在访达中选中「${short}」，把它拖进列表就行`),
+          }, `在访达中显示「${short}」`));
+        }
+      }
+      if (perm !== null && perm.platform === "win32" && perm.folderGuard === "on") {
+        permButtons.push(h("button", {
+          key: "settings", type: "button", className: S.button, disabled: permBusy,
+          onClick: () => pressPermission(PERMISSIONS_SETTINGS_URL, "已打开 Windows 安全中心的「勒索软件防护」"),
+        }, "打开 Windows 安全中心"));
+      }
+      // Nothing to do on other computers (Windows without Controlled folder access, Linux): no row. Nor on a
+      // page opened elsewhere when DSH's computer is not a Mac: a refusal cannot say whether Windows has
+      // Controlled folder access on (it is off unless turned on), and the other rows already say where to look.
+      const permRow = perm === null || perm.platform === "darwin" || (perm.platform === "win32" && perm.folderGuard === "on")
+        || (perm.unreachable === true && (perm.hostPlatform === undefined || perm.hostPlatform === "darwin"));
+
       const restartNow = async () => {
         if (restarting) return;
         setRestarting(true);
@@ -534,7 +772,19 @@ window.__ModuleLoader__.load({
         );
 
       const fields = [
-        // Model first: it is the setting whose default surprises people, because
+        // First, because it is what a new install trips over: on a Mac the bot's file
+        // access is held against whatever started DSH, and until that has Full Disk
+        // Access every protected folder brings up a dialog on the Mac's screen.
+        // The words first, then the buttons: they are steps to read before pressing.
+        // What a button answered shows only while there are buttons (nothing left to do, nothing to say).
+        permRow ? Field({
+          label: "电脑权限",
+          control: h("div", null,
+            h("p", { className: S.hint }, permissionHint(perm, onThisComputer())
+              + (permButtons.length > 0 && permAction !== null && permAction.text ? `（${permAction.text}）` : "")),
+            permButtons.length > 0 ? h("div", { className: S.actions }, permButtons) : null),
+        }) : null,
+        // Model next: it is the setting whose default surprises people, because
         // leaving it empty means the bot follows the deployment default — and the
         // web UI's model picker writes through to exactly that.
         Field({
@@ -870,6 +1120,10 @@ window.__ModuleLoader__.load({
             h("span", { className: S.name }, "微信 Bot"),
             h("span", { className: S.description },
               "模型、图片、白名单、全天候秘书（日历和闹钟）。大多改完立刻生效，微信连接不中断"),
+            // Shown folded: the one thing a new install has to do on the Mac itself (open, the row says it).
+            !open && perm !== null && perm.platform === "darwin" && perm.fullDisk === "denied"
+              ? h("span", { className: S.attention }, "还差一项电脑权限：完全磁盘访问权限（展开看怎么开）")
+              : null,
           ),
           h(
             "svg",

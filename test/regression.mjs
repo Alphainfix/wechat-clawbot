@@ -13,7 +13,7 @@
  *
  * Exits non-zero when any check fails, so it can gate a build.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, lstatSync, readdirSync, rmSync, symlinkSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, existsSync, unlinkSync, statSync, lstatSync, readdirSync, rmSync, symlinkSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -23,6 +23,11 @@ const ROOT = join(HERE, "..");
 // The fixtures are written for one time zone (dates and offsets at UTC−4/−5): pin it, so the
 // suite gives the same answers on any machine. Set before any of the plugin's modules load.
 process.env.TZ = "America/New_York";
+// The bot's state folder is a fresh one, never this machine's own ~/.dsh/clawbot: memory.md rides in
+// every prompt, so the prompt checks read the template a new install starts from, and nothing private
+// can make them pass or fail. Also set before the plugin's modules load; seeded once check() exists.
+const STATE = mkdtempSync(join(tmpdir(), "clawbot-regression-"));
+process.env.CLAWBOT_STATE_DIR = STATE;
 // The host these checks compare against. Used to be a hard-coded bucket, which
 // quietly kept testing 0.1.1-rc.2 through three upgrades. Now: the bucket whose
 // `.bin/dsh` is newest — the same rule the menu-bar whale boots by — or
@@ -53,6 +58,13 @@ const results = [];
 function check(name, ok, detail) {
   if (ok) { pass += 1; results.push(`  ✓ ${name}`); }
   else { fail += 1; results.push(`  ✗ ${name}${detail ? `\n      ${detail}` : ""}`); }
+}
+
+{
+  const { ensureMemoryFile, memoryFilePath } = await import(join(ROOT, "lib/memory.js"));
+  ensureMemoryFile();
+  check("the suite's state folder is its own, seeded with the template memory.md",
+    memoryFilePath() === join(STATE, "memory.md") && existsSync(memoryFilePath()), memoryFilePath());
 }
 
 // ---------------------------------------------------------------- emoji rules
@@ -2507,7 +2519,7 @@ function check(name, ok, detail) {
 
   authorization = "denied";
   const denied = await tools.get("calendar_events").execute({});
-  check("calendar: a refusal says where to turn it on", !denied.ok && /系统设置 → 隐私与安全性 → 日历/.test(denied.summary) && /Clawbot-Calendar/.test(denied.summary));
+  check("calendar: a refusal says where to turn it on", !denied.ok && /系统设置 → 隐私与安全 → 日历/.test(denied.summary) && /Clawbot-Calendar/.test(denied.summary));
   authorization = "notDetermined";
   before = calls.length;
   const undecided = await tools.get("calendar_events").execute({});
@@ -2805,7 +2817,7 @@ function check(name, ok, detail) {
   check("alarms: no Reminders permission yet: it points at 一键授权, at the Mac", !r.ok && /一键授权/.test(r.summary) && /Mac 前/.test(r.summary), r.summary);
   reminders = "denied";
   r = await set({ time: at(46, "07:00") });
-  check("alarms: a refused permission says where to turn it on", !r.ok && /隐私与安全性 → 提醒事项/.test(r.summary));
+  check("alarms: a refused permission says where to turn it on", !r.ok && /隐私与安全 → 提醒事项/.test(r.summary));
   reminders = "fullAccess";
   oldHelper = true;
   r = await set({ time: at(46, "07:00") });
@@ -3523,7 +3535,7 @@ function check(name, ok, detail) {
       check("card words: a newer source with the same protocol asks for nothing (no rebuild that would void two permissions)",
         !/一键授权/.test(hint({ stale: true, outdated: false })) && /点「测试闹钟」试响一次/.test(hint({ stale: true, outdated: false })));
       check("card words: a refusal points at System Settings, not at 一键授权 (it cannot undo one)",
-        /系统设置 → 隐私与安全性 → 提醒事项/.test(hint({ reminders: "denied" })) && !/一键授权/.test(hint({ reminders: "denied" })));
+        /系统设置 → 隐私与安全 → 提醒事项/.test(hint({ reminders: "denied" })) && !/一键授权/.test(hint({ reminders: "denied" })));
       check("card words: an undecided permission points at 一键授权, at the Mac", /到 Mac 前点「一键授权」补上/.test(hint({ reminders: "notDetermined" })));
       check("card words: the rules switched off in the config are said as such, not as a missing section",
         /排日程的规则没开/.test(hint({ secretaryOn: false, secretary: false })) && !/没找到/.test(hint({ secretaryOn: false, secretary: false }))
@@ -3568,6 +3580,20 @@ function check(name, ok, detail) {
   check("icon: it is under DSH's 256 KiB limit", existsSync(file) && statSync(file).size <= 256 * 1024);
   check("icon: it ships in the package, and DSH can read package.json through the exports",
     Array.isArray(pkgI.files) && pkgI.files.includes(icon.split("/")[0]) && pkgI.exports?.["./package.json"] === "./package.json");
+  // Release commits bump package.json; the version the plugin tells MCP clients and Codex sat at 1.1.0 for two releases.
+  {
+    const said = [["src/mcp-server.ts", /new McpServer\(\{ name: "wechat-clawbot", version: "([^"]+)" \}\)/], ["src/codex-rpc.ts", /title: "WeChat Clawbot", version: "([^"]+)" \}/]]
+      .map(([f, re]) => re.exec(readFileSync(join(ROOT, f), "utf-8"))?.[1]);
+    const install = readFileSync(join(ROOT, "wechat-clawbot-INSTALL.md"), "utf-8");
+    check("version: MCP serverInfo, Codex clientInfo and the INSTALL manual (适用版本, the pin) all say package.json's version",
+      said.every((v) => v === pkgI.version) && install.includes(`wechat-clawbot **${pkgI.version}**`) && install.includes(`\`wechat-clawbot@${pkgI.version}\``),
+      JSON.stringify({ package: pkgI.version, said }));
+  }
+  // tsc writes lib/<name>.d.ts next to each module; the manifest pointed into a lib/types/ that was never built.
+  const typeFiles = [pkgI.types, pkgI.exports?.["."]?.types, pkgI.exports?.["./cli"]?.types];
+  check("package.json: every types entry names a declaration file the build writes, in a folder that ships",
+    typeFiles.every((t) => typeof t === "string" && existsSync(join(ROOT, t)) && pkgI.files.includes(t.replace(/^\.\//, "").split("/")[0])),
+    JSON.stringify(typeFiles));
   const svg = existsSync(file) ? readFileSync(file, "utf-8") : "";
   check("icon: a standalone SVG (it is shown as an image: it needs its namespace, and has no script)",
     !/\.svg$/i.test(icon) || (/xmlns="http:\/\/www\.w3\.org\/2000\/svg"/.test(svg) && /viewBox="0 0 36 36"/.test(svg) && !/<script|on[a-z]+=/i.test(svg)));
@@ -3693,6 +3719,395 @@ function check(name, ok, detail) {
   }
 }
 
+// ------------------------------------------------- 电脑权限 (src/permissions.ts + the card row)
+{
+  const perm = await import(join(ROOT, "lib/permissions.js"));
+  const TERMINAL = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal";
+  const NODE = "/usr/local/bin/node";
+  // DSH's own program, as ownProgram() would say.
+  const OWN = "/opt/dsh/bin/node";
+  const rowsToTable = (rows) => perm.parseProcessTable(rows.map(([pid, ppid, cmd]) => `${String(pid).padStart(6)} ${String(ppid).padStart(6)} ${cmd}`).join("\n"));
+  const found = (rows, self, jobs = new Set()) => perm.findLauncher(rowsToTable(rows), self, jobs, OWN);
+
+  // What macOS itself says, asked first.
+  check("电脑权限: macOS is asked first — its answer is `<pid>\\t<program>`; anything else is no answer",
+    JSON.stringify(perm.parseResponsible("82870\t/Applications/DSHWhale.app/Contents/MacOS/DSHWhale"))
+      === JSON.stringify({ pid: 82870, path: "/Applications/DSHWhale.app/Contents/MacOS/DSHWhale" })
+      && perm.parseResponsible("5\t/Applications/小鲸鱼 2.app/Contents/MacOS/x")?.path === "/Applications/小鲸鱼 2.app/Contents/MacOS/x"
+      && perm.parseResponsible("") === undefined && perm.parseResponsible("0\t/x") === undefined
+      && perm.parseResponsible("12\tnode") === undefined && perm.parseResponsible("-e:1: NameError") === undefined);
+  check("电脑权限: the system's answer names the app whose program it is (the outermost bundle), or the program itself",
+    JSON.stringify(perm.fromResponsible("/Applications/DSHWhale.app/Contents/MacOS/DSHWhale")) === JSON.stringify({ kind: "app", path: "/Applications/DSHWhale.app" })
+      && perm.fromResponsible("/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper").path === "/Applications/Visual Studio Code.app"
+      && JSON.stringify(perm.fromResponsible("/opt/nvm/versions/node/v26/bin/node")) === JSON.stringify({ kind: "program", path: "/opt/nvm/versions/node/v26/bin/node" }));
+  if (process.platform === "darwin") {
+    // This test's own process: whatever the system holds it to (Terminal, an editor, an agent's app) has to exist.
+    const asked = await perm.askResponsible(perm.runProgram, process.pid);
+    const why = [];
+    const none = await perm.askResponsible(perm.runProgram, 999_999_999, (reason) => why.push(reason));
+    check("电脑权限: this Mac answers through the system's Ruby, without privileges: a responsible program that exists; a process that is not there has none, and says why",
+      asked !== undefined && asked.pid > 0 && existsSync(asked.path) && none === undefined && why.length === 1 && /^exit 2\b/.test(why[0]),
+      JSON.stringify({ asked, none, why }));
+    // A shell set up for a newer Ruby: 2.6 refuses -W:no-deprecated and prints its version ahead of the answer with -v.
+    const saved = { RUBYOPT: process.env.RUBYOPT, RUBYLIB: process.env.RUBYLIB };
+    const shadow = join(tmpdir(), `clawbot-rubylib-${process.pid}`);
+    mkdirSync(shadow, { recursive: true });
+    writeFileSync(join(shadow, "fiddle.rb"), "raise LoadError, 'not the system fiddle'\n");
+    const kept = [];
+    try {
+      for (const [opt, lib] of [["-W:no-deprecated", undefined], ["-v", undefined], [undefined, shadow]]) {
+        if (opt === undefined) delete process.env.RUBYOPT; else process.env.RUBYOPT = opt;
+        if (lib === undefined) delete process.env.RUBYLIB; else process.env.RUBYLIB = lib;
+        const a = await perm.askResponsible(perm.runProgram, process.pid);
+        kept.push(a !== undefined && a.path === asked?.path);
+      }
+    } finally {
+      for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      rmSync(shadow, { recursive: true, force: true });
+    }
+    check("电脑权限: the owner's Ruby settings (RUBYOPT -W:no-deprecated or -v, a RUBYLIB with its own fiddle) do not reach the system's Ruby",
+      kept.length === 3 && kept.every(Boolean), JSON.stringify(kept));
+  }
+  {
+    const seen = [];
+    const why = [];
+    const fake = (result) => async (cmd, args, timeoutMs, env) => { seen.push({ cmd, args, env }); return result; };
+    const saved = { RUBYOPT: process.env.RUBYOPT, RUBYLIB: process.env.RUBYLIB };
+    process.env.RUBYOPT = "--yjit";
+    process.env.RUBYLIB = "/tmp/elsewhere";
+    let answer;
+    try {
+      answer = await perm.askResponsible(fake({ code: 0, stdout: "7\t/Applications/X.app/Contents/MacOS/X", stderr: "" }), 1, (r) => why.push(r));
+      await perm.askResponsible(fake({ code: 1, stdout: "", stderr: "/usr/bin/ruby: invalid option --yjit  (-h will show valid options) (RuntimeError)\nmore" }), 1, (r) => why.push(r));
+      await perm.askResponsible(fake({ code: 0, stdout: "ruby 2.6.10p210\n7\t/x", stderr: "" }), 1, (r) => why.push(r));
+    } finally {
+      for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    check("电脑权限: the system's Ruby runs with the owner's Ruby settings left out and turned off; no answer says why (the first line only), an answer says nothing",
+      seen.length === 3 && seen.every((s) => s.cmd === "/usr/bin/ruby" && s.args[0] === "--disable=gems,rubyopt" && s.env !== undefined
+        && !("RUBYOPT" in s.env) && !("RUBYLIB" in s.env) && s.env.PATH === process.env.PATH)
+        && answer?.pid === 7 && why.length === 2 && why[0] === "exit 1: /usr/bin/ruby: invalid option --yjit  (-h will show valid options) (RuntimeError)"
+        && why[1] === "unexpected answer: ruby 2.6.10p210", JSON.stringify({ why, args: seen[0]?.args.slice(0, 2) }));
+  }
+
+  // The walk, for when the system cannot be asked.
+  check("电脑权限 (walk): `dsh web` typed into Terminal is Terminal's (login and the shell in between)",
+    JSON.stringify(found([[1, 0, "/sbin/launchd"], [500, 1, TERMINAL], [501, 500, "/usr/bin/login"], [502, 501, "-zsh"], [503, 502, NODE]], 503))
+      === JSON.stringify({ kind: "app", path: "/System/Applications/Utilities/Terminal.app" }));
+  check("电脑权限 (walk): VS Code's terminal is VS Code's, not its helper app's (the outermost bundle)",
+    found([[600, 1, "/Applications/Visual Studio Code.app/Contents/MacOS/Code"],
+      [601, 600, "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)"],
+      [602, 601, "/bin/zsh"], [603, 602, NODE]], 603).path === "/Applications/Visual Studio Code.app");
+  check("电脑权限 (walk): DSH Desktop's host is DSH Desktop's; the whale's DSH is the whale's",
+    found([[700, 1, "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness"],
+      [701, 700, "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/bin/node"]], 701).path === "/Applications/DeepSeek Harness.app"
+      && found([[800, 1, "/Applications/DSHWhale.app/Contents/MacOS/DSHWhale"], [801, 800, NODE]], 801).path === "/Applications/DSHWhale.app");
+  check("电脑权限 (walk): node from inside some app's bundle, typed into Terminal, is still Terminal's (DSH's own program is not looked at)",
+    found([[500, 1, TERMINAL], [502, 500, "/bin/zsh"], [503, 502, "/Applications/Other.app/Contents/Resources/node"]], 503).path
+      === "/System/Applications/Utilities/Terminal.app");
+  check("电脑权限 (walk): run by launchd — node itself, `#!/usr/bin/env node` (argv[0] is just `node`), or a system shell around it — is DSH's own program",
+    JSON.stringify(found([[900, 1, NODE]], 900, new Set([900]))) === JSON.stringify({ kind: "program", path: OWN })
+      && JSON.stringify(found([[900, 1, "node"]], 900, new Set([900]))) === JSON.stringify({ kind: "program", path: OWN })
+      && JSON.stringify(found([[910, 1, "/bin/zsh"], [911, 910, "node"]], 911, new Set([910]))) === JSON.stringify({ kind: "program", path: OWN }));
+  check("电脑权限 (walk): some other program run by launchd is that program; one without a full path is not known",
+    JSON.stringify(found([[920, 1, "/usr/local/bin/dsh-runner"], [921, 920, NODE]], 921, new Set([920]))) === JSON.stringify({ kind: "program", path: "/usr/local/bin/dsh-runner" })
+      && found([[930, 1, "dsh-runner"], [931, 930, NODE]], 931, new Set([930])).kind === "unknown");
+  {
+    const lost = found([[950, 1, "/opt/homebrew/bin/tmux"], [951, 950, "/bin/zsh"], [952, 951, NODE]], 952);
+    check("电脑权限 (walk): left behind (tmux, a restart, a starter that quit) it is not known, and the reason claims no more than that",
+      found([[901, 1, NODE]], 901).kind === "unknown" && lost.kind === "unknown" && /tmux/.test(lost.reason) && !/已经退出了$/.test(lost.reason)
+        && found([[10, 11, NODE], [11, 10, "/bin/zsh"]], 10).kind === "unknown" && found([], 5).kind === "unknown", lost.reason);
+  }
+  check("电脑权限: launchd's jobs come from `launchctl list` (running ones only)",
+    [...perm.parseLaunchdJobs("PID\tStatus\tLabel\n-\t0\tcom.example.idle\n82870\t0\tapplication.com.example.app.1.2\n864\t0\tcom.example.agent\n")]
+      .join(",") === "82870,864");
+  check("电脑权限: who signed it — the system (old and macOS 27 wording), the App Store, Developer ID, a local certificate, ad-hoc, nobody",
+    perm.parseSigning("Identifier=com.apple.Terminal\nPlatform identifier=27\nAuthority=macOS Software Signing\nAuthority=Apple Root CA\n") === "apple"
+      && perm.parseSigning("Authority=Software Signing\nAuthority=Apple Root CA") === "apple"
+      && perm.parseSigning("Authority=Apple Mac OS Application Signing\n") === "apple"
+      && perm.parseSigning("Authority=Developer ID Application: Example Corp (ABCDE12345)\nAuthority=Developer ID Certification Authority\n") === "developer"
+      && perm.parseSigning("Identifier=com.example.whale\nAuthority=Example Local Signing\nTeamIdentifier=not set\n") === "local"
+      && perm.parseSigning("Identifier=node\nSignature=adhoc\nTeamIdentifier=not set\n") === "adhoc"
+      && perm.parseSigning("/tmp/x: code object is not signed at all\n") === "unsigned"
+      && perm.parseSigning("") === "unknown");
+  {
+    const calls = [];
+    const runner = (ruby) => async (cmd, args) => {
+      calls.push([cmd, ...args].join(" "));
+      if (cmd === "/usr/bin/ruby") return ruby;
+      if (cmd === "/usr/bin/env") return { code: 0, stdout: `     1      0 /sbin/launchd\n   500      1 ${TERMINAL}\n  4242    500 ${NODE}\n`, stderr: "" };
+      if (cmd === "/bin/launchctl") return { code: 0, stdout: "PID\tStatus\tLabel\n500\t0\tapplication.com.apple.Terminal.1.2\n", stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    perm.resetPermissionCaches();
+    const sys = await perm.detectLauncher(runner({ code: 0, stdout: "82870\t/Applications/DSHWhale.app/Contents/MacOS/DSHWhale", stderr: "" }), 4242);
+    const treeUnread = calls.every((c) => !c.startsWith("/usr/bin/env") && !c.startsWith("/bin/launchctl"));
+    perm.resetPermissionCaches();
+    calls.length = 0;
+    const walked = await perm.detectLauncher(runner({ code: 1, stdout: "", stderr: "ruby: command not found" }), 4242);
+    check("电脑权限: the process tree is not read when macOS answers; without an answer the walk runs, with ps in a UTF-8 locale (an app's Chinese path)",
+      sys.kind === "app" && sys.path === "/Applications/DSHWhale.app" && sys.file === "DSHWhale.app" && sys.via === "system" && treeUnread
+        && walked.kind === "app" && walked.path === "/System/Applications/Utilities/Terminal.app" && walked.via === "walk"
+        && calls.includes("/usr/bin/env LC_ALL=en_US.UTF-8 /bin/ps -axo pid=,ppid=,comm="), JSON.stringify({ sys, walked, calls }));
+    perm.resetPermissionCaches();
+  }
+  {
+    // A starter in a folder that asks first: reading its bundle could put a dialog up as DSH starts, with nobody there.
+    const home = homedir();
+    const ran = [];
+    const record = async (cmd, args) => { ran.push([cmd, ...args].join(" ")); return { code: 0, stdout: "x\n", stderr: "" }; };
+    const built = await perm.describeLauncher({ kind: "app", path: join(home, "Documents/dsh-whale/build/DSHWhale.app") }, record, "system");
+    const node = await perm.describeLauncher({ kind: "program", path: join(home, "Downloads/node-v26/bin/node") }, record, "system", join(home, "Downloads/node-v26/bin/node"));
+    check("电脑权限: a starter in Desktop, Documents, Downloads, iCloud Drive, Pictures or on another disk is named by its file name, without reading it",
+      ran.length === 0 && built.kind === "app" && built.name === "DSHWhale" && built.file === "DSHWhale.app" && built.signing === "unknown" && built.dsh === true
+        && node.kind === "program" && node.name === "node" && node.own === true && node.signing === "unknown"
+        && ["Desktop/a.app", "Library/Mobile Documents/com~apple~CloudDocs/a.app", "Pictures/a.app"].every((p) => perm.inGuardedFolder(join(home, p), home))
+        && perm.inGuardedFolder("/Volumes/USB/a.app", home) && !perm.inGuardedFolder("/Applications/DSHWhale.app", home)
+        && !perm.inGuardedFolder(join(home, "DocumentsArchive/a.app"), home) && !perm.inGuardedFolder(join(home, "Library/Application Support/Claude/a.app"), home),
+      JSON.stringify({ ran, built, node }));
+  }
+
+  const answers = (pairs) => async (cmd, args) => {
+    const line = `${cmd} ${args.join(" ")}`;
+    for (const [part, result] of pairs) if (line.includes(part)) return result;
+    return { code: -1, stdout: "", stderr: "" };
+  };
+  const missing = { code: 1, stdout: "", stderr: "ls: x: No such file or directory\n" };
+  const blocked = { code: 1, stdout: "", stderr: "ls: x: Operation not permitted\n" };
+  const listed = { code: 0, stdout: "TCC.db\n", stderr: "" };
+  check("电脑权限: Full Disk Access — the first probe folder that answers decides; none answering is unknown",
+    await perm.probeFullDisk(answers([["/a", missing], ["/b", listed]]), ["/a", "/b"]) === "granted"
+      && await perm.probeFullDisk(answers([["/a", blocked], ["/b", listed]]), ["/a", "/b"]) === "denied"
+      && await perm.probeFullDisk(answers([["/a", missing], ["/b", missing]]), ["/a", "/b"]) === "unknown");
+  {
+    // A folder closed by its modes answers EACCES: not the system's refusal, so the next folder decides — as for the child's probe.
+    const dir = join(tmpdir(), `clawbot-permissions-${process.pid}`);
+    mkdirSync(join(dir, "closed"), { recursive: true });
+    mkdirSync(join(dir, "open"), { recursive: true });
+    chmodSync(join(dir, "closed"), 0o000);
+    const here = perm.probeFullDiskHere([join(dir, "closed"), join(dir, "open")]);
+    chmodSync(join(dir, "closed"), 0o700);
+    rmSync(dir, { recursive: true, force: true });
+    check("电脑权限: in DSH's own process only EPERM counts as refused", here === "granted", here);
+  }
+  check("电脑权限: the probes never touch a folder that brings up a dialog (Downloads, Desktop, Documents, Pictures, iCloud Drive)",
+    perm.fullDiskProbes("/h").length > 0 && perm.fullDiskProbes("/h").every((d) => !/Downloads|Desktop|Documents|Pictures|Mobile Documents|Photos/.test(d)));
+  check("电脑权限: 打开设置 goes to the Full Disk Access list (System Settings' extension name from macOS 13, the old pane before)",
+    perm.fullDiskSettingsUrl("27.2.0") === "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"
+      && perm.fullDiskSettingsUrl("21.6.0") === "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles");
+  if (process.platform === "darwin") {
+    const list = "/System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex/Contents/Resources/TCCServiceList.plist";
+    check("电脑权限: this Mac's System Settings still knows the Privacy_AllFiles anchor (skipped where the list is elsewhere)",
+      !existsSync(list) || readFileSync(list).includes("Privacy_AllFiles"));
+    const live = await perm.probeFullDisk();
+    check("电脑权限: the live probe gives a definite answer on this Mac, with no dialog to wait for", live === "granted" || live === "denied", live);
+  }
+  {
+    const started = Date.now();
+    const cat = await perm.runProgram("/bin/cat", [], 3000);
+    const bad = await perm.runProgram("/bin/echo", ["a\u0000b"]);
+    check("电脑权限: programs get no stdin to wait on (cat ends at once), and a bad argument is an answer, not a throw",
+      cat.code === 0 && Date.now() - started < 2500 && bad.code === -1, JSON.stringify({ cat, bad, ms: Date.now() - started }));
+  }
+
+  check("电脑权限 (Windows): Controlled folder access — 1 blocks folder writes, 2 only records, 3 and 4 are disk sectors",
+    perm.parseFolderGuard("1\r\n") === "on" && perm.parseFolderGuard("Enabled") === "on" && perm.parseFolderGuard("2") === "audit"
+      && perm.parseFolderGuard("AuditMode") === "audit" && perm.parseFolderGuard("0") === "off" && perm.parseFolderGuard("3") === "off"
+      && perm.parseFolderGuard("") === "unknown" && perm.parseFolderGuard("Get-MpPreference : not available") === "unknown");
+  check("电脑权限 (Windows): it counts only while Defender enforces it — the active antivirus, real-time protection on; a stray warning line changes nothing",
+    perm.parseDefender("cfa=1\r\nmode=Normal\r\nrtp=True\r\n") === "on"
+      && perm.parseDefender("WARNING: something\r\ncfa=1\r\nmode=Normal\r\nrtp=True\r\n") === "on"
+      && perm.parseDefender("cfa=1\nmode=Passive Mode\nrtp=True\n") === "off"
+      && perm.parseDefender("cfa=1\nmode=EDR Block Mode\nrtp=True\n") === "off"
+      && perm.parseDefender("cfa=1\nmode=Normal\nrtp=False\n") === "off"
+      && perm.parseDefender("cfa=1\nmode=\nrtp=\n") === "on"
+      && perm.parseDefender("cfa=2\nmode=Normal\nrtp=True\n") === "audit"
+      && perm.parseDefender("cfa=0\nmode=Normal\nrtp=True\n") === "off"
+      && perm.parseDefender("cfa=\nmode=\nrtp=\n") === "unknown");
+  {
+    perm.resetPermissionCaches();
+    let calls = 0;
+    let program = "";
+    const asked = async (cmd) => {
+      calls += 1;
+      program = cmd;
+      await new Promise((r) => setTimeout(r, 20));
+      return { code: 0, stdout: "cfa=1\r\nmode=Normal\r\nrtp=True\r\n", stderr: "" };
+    };
+    const [first, second] = await Promise.all([perm.readFolderGuard(asked, 1_000_000), perm.readFolderGuard(asked, 1_000_000)]);
+    const again = await perm.readFolderGuard(asked, 1_060_000);
+    const later = await perm.readFolderGuard(async () => ({ code: 1, stdout: "", stderr: "no" }), 1_400_000);
+    check("电脑权限 (Windows): one PowerShell at a time, by its full path, at most every five minutes; a failed ask is unknown",
+      first === "on" && second === "on" && again === "on" && calls === 1 && /\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe$/.test(program)
+        && later === "unknown", program);
+    perm.resetPermissionCaches();
+  }
+
+  {
+    perm.resetPermissionCaches();
+    const fakeRes = () => ({ status: 0, body: null, writeHead(code) { this.status = code; }, end(text) { this.body = JSON.parse(text); } });
+    const ran = [];
+    const runner = async (cmd, args) => {
+      ran.push([cmd, ...args].join(" "));
+      if (cmd === "/usr/bin/ruby") return { code: 0, stdout: `500\t${TERMINAL}`, stderr: "" };
+      if (cmd === "/usr/bin/plutil" && args.includes("CFBundleIdentifier")) return { code: 0, stdout: "com.apple.Terminal\n", stderr: "" };
+      if (cmd === "/usr/bin/plutil" && args.includes("CFBundleName")) return { code: 0, stdout: "Terminal\n", stderr: "" };
+      if (cmd === "/usr/bin/codesign") return { code: 0, stdout: "", stderr: "Platform identifier=27\n" };
+      if (cmd === "/bin/ls") return blocked;
+      if (cmd === "/usr/bin/open" || /cmd\.exe$/.test(cmd)) return { code: 0, stdout: "", stderr: "" };
+      return { code: 1, stdout: "", stderr: "" };
+    };
+    const get = (headers) => ({ method: "GET", headers: { host: "127.0.0.1:3080", ...headers } });
+    const post = (headers) => ({ method: "POST", headers: { host: "127.0.0.1:3080", "content-type": "application/json", ...headers } });
+    let r = fakeRes();
+    await perm.handlePermissionStatus(get({ host: "evil.example:3080" }), r, runner, "darwin");
+    check("电脑权限 route: the status answers this machine's page only (it names programs and paths); a refusal says only which system DSH runs on",
+      r.status === 403 && ran.length === 0 && JSON.stringify(Object.keys(r.body).sort()) === JSON.stringify(["message", "ok", "platform"]) && r.body.platform === "darwin",
+      JSON.stringify(r.body));
+    r = fakeRes();
+    await perm.handlePermissionStatus(get({}), r, runner, "darwin");
+    check("电脑权限 route: on a Mac it says what DSH's access is held against, how that is signed, and whether it has Full Disk Access",
+      r.status === 200 && r.body.platform === "darwin" && r.body.launcher.kind === "app"
+        && r.body.launcher.path === "/System/Applications/Utilities/Terminal.app" && r.body.launcher.name === "Terminal" && r.body.launcher.file === "Terminal.app"
+        && r.body.launcher.signing === "apple" && r.body.launcher.dsh === false && r.body.launcher.via === "system" && r.body.fullDisk === "denied"
+        && typeof r.body.own === "string" && r.body.own.startsWith("/"), JSON.stringify(r.body));
+    r = fakeRes();
+    await perm.handlePermissionStatus(get({}), r, runner, "linux");
+    check("电脑权限 route: elsewhere there is nothing to grant, and nothing is run", r.status === 200 && r.body.platform === "linux" && r.body.launcher === undefined);
+    ran.length = 0;
+    r = fakeRes();
+    await perm.handlePermissionAction("settings", get({}), r, runner, "darwin");
+    const getRefused = r.status === 405;
+    r = fakeRes();
+    await perm.handlePermissionAction("settings", post({ "content-type": "text/plain" }), r, runner, "darwin");
+    const formRefused = r.status === 403;
+    r = fakeRes();
+    await perm.handlePermissionAction("reveal", post({ host: "evil.example:3080", origin: "http://evil.example:3080" }), r, runner, "darwin");
+    check("电脑权限 buttons: only the card's own JSON POST from this machine opens anything",
+      getRefused && formRefused && r.status === 403 && ran.length === 0);
+    r = fakeRes();
+    await perm.handlePermissionAction("settings", post({ origin: "http://127.0.0.1:3080" }), r, runner, "darwin");
+    const opened = r.status === 200 && ran.at(-1) === `/usr/bin/open ${perm.fullDiskSettingsUrl()}`;
+    r = fakeRes();
+    await perm.handlePermissionAction("reveal", { ...post({}), body: { path: "/etc" } }, r, runner, "darwin");
+    check("电脑权限 buttons: 打开设置 opens the Full Disk Access page; 在访达中显示 shows what DSH found itself, never a path from the request",
+      opened && r.status === 200 && ran.at(-1) === "/usr/bin/open -R /System/Applications/Utilities/Terminal.app", ran.at(-1));
+    r = fakeRes();
+    await perm.handlePermissionAction("settings", post({}), r, runner, "win32");
+    const windows = r.status === 200 && /\\System32\\cmd\.exe \/d \/c start  windowsdefender:\/\/ransomwareprotection\/$/.test(ran.at(-1));
+    r = fakeRes();
+    await perm.handlePermissionAction("reveal", post({}), r, runner, "linux");
+    check("电脑权限 buttons: on Windows it opens Windows Security's 勒索软件防护 (cmd by full path, no AutoRun); where there is nothing to show, it says so",
+      windows && r.status === 404, ran.at(-1));
+    r = fakeRes();
+    await perm.handlePermissionAction("settings", post({}), r, async () => { throw new Error("boom"); }, "darwin");
+    check("电脑权限 buttons: a failure inside is an answer with a reason, not an empty error", r.status === 500 && /boom/.test(r.body.message), JSON.stringify(r.body));
+    perm.resetPermissionCaches();
+  }
+
+  // The card's words, run as the browser would (lib/client.js, sliced out like authorizeText above).
+  {
+    const lib = readFileSync(join(ROOT, "lib/client.js"), "utf-8");
+    const fn = (name) => {
+      const at = lib.indexOf(`    function ${name}(`);
+      return lib.slice(at, lib.indexOf("\n    }\n", at) + 6);
+    };
+    const start = lib.indexOf("    function onThisComputer() {");
+    const end = lib.indexOf("    function Switch(props) {");
+    const { permissionHint, starterName, finderName, unreachableText, noAnswer } = new Function(
+      `${fn("unreachableText")}\n${fn("noAnswer")}\n${lib.slice(start, end)}; return { permissionHint, starterName, finderName, unreachableText, noAnswer };`)();
+    check("card: a refusal keeps which system DSH runs on apart from an answer's platform; nothing at all keeps nothing",
+      JSON.stringify(noAnswer({ status: 403, message: "m", platform: "linux" })) === JSON.stringify({ unreachable: true, status: 403, message: "m", hostPlatform: "linux" })
+        && JSON.stringify(noAnswer({ status: 500, message: "boom" })) === JSON.stringify({ unreachable: true, status: 500, message: "boom" })
+        && JSON.stringify(noAnswer(new TypeError("Failed to fetch"))) === JSON.stringify({ unreachable: true }) && noAnswer(undefined).platform === undefined);
+    const terminal = { kind: "app", path: "/System/Applications/Utilities/Terminal.app", name: "Terminal", localName: "终端", file: "Terminal.app", signing: "apple", dsh: false };
+    const whale = { kind: "app", path: "/Applications/DSHWhale.app", name: "DSH小鲸鱼", file: "DSHWhale.app", signing: "local", dsh: true };
+    const code = { kind: "app", path: "/Applications/Visual Studio Code.app", name: "Code", file: "Visual Studio Code.app", signing: "developer", dsh: false };
+    check("card words: an app is named as System Settings and Finder show it — 「终端」（Terminal）, 「DSH小鲸鱼」（DSHWhale.app）, 「Code」（Visual Studio Code.app）",
+      starterName(terminal) === "「终端」（Terminal）" && starterName(whale) === "「DSH小鲸鱼」（DSHWhale.app）" && starterName(code) === "「Code」（Visual Studio Code.app）"
+        && finderName(terminal) === "终端" && finderName(whale) === "DSHWhale" && finderName(code) === "Visual Studio Code"
+        && starterName({ kind: "program", name: "node" }) === "「node」" && starterName({ kind: "unknown" }) === null);
+    const t1 = permissionHint({ platform: "darwin", launcher: terminal, fullDisk: "denied", fullDiskHere: "denied" }, true);
+    check("card words: Full Disk Access missing under Terminal — System Settings' own words (完全磁盘访问权限, 以后), what the dialogs cost, how to add it, what else gets the access",
+      /还没开「完全磁盘访问权限」/.test(t1) && /启动 DSH 的程序「终端」（Terminal）头上/.test(t1) && (t1.match(/「终端」/g) || []).length === 1
+        && /没人点「允许」它就一直卡着/.test(t1) && /点「打开设置」/.test(t1) && /拖进去/.test(t1) && /管理员确认一次：触控 ID 或登录密码/.test(t1)
+        && /点「以后」（英文系统是 Later），不要点「退出并重新打开」/.test(t1) && !/稍后|开机密码/.test(t1)
+        && /在它里面运行的其他程序也都能读你的全部文件/.test(t1) && !/那台电脑上打开/.test(t1), t1);
+    const t2 = permissionHint({ platform: "darwin", launcher: whale, fullDisk: "denied" }, false);
+    check("card words: an app that is there to run DSH gets no warning; on another device the buttons say where they act",
+      /「DSH小鲸鱼」（DSHWhale\.app）/.test(t2) && !/其他程序/.test(t2) && /下面的按钮在运行 DSH 的那台电脑上打开/.test(t2), t2);
+    const own = { kind: "program", path: "/opt/homebrew/Cellar/node/26.3.1/bin/node", name: "node", signing: "adhoc", own: true };
+    const t3 = permissionHint({ platform: "darwin", launcher: own, fullDisk: "denied" }, true);
+    check("card words: DSH's own node — said to be DSH's own, the path, the switched-off row likely already there, ⌘⇧G, and the update caveat once",
+      /算在 DSH 自己的程序「node」头上/.test(t3) && /\/opt\/homebrew\/Cellar\/node\/26\.3\.1\/bin\/node/.test(t3) && /关着的「node」/.test(t3)
+        && /⌘⇧G/.test(t3) && (t3.match(/正式签名/g) || []).length === 1 && !/开机自启/.test(t3) && /不经过 App/.test(t3)
+        // It is DSH's own whether launchd runs it or the app that started it handed the access over; the words claim neither alone.
+        && /macOS 没把它算在哪个 App 头上：DSH 由 launchd 直接运行，或者启动它的程序把授权交给了 DSH 自己/.test(t3) && !/DSH 不是从哪个 App 里启动的/.test(t3), t3);
+    const t3b = permissionHint({ platform: "darwin", launcher: { kind: "program", path: "/usr/local/bin/dsh-runner", name: "dsh-runner", signing: "developer", own: false }, fullDisk: "denied" }, true);
+    check("card words: some other program is named as what started DSH",
+      /启动 DSH 的程序「dsh-runner」头上/.test(t3b) && /换了版本、路径变了要重新开/.test(t3b) && !/没把它算在哪个 App 头上/.test(t3b), t3b);
+    const t4 = permissionHint({ platform: "darwin", launcher: { kind: "unknown", reason: "往上找不到 App" }, fullDisk: "denied", own: "/opt/dsh/bin/node" }, true);
+    check("card words: when what started DSH is not known, it says why once and what each way of running DSH needs (DSH's own node too)",
+      /没认出启动 DSH 的程序（往上找不到 App）/.test(t4) && /「终端」/.test(t4) && /「DeepSeek Harness」/.test(t4)
+        && /「DSH小鲸鱼」（DSHWhale\.app）/.test(t4) && /DSH 自己的程序 \/opt\/dsh\/bin\/node/.test(t4), t4);
+    const t5 = permissionHint({ platform: "darwin", launcher: terminal, fullDisk: "granted", fullDiskHere: "denied" }, true);
+    const t6 = permissionHint({ platform: "darwin", launcher: { kind: "unknown", reason: "x" }, fullDisk: "granted", fullDiskHere: "granted" }, true);
+    check("card words: granted — says to whom; a DSH started before the grant needs one restart for its own file tools",
+      /完全磁盘访问权限已开（开给了「终端」（Terminal））/.test(t5) && /重启一次 DSH/.test(t5) && /^完全磁盘访问权限已开：/.test(t6) && !/重启/.test(t6), `${t5} | ${t6}`);
+    const t7 = permissionHint({ platform: "darwin", launcher: terminal, fullDisk: "unknown" }, true);
+    check("card words: when the probe has no answer, it still names the program to open it for",
+      /查不出「完全磁盘访问权限」开没开/.test(t7) && /要开就开给启动 DSH 的程序「终端」（Terminal）/.test(t7) && !/文件夹都不在/.test(t7), t7);
+    const w1 = permissionHint({ platform: "win32", folderGuard: "on", program: "C:\\Program Files\\nodejs\\node.exe" }, true);
+    const w2 = permissionHint({ platform: "win32", folderGuard: "off", program: "x" }, true);
+    check("card words (Windows): nothing to grant; with Controlled folder access on — both names, both programs (node.exe and PowerShell), restart, UAC, the risk",
+      /^Windows 不用单独授权/.test(w2) && !/文件夹限制访问/.test(w2) && /「文件夹限制访问」/.test(w1) && /受控文件夹访问/.test(w1) && /Controlled folder access/.test(w1)
+        && /node\.exe/.test(w1) && /PowerShell/.test(w1) && /pwsh\.exe/.test(w1) && /重启一次 DSH/.test(w1) && /管理员确认/.test(w1)
+        && /文档/.test(w1) && !/文稿/.test(w1) && /读不受影响/.test(w1) && /「下载」默认不受保护/.test(w1)
+        && /被拦的主要是两个程序/.test(w1) && /其他程序也可能按它自己的名字被拦/.test(w1) && /放行 PowerShell 或 node\.exe，/.test(w1), w1);
+    // DSH Desktop runs DSH as the app itself (Electron in Node mode): the warning names that program, not node.exe.
+    const w3 = permissionHint({ platform: "win32", folderGuard: "on", program: "C:\\Users\\u\\AppData\\Local\\Programs\\DeepSeek Harness\\DeepSeek Harness.exe" }, true);
+    check("card words (Windows, DSH Desktop): both the program to allow and the warning name DSH Desktop's own program, not node.exe",
+      /算 C:\\Users\\u\\AppData\\Local\\Programs\\DeepSeek Harness\\DeepSeek Harness\.exe，/.test(w3)
+        && /放行 PowerShell 或 DeepSeek Harness\.exe，/.test(w3) && !/node\.exe/.test(w3), w3);
+    check("card words: before the first answer; refused (403) is about where the page is open, not a restart; a 500 says why; nothing at all is the route or DSH",
+      permissionHint(null, true) === "读取中…"
+        && /只在运行 DSH 的那台电脑上能看/.test(unreachableText({ unreachable: true, status: 403 })) && !/重启/.test(unreachableText({ unreachable: true, status: 403 }))
+        && unreachableText({ unreachable: true, status: 500, message: "boom" }) === "状态读不到：boom"
+        && /DSH 可能需要重启/.test(permissionHint({ unreachable: true }, true)) && /DSH 可能需要重启/.test(unreachableText({ unreachable: true, status: 404 })));
+  }
+
+  const clientSrc = readFileSync(join(ROOT, "src/client.js"), "utf-8");
+  const permSrc = readFileSync(join(ROOT, "src/permissions.ts"), "utf-8");
+  check("电脑权限: it is the card's first row where there is something to say; the folded card says when Full Disk Access is missing",
+    /const fields = \[\s*(\/\/[^\n]*\n\s*)*permRow \? Field\(\{\s*label: "电脑权限"/.test(clientSrc)
+      && /!open && perm !== null && perm\.platform === "darwin" && perm\.fullDisk === "denied"\s*\?\s*h\("span", \{ className: S\.attention \}/.test(clientSrc));
+  check("电脑权限: the card reads the status and posts JSON to both buttons, once per click; the routes are registered",
+    /getStatus\(PERMISSIONS_URL\)/.test(clientSrc) && /pressPermission\(PERMISSIONS_SETTINGS_URL/.test(clientSrc) && /pressPermission\(PERMISSIONS_REVEAL_URL/.test(clientSrc)
+      && /const pressPermission = async \(url, done\) => \{\s*if \(permPressing\.current\) return;\s*permPressing\.current = true;[\s\S]{0,400}fetch\(url, \{ method: "POST", headers: \{ "content-type": "application\/json" \}/.test(clientSrc)
+      && /registerPermissionRoutes\(ctx\);/.test(readFileSync(join(ROOT, "src/index.ts"), "utf-8")));
+  check("电脑权限: the row looks again soon after a look got nothing back (a refusal keeps the pace of the last answer), shows only the newest answer, and drops a button's words once nothing is left to do",
+    /if \(d !== null\) waiting = d\.platform === "darwin" && d\.fullDisk !== "granted";\s*timer = setTimeout\(tick, retry \? 5000 : waiting \? 4000 : 60000\);/.test(clientSrc)
+      && /const lost = noAnswer\(e\);\s*setPerm\(lost\);\s*next\(null, lost\.status !== 403\);/.test(clientSrc)
+      && /if \(!alive \|\| n <= shown\) return false;/.test(clientSrc)
+      && /permButtons\.length > 0 && permAction !== null && permAction\.text/.test(clientSrc));
+  check("电脑权限: a page opened elsewhere has the row only when DSH's computer is a Mac (or did not say)",
+    /\|\| \(perm\.unreachable === true && \(perm\.hostPlatform === undefined \|\| perm\.hostPlatform === "darwin"\)\);/.test(clientSrc)
+      && !/perm\.unreachable === true \|\| perm\.platform === "darwin"/.test(clientSrc));
+  check("电脑权限: the status rows share one reader, so a refusal reads the same everywhere",
+    /getStatus\(BRIDGE_URL\)/.test(clientSrc) && /getStatus\(CALENDAR_URL\)/.test(clientSrc) && (clientSrc.match(/return unreachableText\(/g) || []).length === 3);
+  {
+    // A card state named `failed` once hid the helper failed(): every status row stuck at 读取中 on its first error.
+    const helpers = new Set([...clientSrc.matchAll(/^ {4}function (\w+)\(/gm)].map((m) => m[1]));
+    const locals = [...clientSrc.matchAll(/^ {6,}(?:const|let) (?:\[(\w+), \w+\]|(\w+)) =/gm)].map((m) => m[1] || m[2]);
+    const clash = [...new Set(locals.filter((name) => helpers.has(name)))];
+    check("card: nothing declared inside the card shadows one of the card's helpers", helpers.size > 10 && clash.length === 0, clash.join(", "));
+  }
+  check("电脑权限: programs run without a shell, and who started DSH is looked up as the plugin starts",
+    /execFile\(cmd, args, \{/.test(permSrc) && !/\{[^}]*\bexec\b[^}]*\} from "node:child_process"|shell: true|spawnSync/.test(permSrc)
+      && /if \(process\.platform === "darwin"\) \{\s*void detectLauncher\(\)\s*\.then\(/.test(permSrc));
+}
+
+rmSync(STATE, { recursive: true, force: true });
 console.log(`宿主: dsh ${HOST_VERSION}  (${NPX})`);
 console.log(results.join("\n"));
 console.log(`\n${pass} 通过, ${fail} 失败`);

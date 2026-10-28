@@ -52,7 +52,7 @@ export class ClawbotMcpClient {
 }
 
 export function createClawbotMcpServer(client = new ClawbotMcpClient()): McpServer {
-  const server = new McpServer({ name: "wechat-clawbot", version: "1.1.0" });
+  const server = new McpServer({ name: "wechat-clawbot", version: "1.3.1" });
   const text = z.string().trim().min(1).max(32_000);
   const sessionId = z.string().trim().min(1).max(256);
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };

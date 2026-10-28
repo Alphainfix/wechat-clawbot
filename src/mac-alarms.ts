@@ -227,8 +227,8 @@ export class AlarmService {
       if (error === "notDetermined") {
         return "还没授权「提醒事项」，闹钟设不了：到 Mac 前，在设置卡片「全天候秘书」上点「一键授权」，在弹出的窗口里点「允许」。";
       }
-      if (error === "denied") return `「提醒事项」的授权被拒绝了：在 Mac 的 系统设置 → 隐私与安全性 → 提醒事项 里打开「${HELPER_NAME}」。`;
-      return `「${HELPER_NAME}」没有「提醒事项」的完全访问权限（${error}）：在 Mac 的 系统设置 → 隐私与安全性 → 提醒事项 里打开它。`;
+      if (error === "denied") return `「提醒事项」的授权被拒绝了：在 Mac 的 系统设置 → 隐私与安全 → 提醒事项 里打开「${HELPER_NAME}」。`;
+      return `「${HELPER_NAME}」没有「提醒事项」的完全访问权限（${error}）：在 Mac 的 系统设置 → 隐私与安全 → 提醒事项 里打开它。`;
     }
     if (code === "bad_request" && /unknown command/.test(error)) {
       return `Mac 上的「${HELPER_NAME}」还是旧版，没有闹钟功能：到 Mac 前在设置卡片「全天候秘书」上点「一键授权」更新它（会再弹出两次授权，都点「允许」）。`;

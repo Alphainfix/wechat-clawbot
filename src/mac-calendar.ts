@@ -836,8 +836,8 @@ export function registerCalendarTools(agentCtx: Context, deps: CalendarToolDeps)
         // No prompt from here: the owner may be far from the Mac, and a prompt nobody answers helps nobody.
         return "还没授权日历：到 Mac 前，在设置卡片「全天候秘书」上点「一键授权」，在弹出的窗口里点「允许」。";
       }
-      if (res.error === "writeOnly") return `「${HELPER_NAME}」只有「仅添加」权限，读不到日程：在 系统设置 → 隐私与安全性 → 日历 里改成完全访问。`;
-      return `「${HELPER_NAME}」没有日历权限（${String(res.error)}）：在 Mac 的 系统设置 → 隐私与安全性 → 日历 里打开它。`;
+      if (res.error === "writeOnly") return `「${HELPER_NAME}」只有「仅添加」权限，读不到日程：在 系统设置 → 隐私与安全 → 日历 里改成完全访问。`;
+      return `「${HELPER_NAME}」没有日历权限（${String(res.error)}）：在 Mac 的 系统设置 → 隐私与安全 → 日历 里打开它。`;
     }
     if (res.code === "timeout" || res.code === "no_response") {
       return writing

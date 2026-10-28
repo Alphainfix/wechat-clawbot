@@ -35,6 +35,7 @@ import { Backlog } from "./backlog.js";
 import { uploadFileTo } from "./tool.js";
 import { ensureMemoryFile } from "./memory.js";
 import { addSecretaryRules, hasSecretaryRules, registerMemoryOpenRoute, removeSecretaryRules, upgradeSecretaryRules } from "./secretary.js";
+import { registerPermissionRoutes } from "./permissions.js";
 import { isHostSchedule, migrateLegacyReminders, type HostSchedule } from "./schedule-migrate.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import {
@@ -355,6 +356,8 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   registerMemoryOpenRoute(ctx);
   // The card's 一键授权 (every Mac permission, while the owner is at the Mac) and 测试闹钟.
   registerCardRoutes(ctx, { helper: calendarHelper, alarms, enabled: () => config.macCalendar === true });
+  // The card's 电脑权限 row: Full Disk Access for whatever started DSH (macOS), Controlled folder access (Windows).
+  registerPermissionRoutes(ctx);
 
   /** Pick the first bound account (v1 supports a single account). */
   const pickAccount = (): ResolvedWeixinAccount | null => {
