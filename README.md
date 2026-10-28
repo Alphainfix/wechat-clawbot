@@ -130,7 +130,7 @@ It is written for an AI agent installing the plugin for you, and it works just a
 
 ## Limitations
 
-- No group chats and no voice messages.
+- No group chats. Voice messages can be received but not sent.
 - One WeChat account per DSH installation.
 - The bot is offline while the computer is off or DSH is not running.
 - The all-day secretary is macOS only, and alarms also need an iPhone (versions under [Requirements](#requirements)).

@@ -128,7 +128,7 @@ npx -y -p wechat-clawbot clawbot login
 
 ## 限制
 
-- 不支持群聊，也不支持语音消息。
+- 不支持群聊。收语音能，发不了。
 - 一个 DSH 只绑定一个微信号。
 - 电脑关机、DSH 没运行的时候，bot 不在线。
 - 全天候秘书只支持 macOS，闹钟还要一台 iPhone（版本见「需要什么」）。
