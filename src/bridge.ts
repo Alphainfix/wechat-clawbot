@@ -1654,9 +1654,11 @@ export class WechatBridge {
       });
       // Visibility into the user's Claude Code sessions, so a WeChat message can
       // ask "what is Claude doing" or redirect a coding session the user is not
-      // sitting in front of. restrictTools below is a DENY list, so these three
-      // are visible without needing to be named there.
-      registerClaudePeerTools(agentCtx, this.config);
+      // sitting in front of. Off by default, like the Codex tools below: every
+      // registered tool rides along on every request. restrictTools further down
+      // is a DENY list, so these three are visible without being named there.
+      const claude = this.config.claudePeer === true;
+      if (claude) registerClaudePeerTools(agentCtx, this.config);
       // The same for the owner's other DSH conversations, in any folder.
       registerDshSessionTools(agentCtx, this.ctx, this.config.sessionId);
       // Codex tools only when the owner switched them on: every registered tool
@@ -1695,7 +1697,7 @@ export class WechatBridge {
       const offLate = registerLateScheduleNotes(target, (id) => this.isWechatSession(id), (text) => wechatUserMessage([{ type: "text", text }]));
       if (typeof offLate === "function") this.toolDisposers.push(offLate as () => void);
       this.toolsRegistered = true;
-      logger.info(`ensureTools: WeChat tools registered (Codex tools ${codex ? "on" : "off"}, calendar tools ${calendar ? "on" : "off"})`);
+      logger.info(`ensureTools: WeChat tools registered (Claude tools ${claude ? "on" : "off"}, Codex tools ${codex ? "on" : "off"}, calendar tools ${calendar ? "on" : "off"})`);
     } catch (err) {
       // Undo the half that did register, so the retry starts clean.
       this.releaseTools();
