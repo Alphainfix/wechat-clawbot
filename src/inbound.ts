@@ -169,22 +169,30 @@ export class InboundRouter {
       } catch {
         // fresh file / stat race: proceed
       }
-      fs.appendFileSync(
-        rawPath,
-        JSON.stringify({
-          t: Date.now(),
-          seq: msg.seq,
-          msgType: msg.message_type,
-          msgId: msg.message_id,
-          clientId: msg.client_id,
-          items: (msg.item_list ?? []).map((i) => ({
-            type: i.type,
-            text: i.text_item?.text ?? null,
-            hasRef: !!i.ref_msg,
-            ref: i.ref_msg ?? null,
-          })),
-        }) + "\n",
-      );
+      // Only at debug level. The dump stores the text of every inbound message
+      // (and the quoted content it carries) on disk, which is more than a
+      // diagnostic should collect without being asked: a normal deployment would
+      // keep a plaintext transcript of the owner's WeChat chats in the state
+      // directory. The rotation above stays unconditional and cheap, so an old
+      // file from a debug session is still bounded.
+      if (this.config.logLevel === "debug") {
+        fs.appendFileSync(
+          rawPath,
+          JSON.stringify({
+            t: Date.now(),
+            seq: msg.seq,
+            msgType: msg.message_type,
+            msgId: msg.message_id,
+            clientId: msg.client_id,
+            items: (msg.item_list ?? []).map((i) => ({
+              type: i.type,
+              text: i.text_item?.text ?? null,
+              hasRef: !!i.ref_msg,
+              ref: i.ref_msg ?? null,
+            })),
+          }) + "\n",
+        );
+      }
     } catch {
       // ignore logging failures
     }
