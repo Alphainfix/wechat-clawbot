@@ -36,7 +36,7 @@ import { uploadFileTo } from "./tool.js";
 import { ensureMemoryFile } from "./memory.js";
 import { addSecretaryRules, hasSecretaryRules, registerMemoryOpenRoute, removeSecretaryRules, upgradeSecretaryRules } from "./secretary.js";
 import { registerPermissionRoutes } from "./permissions.js";
-import { isHostSchedule, migrateLegacyReminders, type HostSchedule } from "./schedule-migrate.js";
+import { resolveHostSchedule, migrateLegacyReminders, type HostSchedule } from "./schedule-migrate.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import {
   resolveWeixinAccount,
@@ -188,7 +188,10 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   // sessions are never affected. This covers agents that the harness resumes
   // directly from GUI messages without running the bridge's agent setup.
   try {
-    registerWechatGuidanceGlobal(ctx, config.sessionId, config);
+    // DSH 0.2.2 changed how `schedule_create` takes its timing; the guidance
+    // must describe whichever generation this Host runs. The service is
+    // injected below, so pass a getter rather than a value.
+    registerWechatGuidanceGlobal(ctx, config.sessionId, config, () => hostSchedule?.generation ?? 1);
     logger.info(`clawbot: wechat guidance registered globally (session=${config.sessionId})`);
   } catch (err) {
     logger.warn(`clawbot: global guidance registration failed: ${String(err)}`);
@@ -293,10 +296,11 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
   };
   ctx.inject(["schedule"], (scoped) => {
     const service = (scoped as unknown as { schedule?: unknown }).schedule;
-    if (!isHostSchedule(service)) return;
-    hostSchedule = service;
+    const resolved = resolveHostSchedule(service);
+    if (!resolved) return;
+    hostSchedule = resolved;
     scoped.effect(() => () => {
-      if (hostSchedule === service) hostSchedule = undefined;
+      if (hostSchedule === resolved) hostSchedule = undefined;
     });
     carryOverLegacyReminders();
   });
