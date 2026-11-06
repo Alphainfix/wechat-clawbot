@@ -340,6 +340,20 @@ function check(name, ok, detail) {
     /not_future/.test(prompt) && /不要把它转述成/.test(prompt));
   check("rule G5 warns that scheduledAt comes back in UTC",
     /scheduledAt/.test(prompt) && /UTC/.test(prompt));
+
+  // DSH 0.2.2 renamed the tools and rebuilt the parameters; the guidance has to
+  // follow the Host the plugin runs on, not the one it was written against.
+  const modern = buildWechatSystemPrompt(false, 2, "wechat-main");
+  check("0.2.2 guidance teaches the two-line rrule form",
+    /DTSTART;TZID=/.test(modern) && /RRULE:FREQ=DAILY;COUNT=1/.test(modern) && /20261107T090000/.test(modern));
+  check("0.2.2 guidance requires target this_session",
+    /target 每次都必须填 "this_session"/.test(modern));
+  check("0.2.2 guidance reads scheduledAtLocal instead of the UTC scheduledAt",
+    /scheduledAtLocal/.test(modern) && !/填 `at` 的日期/.test(modern));
+  check("0.2.2 guidance scopes the Host-wide list and uses schedule_edit",
+    /schedule_edit\(action:"delete", id\)/.test(modern) && /target\.sessionId 等于 `wechat-main`/.test(modern));
+  check("0.2.1 guidance keeps the selector-based form",
+    /填 `at` 的日期/.test(prompt) && /after_seconds/.test(prompt) && !/RRULE:FREQ=DAILY;COUNT=1/.test(prompt));
 }
 
 // ------------------------------------------------------- inbound marker format
@@ -687,50 +701,122 @@ function check(name, ok, detail) {
   const plan = M.planLegacyMigration(active, [], new Set(), NOW);
   const by = Object.fromEntries(plan.map((step) => [step.legacy.id, step]));
   check("future one-shot is recreated at the same instant",
-    by["schedule-1"]?.action === "create" && by["schedule-1"].request.at === "2026-01-11T14:00:00.000Z"
-      && by["schedule-1"].request.title === "交房租");
+    by["schedule-1"]?.action === "create" && by["schedule-1"].timing.kind === "at"
+      && by["schedule-1"].timing.at === "2026-01-11T14:00:00.000Z"
+      && by["schedule-1"].title === "交房租");
   check("one-shot that came due within a day is delivered late, like rc.1's catch-up",
-    by["schedule-3"]?.action === "create" && by["schedule-3"].request.after_seconds === 60);
+    by["schedule-3"]?.action === "create" && by["schedule-3"].timing.kind === "after"
+      && by["schedule-3"].timing.after_seconds === 60);
   check("one-shot overdue by more than a day is skipped, not fired",
     by["schedule-4"]?.action === "skip");
   check("every reminder is recreated with its interval",
-    by["schedule-6"]?.action === "create" && by["schedule-6"].request.every_seconds === 3600);
-  check("a request never carries more than one timing selector",
-    plan.filter((s) => s.action === "create").every((s) =>
-      ["at", "after_seconds", "every_seconds"].filter((k) => k in s.request).length === 1));
+    by["schedule-6"]?.action === "create" && by["schedule-6"].timing.kind === "every"
+      && by["schedule-6"].timing.every_seconds === 3600);
+  check("a create step carries a typed timing kind, not flat selectors",
+    plan.filter((s) => s.action === "create").every((s) => typeof s.timing.kind === "string"));
   const again = M.planLegacyMigration(active,
     [{ prompt: "提醒:交房租", scheduledAt: "2026-01-11T14:00:00.000Z" }], new Set(["schedule-3"]), NOW);
   check("already-handled ids and hand-made duplicates are not created again",
     !again.some((s) => s.legacy.id === "schedule-3")
       && again.find((s) => s.legacy.id === "schedule-1")?.action === "present");
 
-  check("rc.1 composition (no schedule service) is never mistaken for rc.2",
-    !M.isHostSchedule(undefined) && !M.isHostSchedule({ create() {} }));
+  check("a Host without a schedule service is never mistaken for one",
+    M.resolveHostSchedule(undefined) === undefined && M.resolveHostSchedule({ create() {} }) === undefined);
+  check("pre-0.2.2's service resolves to generation 1",
+    M.resolveHostSchedule({ create() {}, list() {}, catalog() {} })?.generation === 1);
+  check("0.2.2's service is recognised by edit/view",
+    M.resolveHostSchedule({ create() {}, list() {}, catalog() {}, edit() {}, view() {} })?.generation === 2);
 
-  // End to end against a fake host service: once, and only once.
-  const made = [];
-  const fake = {
-    async create(sessionId, request) {
-      made.push({ sessionId, request });
-      return { id: `schedule-host-${made.length}`, scheduledAt: request.at ?? "2026-01-10T12:01:00.000Z" };
-    },
-    async list() { return []; },
-    async catalog() { return []; },
-  };
-  check("fake host service passes the rc.2 shape check", M.isHostSchedule(fake));
   const dir = join(tmpdir(), `clawbot-migrate-${process.pid}`);
   rmSync(dir, { recursive: true, force: true });
   const markerPath = join(dir, "schedule-migration.json");
-  const first = await M.migrateLegacyReminders({ schedule: fake, sessionId: "wechat-test", events, markerPath, now: () => NOW });
-  check("first start recreates the three live reminders in their own session",
-    first.created.length === 3 && made.every((m) => m.sessionId === "wechat-test"),
+
+  // 0.1.7-rc.2 … 0.2.1: create(sessionId, request) over a Session-scoped list.
+  const madeV1 = [];
+  const hostV1 = M.resolveHostSchedule({
+    async create(sessionId, request) {
+      madeV1.push({ sessionId, request });
+      return { id: `schedule-host-${madeV1.length}`, scheduledAt: request.at ?? "2026-01-10T12:01:00.000Z" };
+    },
+    async list() { return []; },
+    async catalog() { return []; },
+  });
+  const first = await M.migrateLegacyReminders({ schedule: hostV1, sessionId: "wechat-test", events, markerPath, now: () => NOW });
+  check("old Host: first start recreates the three live reminders in their own session",
+    first.created.length === 3 && madeV1.every((m) => m.sessionId === "wechat-test")
+      && madeV1.some((m) => m.request.at === "2026-01-11T14:00:00.000Z")
+      && madeV1.some((m) => m.request.every_seconds === 3600),
     JSON.stringify(first));
-  const second = await M.migrateLegacyReminders({ schedule: fake, sessionId: "wechat-test", events, markerPath, now: () => NOW });
-  check("second start creates nothing (marker file)", made.length === 3 && second.created.length === 0,
-    JSON.stringify(second));
+  const second = await M.migrateLegacyReminders({ schedule: hostV1, sessionId: "wechat-test", events, markerPath, now: () => NOW });
+  check("old Host: second start creates nothing (marker file)",
+    madeV1.length === 3 && second.created.length === 0, JSON.stringify(second));
   const marker = JSON.parse(readFileSync(markerPath, "utf-8"));
   check("marker keeps the skip reason for the stale one",
     marker.sessions["wechat-test"]["schedule-4"]?.status === "skipped");
+
+  // 0.2.2+: create(request, actorSessionId) with timing/target over a Host-wide list.
+  rmSync(dir, { recursive: true, force: true });
+  const markerV2 = join(dir, "schedule-migration.json");
+  const madeV2 = [];
+  const seenListV2 = [];
+  const hostV2 = M.resolveHostSchedule({
+    async create(request, actorSessionId) {
+      madeV2.push({ request, actorSessionId });
+      return { id: `schedule-v2-${madeV2.length}`, scheduledAt: request.timing.at ?? "2026-01-10T12:01:00.000Z" };
+    },
+    async list(request) {
+      seenListV2.push(request);
+      return {
+        items: [{
+          prompt: "提醒:交房租",
+          scheduledAt: "2026-01-11T14:00:00.000Z",
+          target: { kind: "session", sessionId: "other-session" },
+        }],
+        total: 1,
+      };
+    },
+    async catalog() { return []; },
+    async edit() { return {}; },
+    async view() { return {}; },
+  });
+  const migrated = await M.migrateLegacyReminders({ schedule: hostV2, sessionId: "wechat-test", events, markerPath: markerV2, now: () => NOW });
+  check("0.2.2: a task belonging to another Session is neither deduped nor touched",
+    migrated.created.length === 3 && migrated.present.length === 0, JSON.stringify(migrated));
+  check("0.2.2: create receives typed timing, this Session target and the acting Session",
+    madeV2.length === 3 && madeV2.every((m) => m.actorSessionId === "wechat-test"
+      && m.request.target.kind === "session" && m.request.target.sessionId === "wechat-test"
+      && !("at" in m.request) && !("every_seconds" in m.request))
+      && madeV2.some((m) => m.request.timing.kind === "at")
+      && madeV2.some((m) => m.request.timing.kind === "after" && m.request.timing.after_seconds === 60)
+      && madeV2.some((m) => m.request.timing.kind === "every" && m.request.timing.every_seconds === 3600),
+    JSON.stringify(madeV2.map((m) => m.request)));
+  check("0.2.2: the list is asked for active tasks from the start of the first page",
+    seenListV2.length === 1 && seenListV2[0].active === true && seenListV2[0].limit === 500 && seenListV2[0].offset === 0,
+    JSON.stringify(seenListV2));
+
+  const paged = [];
+  const paging = M.resolveHostSchedule({
+    async create() { throw new Error("unused"); },
+    async list(request) {
+      paged.push(request.offset);
+      if (request.offset === 0) {
+        return { items: Array.from({ length: 500 }, (_, i) => ({ prompt: `p${i}`, scheduledAt: "2026-01-01T00:00:00.000Z", target: { kind: "new" } })), total: 501 };
+      }
+      return { items: [{ prompt: "提醒:交房租", scheduledAt: "2026-01-11T14:00:00.000Z", target: { kind: "session", sessionId: "wechat-test" } }], total: 501 };
+    },
+    async catalog() { return []; },
+    async edit() { return {}; },
+    async view() { return {}; },
+  });
+  const pagedTasks = await paging.listSessionTasks("wechat-test");
+  check("0.2.2: a Host-wide list is paged to its end and filtered to this Session",
+    paged.join(",") === "0,500" && pagedTasks.length === 1 && pagedTasks[0].prompt === "提醒:交房租",
+    JSON.stringify({ paged, pagedTasks }));
+
+  const againV2 = await M.migrateLegacyReminders({ schedule: hostV2, sessionId: "wechat-test", events, markerPath: markerV2, now: () => NOW });
+  check("0.2.2: second start creates nothing (marker file)",
+    madeV2.length === 3 && againV2.created.length === 0, JSON.stringify(againV2));
+
   rmSync(dir, { recursive: true, force: true });
 
   // The loader half: with no host `schedule` service the callback never fires.
