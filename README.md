@@ -49,7 +49,7 @@ The first time, the plugin compiles a small background app, `Clawbot-Calendar`, 
 
 ## Requirements
 
-- DSH **0.1.7 – 0.2.1** (tested on 0.1.7-rc.2, 0.2.0-rc.2 and 0.2.1-rc.2), Node.js 22+ and pnpm
+- DSH **0.1.7 – 0.2.2** (tested on 0.1.7-rc.2, 0.2.0-rc.2, 0.2.1-rc.2 and 0.2.2-rc.1), Node.js 22+ and pnpm
 - The official **微信ClawBot** plugin in the WeChat mobile app (WeChat → Settings → Plugins; the first scan may ask you to update WeChat)
 - A computer that stays on: the bot is online while DSH is running
 - For the all-day secretary (macOS only):

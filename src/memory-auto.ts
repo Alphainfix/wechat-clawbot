@@ -107,6 +107,66 @@ function mightContainFact(text: string): boolean {
  */
 export type MemoryJudge = (prompt: string) => Promise<string | null>;
 
+/**
+ * Effort ids, cheapest first. This is pi-ai's level order, which DSH's own
+ * adapters also follow, plus `none`: OpenAI's name for "no reasoning", which
+ * server-supplied effort lists may use.
+ */
+const EFFORT_ORDER = ["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/** Output budget when thinking is off: the answer is one line of JSON. */
+const ANSWER_BUDGET = 400;
+/**
+ * Output budget when the route cannot stop the model thinking. Thinking and the
+ * answer share it.
+ * - At its lowest effort a model thinks a few dozen to a few hundred tokens.
+ *   With only 400 it can spend them all and send no answer.
+ * - Some adapters reserve a fixed thinking budget per effort and refuse any
+ *   maxTokens that is not larger. Antigravity's reaches about 10,000.
+ * Unused budget costs nothing. The model's own output limit still caps it.
+ */
+const THINKING_BUDGET = 16384;
+
+/**
+ * The reasoning effort and output budget for one classifier call, chosen from
+ * what the route's model reports (`resolveModelInfo(...).reasoning`).
+ *
+ * The classifier needs no deliberation, so it asks for the least thinking the
+ * route allows:
+ *   - The route lists `off`: turn thinking off and keep the small budget.
+ *   - It does not: use the cheapest effort it lists, with room for that
+ *     thinking. Examples are DeepSeek V4.1 Flash on OpenCode Go, Kimi K3.1 and
+ *     GLM, none of which can stop thinking.
+ *   - It reports no reasoning at all: name no effort, because the host rejects
+ *     ANY effort for such a model, `off` included.
+ *
+ * Until 2026-11 the classifier always asked for `off`. The host refuses an
+ * effort the model does not list (UNSUPPORTED_REASONING_EFFORT), so on routes
+ * without `off` every classification failed. From 2026-10-19, when the bot moved
+ * to DeepSeek V4.1 Flash on OpenCode Go, nothing was captured.
+ */
+export function judgeCallControls(
+  reasoning: { efforts?: readonly { id: string }[] } | undefined,
+  maxOutput?: number,
+): { reasoningEffort?: string; maxTokens: number } {
+  // Never ask for more than the model's own output limit (`defaultMaxTokens`,
+  // present when the deployment declares one).
+  const cap = (budget: number): number =>
+    typeof maxOutput === "number" && Number.isFinite(maxOutput) && maxOutput >= 1
+      ? Math.min(budget, Math.floor(maxOutput))
+      : budget;
+  if (reasoning === undefined) return { maxTokens: cap(THINKING_BUDGET) };
+  const ids = (reasoning.efforts ?? []).map((effort) => String(effort.id));
+  if (ids.includes("off")) return { reasoningEffort: "off", maxTokens: cap(ANSWER_BUDGET) };
+  // An id outside EFFORT_ORDER is used only when the route lists none of the
+  // known ones. Then the route's first id wins, because every adapter seen so
+  // far lists its cheapest level first.
+  const cheapest = EFFORT_ORDER.find((id) => ids.includes(id)) ?? ids[0];
+  return cheapest === undefined
+    ? { maxTokens: cap(THINKING_BUDGET) }
+    : { reasoningEffort: cheapest, maxTokens: cap(THINKING_BUDGET) };
+}
+
 /** Build the classification prompt for one candidate message. */
 function judgePrompt(cleaned: string): string {
   return (

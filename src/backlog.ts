@@ -109,6 +109,67 @@ export function quietTask(text: string): boolean {
 }
 
 /**
+ * What a scheduled message asks for, for the reminder fallback: its reminder
+ * prompts. If dsh-schedule ever changes the format, the message without its
+ * machine lines instead, never nothing: a reminder that cannot be parsed is
+ * still a reminder.
+ */
+export function scheduledReminders(text: string): string[] {
+  const prompts = reminderPrompts(text);
+  if (prompts.length > 0) return prompts;
+  const rest = text
+    .split("\n")
+    .filter((line) => !/^\s*(\[SCHEDULE REMINDER\]|This is a scheduled message|schedule_id_json:|occurrence_at:|reminders_json:)/i.test(line))
+    .join("\n")
+    .trim();
+  return rest === "" ? [] : [rest];
+}
+
+/** Why a failed turn (`turn/end` reason) failed, as the owner reads it. */
+function failureLabel(reason: unknown): string {
+  const kind = (reason as { kind?: unknown } | undefined)?.kind;
+  if (kind === "max-tokens") return "模型的回复被截断了";
+  if (kind === "blocked") return "模型请求被拦下了";
+  switch ((reason as { error?: { code?: unknown } } | undefined)?.error?.code) {
+    case "RATE_LIMIT": return "模型服务器太忙";
+    case "TIMEOUT": return "模型响应超时";
+    case "SERVER": return "模型服务器出错";
+    case "TRANSPORT": return "连不上模型";
+    case "EMPTY_RESPONSE": return "模型没有回复";
+    case "QUOTA":
+    case "ACCOUNT_QUOTA": return "模型额度用完了";
+    case "INVALID_CREDENTIAL": return "模型的 key 不能用";
+    default: return "模型暂时出错";
+  }
+}
+
+/**
+ * What the owner gets when a reminder's turn ended in an error before the bot
+ * sent anything (the model was down): each reminder as it was set, and why it
+ * reads plainer than usual.
+ *
+ * A 「任务」 is a job for the bot, not a line for the owner, so it is reported
+ * as not done. If the turn had already started on it (`started`: it made tool
+ * calls), it is reported as not finished.
+ */
+export function reminderFallbackText(prompts: readonly string[], reason?: unknown, started = false): string {
+  const why = failureLabel(reason);
+  const strip = (prompt: string, word: string): string => prompt.trim().replace(new RegExp(`^${word}\\s*[:：]\\s*`), "");
+  const reminders = prompts.filter((p) => !isTaskPrompt(p)).map((p) => strip(p, "提醒"));
+  const tasks = prompts.filter(isTaskPrompt).map((p) => strip(p, "任务"));
+  const note = tasks.length === 0
+    ? `（${why}，没能照常回复，这是提醒原文。）`
+    : reminders.length === 0
+      ? `（${why}。要补做的话跟我说一声。）`
+      : `（${why}：提醒是原文；任务要补做的话跟我说一声。）`;
+  return [
+    ...reminders.map((r) => `提醒：${r}`),
+    ...tasks.map((t) => `定时任务没${started ? "做完" : "做成"}：${t}`),
+    note,
+  ].join("\n");
+}
+
+/**
  * The line that goes with a scheduled message delivered on a later day than it
  * was due (the Mac slept, DSH was down), or undefined. The message reads the
  * same whenever it arrives and its only time is UTC, while the prompt's date

@@ -546,9 +546,139 @@ function check(name, ok, detail) {
   check("judge 绑定到当前会话的路由",
     /memoryJudge/.test(bridgeSrc) && /currentRoute\(\)/.test(bridgeSrc),
     "judge 必须用 currentRoute(),否则又会发去别的模型");
-  check("judge 关掉思考",
-    /reasoningEffort:\s*"off"/.test(bridgeSrc),
-    "分类不需要推敲,而且思考会吃掉 maxTokens 让 message 全空");
+  // 只看 memoryJudge 自己:resolveModelInfo(route.provider, route.model) 在识图那几处也有,查全文盯不住它。
+  const judgeSrc = bridgeSrc.slice(bridgeSrc.indexOf("memoryJudge() {"), bridgeSrc.indexOf("currentRoute() {"));
+  check("judge 按路由报的思考档位选(能关就关,关不掉用最低一档)",
+    judgeSrc.length > 0 && /judgeCallControls\(model\?\.reasoning, model\?\.defaultMaxTokens\)/.test(judgeSrc)
+      && /resolveModelInfo\(route\.provider, route\.model\)/.test(judgeSrc)
+      && /maxTokens: controls\.maxTokens/.test(judgeSrc)
+      && !/reasoningEffort:\s*"off"/.test(bridgeSrc),
+    "以前写死 \"off\":OpenCode Go 的 DSF 没有这一档,宿主直接拒绝,自动记忆一条都记不上");
+}
+
+// ------------------------------- 自动记忆的判定调用:思考档位按路由选(2026-11-05)
+{
+  const { judgeCallControls: pick } = await import(join(ROOT, "lib/memory-auto.js"));
+  const efforts = (...ids) => ({ efforts: ids.map((id) => ({ id, name: id })) });
+  const dsf = efforts("low", "high", "max"); // OpenCode Go 的 DeepSeek V4.1 Flash,关不掉思考
+  const official = efforts("off", "low", "high", "max"); // DeepSeek 官方 deepseek-flash
+  const responses = efforts("off", "low", "medium", "high", "xhigh", "max"); // OpenAI Responses 那种,off 发成 none
+  const argon = efforts("low", "medium", "high");
+  check("判定:能关思考的路由照旧关掉、上限 400",
+    JSON.stringify(pick(official)) === JSON.stringify({ reasoningEffort: "off", maxTokens: 400 })
+      && pick(responses).reasoningEffort === "off");
+  check("判定:关不掉思考的路由用最低一档、放宽上限",
+    pick(dsf).reasoningEffort === "low" && pick(dsf).maxTokens >= 2000
+      && pick(argon).reasoningEffort === "low" && pick(efforts("high", "max")).reasoningEffort === "high"
+      && pick(efforts("max", "minimal", "low")).reasoningEffort === "minimal",
+    JSON.stringify(pick(dsf)));
+  check("判定:没有思考档位信息的模型不指定档位(宿主对它拒绝任何档位,off 也不行)",
+    pick(undefined).reasoningEffort === undefined && pick(undefined).maxTokens >= 2000
+      && pick({}).reasoningEffort === undefined);
+  check("判定:不认识的档位名按路由自己的顺序取第一个",
+    pick(efforts("auto", "deep")).reasoningEffort === "auto");
+  check("判定:名单里有 none(OpenAI 的「不思考」)就用它",
+    pick(efforts("none", "low", "high")).reasoningEffort === "none");
+  check("判定:输出上限不超过模型自己声明的(defaultMaxTokens)",
+    pick(dsf, 8192).maxTokens === 8192 && pick(official, 32768).maxTokens === 400
+      && pick(dsf, 0).maxTokens === pick(dsf).maxTokens && pick(undefined, 1000).maxTokens === 1000);
+  check("判定:关不掉思考时的上限够按档位预留思考预算的适配器(Antigravity 要大于约 1 万)",
+    pick(dsf).maxTokens > 10001, String(pick(dsf).maxTokens));
+
+  // 拿宿主自己的校验跑一遍:2026-10-19 起每次判定都失败在这一步。
+  const llmHost = await import(join(NPX, "@deepseek-ai/dsh-llm/lib/index.js")).catch(() => ({}));
+  const validate = llmHost.LlmRuntime?.prototype?.resolveCallWithInfo;
+  if (typeof validate === "function") {
+    const passes = (reasoning, controls) => {
+      const info = reasoning === undefined ? {} : { reasoning };
+      try { validate.call({}, { provider: "p", model: "m", ...controls }, info); return true; }
+      catch { return false; }
+    };
+    const routes = [dsf, official, responses, argon, undefined];
+    check("宿主校验:按新规则选的档位,每种路由都收",
+      routes.every((r) => passes(r, pick(r))),
+      routes.map((r) => JSON.stringify(pick(r))).join(" "));
+    check("宿主校验:旧写法的 off 在 DSF 和没有档位信息的模型上被拒(复现那个 bug)",
+      !passes(dsf, { reasoningEffort: "off" }) && !passes(undefined, { reasoningEffort: "off" }));
+  }
+
+  // 真目录(0.2.1 起才有 OpenCode Go):DSF 的 off 是 null,适配器报的档位里没有 off,新规则选 low。
+  // 档位表照 dsh-llm-pi-ai 的 reasoningInfo() 算:model.reasoning 为真时用 getSupportedThinkingLevels。
+  const piDist = join(NPX, "@earendil-works/pi-ai/dist");
+  const goCatalog = join(piDist, "providers/data/opencode-go.json");
+  if (existsSync(goCatalog) && existsSync(join(piDist, "models.js"))) {
+    const { getSupportedThinkingLevels } = await import(join(piDist, "models.js"));
+    const catalog = JSON.parse(readFileSync(goCatalog, "utf-8"));
+    const model = Object.values(catalog).flatMap((byKey) => Object.values(byKey))
+      .find((m) => m?.id === "deepseek-v4.1-flash");
+    if (model !== undefined && typeof getSupportedThinkingLevels === "function") {
+      const reasoning = model.reasoning
+        ? { efforts: getSupportedThinkingLevels(model).map((id) => ({ id, name: id })) }
+        : undefined;
+      check("真目录:OpenCode Go 的 DSF 没有 off,判定改用 low",
+        reasoning !== undefined && !reasoning.efforts.some((e) => e.id === "off")
+          && pick(reasoning).reasoningEffort === "low",
+        JSON.stringify(reasoning));
+    }
+  }
+
+  // 真的 bridge:判定调用交给宿主 llm.stream 的参数。只查源码文字盯不住这一处(2026-11-05 审查指出)。
+  {
+    const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+    const { PendingRegistry } = await import(join(ROOT, "lib/pending.js"));
+    const { DEFAULT_CONFIG } = await import(join(ROOT, "lib/config.js"));
+    const config = {
+      ...DEFAULT_CONFIG, sessionId: "sim-judge", autoMemory: false, idleCompaction: false,
+      provider: "opencode-go", model: "deepseek-v4.1-flash",
+    };
+    const deps = {
+      getAccount: () => ({ configured: true, userId: "owner@im.wechat" }),
+      getContextToken: () => "",
+      pending: new PendingRegistry(),
+    };
+    const bridge = new WechatBridge({ agents: { get: () => undefined }, get: () => undefined }, config, async () => {}, deps);
+    let info = { reasoning: dsf };
+    const calls = [];
+    bridge.useVisionServices({
+      llm: {
+        async resolveModelInfo() {
+          if (info instanceof Error) throw info;
+          return info;
+        },
+        async *stream(options) {
+          calls.push(options);
+          yield { type: "text-delta", text: "null" };
+          yield { type: "finish", reason: { kind: "stop" } };
+        },
+      },
+    });
+    const judgeOnce = async () => {
+      const judge = bridge.memoryJudge();
+      return judge === undefined ? "no judge" : judge("p");
+    };
+    const r1 = await judgeOnce();
+    const c1 = calls.at(-1);
+    check("bridge 判定:DSF 这种关不掉思考的路由发 low、上限放宽,走的是 bot 自己的路由",
+      r1 === "null" && c1?.reasoningEffort === "low" && c1?.maxTokens > 10001
+        && c1?.provider === "opencode-go" && c1?.model === "deepseek-v4.1-flash",
+      JSON.stringify({ r1, effort: c1?.reasoningEffort, max: c1?.maxTokens, provider: c1?.provider }));
+    info = { reasoning: official, defaultMaxTokens: 32768 };
+    await judgeOnce();
+    const c2 = calls.at(-1);
+    check("bridge 判定:能关思考的路由发 off、上限 400",
+      c2?.reasoningEffort === "off" && c2?.maxTokens === 400);
+    info = { defaultMaxTokens: 8192 };
+    await judgeOnce();
+    const c3 = calls.at(-1);
+    check("bridge 判定:没有思考档位的模型不带档位,上限按模型自己声明的",
+      c3 !== undefined && !("reasoningEffort" in c3) && c3.maxTokens === 8192);
+    info = new Error("unknown model");
+    const before = calls.length;
+    const r4 = await judgeOnce();
+    check("bridge 判定:解析不了模型就不判定,也不白发一次请求",
+      r4 === null && calls.length === before);
+    await bridge.dispose();
+  }
 }
 
 // ------------------------------------------- 自动记忆不收一次性提醒(2026-09-23)
@@ -1026,7 +1156,7 @@ function check(name, ok, detail) {
   // 每轮 10 条的上限:提醒那一轮也是新的一轮;被丢掉的那条要让调用方知道。
   {
     const fake = {
-      sessionId: "S", worker: undefined, turnMessageCount: 10, currentSender: undefined,
+      sessionId: "S", worker: undefined, turnMessageCount: 10, currentSender: undefined, unansweredReminders: new Map(), noteReminder() {},
       typing: { start() {}, stop() {} },
       deps: { getAccount: () => ({ userId: "owner" }) },
       ctx: { agents: { get: () => undefined } },
@@ -1040,7 +1170,8 @@ function check(name, ok, detail) {
   {
     const out = [];
     const fake = {
-      turnMessageCount: 10, sendChain: Promise.resolve(),
+      turnMessageCount: 10, sendChain: Promise.resolve(), unansweredReminders: new Map(),
+      deps: { getAccount: () => ({ userId: "owner" }) },
       sendText: async (_to, text) => { out.push(text); },
       typing: { noteDelivered() {} },
     };
@@ -4105,6 +4236,203 @@ function check(name, ok, detail) {
   check("电脑权限: programs run without a shell, and who started DSH is looked up as the plugin starts",
     /execFile\(cmd, args, \{/.test(permSrc) && !/\{[^}]*\bexec\b[^}]*\} from "node:child_process"|shell: true|spawnSync/.test(permSrc)
       && /if \(process\.platform === "darwin"\) \{\s*void detectLauncher\(\)\s*\.then\(/.test(permSrc));
+}
+
+
+// ------------------------------------- 提醒兜底:提醒那一轮出错就把原文发给机主(2026-11-05)
+{
+  const bl = await import(join(ROOT, "lib/backlog.js"));
+  const single = (prompt, at = "2026-11-05T22:00:00.000Z") => ["[SCHEDULE REMINDER]", "This is a scheduled message from the user",
+    'schedule_id_json: "s1"', `occurrence_at: ${at}`, `reminder_prompt_json: ${JSON.stringify(prompt)}`].join("\n");
+  const busy = { kind: "error", error: { code: "RATE_LIMIT", message: "429: overloaded" } };
+  const t1 = bl.reminderFallbackText(["提醒：给植物浇水"], busy);
+  check("提醒兜底:原文照发,去掉重复的「提醒：」,说明是模型太忙",
+    t1 === "提醒：给植物浇水\n（模型服务器太忙，没能照常回复，这是提醒原文。）", t1);
+  const t2 = bl.reminderFallbackText(["任务：排明天的闹钟"], { kind: "error", error: { code: "TIMEOUT" } });
+  const t3 = bl.reminderFallbackText(["任务：排明天的闹钟"], undefined, true);
+  check("提醒兜底:「任务」说没做成(已经动手了就说没做完),要补做时说一声",
+    t2 === "定时任务没做成：排明天的闹钟\n（模型响应超时。要补做的话跟我说一声。）"
+      && t3 === "定时任务没做完：排明天的闹钟\n（模型暂时出错。要补做的话跟我说一声。）", `${t2} | ${t3}`);
+  const t4 = bl.reminderFallbackText(["喝水", "任务:看课表"], busy);
+  check("提醒兜底:提醒和任务一起时各写一行",
+    t4 === "提醒：喝水\n定时任务没做成：看课表\n（模型服务器太忙：提醒是原文；任务要补做的话跟我说一声。）", t4);
+  check("提醒兜底:认得出提醒内容;格式变了也不丢(去掉机器行、留下其余)",
+    JSON.stringify(bl.scheduledReminders(single("提醒：交报告"))) === JSON.stringify(["提醒：交报告"])
+      && JSON.stringify(bl.scheduledReminders("[SCHEDULE REMINDER]\nThis is a scheduled message from the user\noccurrence_at: 2026-11-05T22:00:00.000Z\n新格式：交报告")) === JSON.stringify(["新格式：交报告"])
+      && bl.scheduledReminders("[SCHEDULE REMINDER]\noccurrence_at: 2026-11-05T22:00:00.000Z").length === 0);
+
+  // A real bridge, fed the session events the host emits for a reminder's turn. The fake agent refuses an
+  // inject while an event is being published, as the host's session does (an append cannot reenter one).
+  const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+  const { PendingRegistry } = await import(join(ROOT, "lib/pending.js"));
+  const { DEFAULT_CONFIG } = await import(join(ROOT, "lib/config.js"));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const owner = "fallback-owner@im.wechat";
+  const reminderMsg = (prompt) => ({ id: "m1", role: "user", source: { kind: "schedule" }, content: [{ type: "text", text: single(prompt) }] });
+  const run = async ({ prompt = "提醒：给植物浇水", end = busy, botSends = false, failSend, tools = 0, written = true, claimed = false, claimAgent = "sim-fallback" }) => {
+    const sent = [];
+    const injected = [];
+    let publishing = false;
+    let claimListener;
+    const agent = { inject: (m) => { if (publishing) throw new Error("session append cannot reenter while another append is being published"); injected.push(m); } };
+    const config = { ...DEFAULT_CONFIG, sessionId: "sim-fallback", autoMemory: false, idleCompaction: false };
+    const deps = { getAccount: () => ({ configured: true, userId: owner }), getContextToken: () => "", pending: new PendingRegistry() };
+    const ctx = {
+      agents: { get: () => agent }, get: () => undefined,
+      on: (name, listener) => { if (name === "agent/inbox/claimed") claimListener = listener; return () => { claimListener = undefined; }; },
+    };
+    const bridge = new WechatBridge(ctx, config, async (to, text) => {
+      if (failSend) throw new Error(failSend);
+      sent.push({ to, text });
+    }, deps);
+    const quiet = new Proxy({}, { get: () => () => {} });
+    bridge.typing = quiet;
+    bridge.idleCompact = quiet;
+    bridge.installSelection = () => {};
+    bridge.ensureTools = () => {};
+    let seq = 0;
+    const ev = (type, data) => {
+      publishing = true;
+      try { bridge.onSessionEvent({ id: "sim-fallback" }, { type, data, seq: ++seq, time: Date.now() }); }
+      finally { publishing = false; }
+    };
+    ev("turn/start", { turn: 1 });
+    if (claimed) claimListener?.({ message: reminderMsg(prompt), turn: 1, agent: { id: claimAgent } });
+    ev("step/start", { turn: 1, step: 1 });
+    if (written) ev("user/message", reminderMsg(prompt));
+    for (let i = 0; i < tools; i += 1) ev("tool/call", { name: "alarm_set" });
+    if (botSends) bridge.sendTextTo(owner, "该浇花啦");
+    ev("turn/end", { turn: 1, reason: end });
+    await sleep(30);
+    const kept = bridge.backlog.peek(owner);
+    if (kept.length > 0) bridge.backlog.remove(owner, kept.map((k) => k.id));
+    await bridge.dispose();
+    return { sent, injected: injected.map((m) => JSON.stringify(m)), kept, listening: claimListener !== undefined };
+  };
+  const failed = await run({});
+  check("提醒兜底:提醒那一轮出错、bot 什么都没发 → 原文发给机主,发完再告诉 bot(写在 turn/end 事件之外,宿主才收)",
+    failed.sent.length === 1 && failed.sent[0].to === owner && failed.sent[0].text.startsWith("提醒：给植物浇水\n（模型服务器太忙")
+      && failed.injected.length === 1 && /\[提醒兜底\][^"]*已经把下面这段直接发给了对方[^"]*不用再发一遍/.test(failed.injected[0]),
+    JSON.stringify(failed));
+  const answered = await run({ botSends: true });
+  check("提醒兜底:bot 已经发过东西再出错 → 不再补发",
+    answered.sent.length === 1 && answered.sent[0].text === "该浇花啦" && answered.injected.length === 0, JSON.stringify(answered));
+  const fine = await run({ end: { kind: "completed" } });
+  const stopped = await run({ end: { kind: "aborted", reason: { kind: "user" } } });
+  const odd = await run({ end: { kind: "something-new" } });
+  const gui = await run({ written: false });
+  check("提醒兜底:正常结束、被手动停下、不认识的结束原因、或这一轮没有提醒 → 什么都不发",
+    [fine, stopped, odd, gui].every((r) => r.sent.length === 0 && r.injected.length === 0), JSON.stringify({ fine, stopped, odd, gui }));
+  const cut = await run({ end: { kind: "max-tokens" } });
+  const blocked = await run({ end: { kind: "blocked" } });
+  check("提醒兜底:回复被截断、请求被拦下 → 也补发,说明原因",
+    cut.sent.length === 1 && cut.sent[0].text.includes("模型的回复被截断了")
+      && blocked.sent.length === 1 && blocked.sent[0].text.includes("模型请求被拦下了"), JSON.stringify({ cut: cut.sent, blocked: blocked.sent }));
+  const early = await run({ written: false, claimed: true });
+  check("提醒兜底:提醒刚被取出、还没写进历史就出错(准备请求时就失败) → 照样补发",
+    early.listening === false && early.sent.length === 1 && early.sent[0].text.startsWith("提醒：给植物浇水"), JSON.stringify(early));
+  const both = await run({ claimed: true });
+  check("提醒兜底:同一条提醒先被取出、再写进历史,只算一次",
+    both.sent.length === 1 && both.sent[0].text.split("提醒：给植物浇水").length === 2, JSON.stringify(both.sent));
+  const other = await run({ written: false, claimed: true, claimAgent: "session-other" });
+  check("提醒兜底:别的会话取出的提醒不算小bot的", other.sent.length === 0, JSON.stringify(other));
+  const task = await run({ prompt: "任务：排明天的闹钟", tools: 2 });
+  check("提醒兜底:动过手的「任务」出错 → 告诉机主没做完",
+    task.sent.length === 1 && task.sent[0].text.startsWith("定时任务没做完：排明天的闹钟"), JSON.stringify(task.sent));
+  const closed = await run({ failSend: "sendMessage ret=-2 errmsg=prepare failed" });
+  check("提醒兜底:微信这会儿不让 bot 先说话 → 原文存进待补发,标提醒原定的时间,并告诉 bot 存着",
+    closed.sent.length === 0 && closed.kept.length === 1 && closed.kept[0].kind === "text"
+      && closed.kept[0].at === "2026-11-05T22:00:00.000Z" && closed.kept[0].text.startsWith("提醒：给植物浇水")
+      && closed.injected.length === 1 && /已经存着/.test(closed.injected[0]), JSON.stringify({ kept: closed.kept, injected: closed.injected }));
+  const offline = await run({ failSend: "fetch failed", end: { kind: "error", error: { code: "TRANSPORT" } } });
+  check("提醒兜底:断网之类别的发送失败也存着(模型连不上时网络常常也不通)",
+    offline.kept.length === 1 && offline.kept[0].text.startsWith("提醒：给植物浇水\n（连不上模型") && /已经存着/.test(offline.injected[0] ?? ""),
+    JSON.stringify(offline.kept));
+}
+
+
+// --------------------- DSH 0.2.2:模型选择记在会话里,插件要自己记下(2026-11-05)
+{
+  const { WechatBridge } = await import(join(ROOT, "lib/bridge.js"));
+  const { PendingRegistry } = await import(join(ROOT, "lib/pending.js"));
+  const { DEFAULT_CONFIG } = await import(join(ROOT, "lib/config.js"));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // A 0.2.2-like agent: `model.current()` / `model.select()`, and a session that refuses an append
+  // while an event is being published (as the host's does).
+  const make = (recorded, { durable = true, pinned = true } = {}) => {
+    let publishing = false;
+    const selects = [];
+    const state = { recorded };
+    const agent = {
+      inject: () => {},
+      session: { requestHeader: () => undefined },
+      ...(durable ? { model: {
+        current: () => (state.recorded ? { ...state.recorded } : undefined),
+        select: (sel) => {
+          if (publishing) throw new Error("session append cannot reenter while another append is being published");
+          selects.push(sel);
+          state.recorded = { ...sel };
+        },
+      } } : {}),
+    };
+    const config = { ...DEFAULT_CONFIG, sessionId: "sim-select", autoMemory: false, idleCompaction: false,
+      ...(pinned ? { provider: "opencode", model: "deepseek-v4.1-flash", reasoningEffort: "low" } : {}) };
+    const deps = { getAccount: () => ({ configured: true, userId: "o@im.wechat" }), getContextToken: () => "", pending: new PendingRegistry() };
+    const bridge = new WechatBridge({ agents: { get: () => agent }, get: () => undefined }, config, async () => {}, deps);
+    const quiet = new Proxy({}, { get: () => () => {} });
+    bridge.typing = quiet;
+    bridge.idleCompact = quiet;
+    const ev = (type, data) => {
+      publishing = true;
+      try { bridge.onSessionEvent({ id: "sim-select" }, { type, data, seq: 1, time: Date.now() }); }
+      finally { publishing = false; }
+    };
+    return { bridge, selects, state, ev, agentCtx: { on: () => () => {}, get: () => undefined } };
+  };
+
+  // The web UI had picked the bot's line without an effort (what happened at 17:05).
+  const a = make({ provider: "opencode", model: "deepseek-v4.1-flash" });
+  a.bridge.installSelection(a.agentCtx);
+  await sleep(10);
+  check("0.2.2 模型选择:装上时把插件的设置(含 low)记进会话",
+    a.selects.length === 1 && a.selects[0].provider === "opencode" && a.selects[0].model === "deepseek-v4.1-flash"
+      && a.selects[0].reasoningEffort === "low", JSON.stringify(a.selects));
+  a.bridge.installSelection(a.agentCtx);
+  await sleep(10);
+  check("0.2.2 模型选择:会话里已经是这个设置就不再写", a.selects.length === 1, JSON.stringify(a.selects));
+  // The web UI picks another model for the bot's session: the plugin's choice is recorded again, after the event.
+  a.state.recorded = { provider: "opencode-go", model: "glm-5.3-flash" };
+  a.ev("model/selection", { provider: "opencode-go", model: "glm-5.3-flash" });
+  await sleep(10);
+  check("0.2.2 模型选择:网页上给小bot会话换了模型 → 按插件设置改回来(在事件之外写,宿主才收)",
+    a.selects.length === 2 && a.selects[1].model === "deepseek-v4.1-flash" && a.selects[1].reasoningEffort === "low", JSON.stringify(a.selects));
+  // The settings card changes the bot's model.
+  a.bridge.config = { ...a.bridge.config, provider: "openrouter", model: "qwen3.8-27b", reasoningEffort: "low" };
+  await a.bridge.refreshSelection();
+  await sleep(10);
+  check("0.2.2 模型选择:设置卡片换了模型 → 会话记下新的",
+    a.selects.length === 3 && a.selects[2].provider === "openrouter" && a.selects[2].model === "qwen3.8-27b", JSON.stringify(a.selects));
+  await a.bridge.dispose();
+
+  // Not pinned in the settings: a model picked in the web UI is left alone.
+  const b = make({ provider: "opencode-go", model: "glm-5.3-flash" }, { pinned: false });
+  b.ev("model/selection", { provider: "opencode-go", model: "glm-5.3-flash" });
+  await sleep(10);
+  check("0.2.2 模型选择:设置里没钉模型时,不去改网页上的选择", b.selects.length === 0, JSON.stringify(b.selects));
+  await b.bridge.dispose();
+
+  // An older host's agent has no `model`: nothing is recorded and nothing throws.
+  const c = make(undefined, { durable: false });
+  let threw = false;
+  try { c.bridge.installSelection(c.agentCtx); await sleep(10); } catch { threw = true; }
+  check("旧版宿主(没有 agent.model)照旧:不记、不报错", !threw && c.selects.length === 0);
+  await c.bridge.dispose();
+
+  const src = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+  check("0.2.2 模型选择:建好或恢复微信会话后也记一次",
+    /this\.recordSelection\("建好或恢复了微信会话", this\.handle\.agent\);/.test(src));
+  check("0.2.2:新的 plugin_manager(能装、停、删插件)不给微信会话用",
+    /const deny = \[[\s\S]*?"plugin_manager",[\s\S]*?\];/.test(src));
 }
 
 rmSync(STATE, { recursive: true, force: true });

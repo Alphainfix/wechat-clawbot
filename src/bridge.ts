@@ -41,17 +41,39 @@ import { markSessionCreated, wasSessionCreated } from "./state.js";
 import { PendingRegistry, type PendingAnswer } from "./pending.js";
 import { TypingIndicator } from "./typing.js";
 import { HOLD_MESSAGE, INCOMING_WAIT_MS, MAX_HOLDS, MAX_RESTARTS, TOGETHER_HINT, mayRestartTurn, shouldHoldReply } from "./coalesce.js";
-import { Backlog, FILE_ATTEMPTS, digestChunks, dueStamp, fileLabel, isSendWindowClosed, occurrenceAt, quietTask, type BacklogItem, type NewBacklogItem } from "./backlog.js";
+import { Backlog, FILE_ATTEMPTS, digestChunks, dueStamp, fileLabel, isSendWindowClosed, occurrenceAt, quietTask, reminderFallbackText, scheduledReminders, type BacklogItem, type NewBacklogItem } from "./backlog.js";
 import type { FileUploadResult } from "./tool.js";
 
 /**
  * Tool calls that are the bot talking to the user, not working: they must not
  * bring 「正在输入」 back after a reply (see TypingIndicator.noteWorking).
  */
+/**
+ * How a turn ends when the model failed it (dsh-agent-loop): an error after
+ * the host's retries, output cut off before the reply, or a request a hook
+ * blocked. Not "aborted": someone stopped it on purpose. An unknown kind
+ * counts as fine, so a renamed reason never makes every reminder go out twice.
+ */
+const FAILED_TURN = new Set(["error", "max-tokens", "blocked"]);
+
 const REPLY_TOOLS = new Set(["send_wechat_text", "send_wechat_file", "ask_user_question"]);
 
 /** One inbound WeChat message waiting for its turn; `parts` lets several merge into one. */
 type QueuedMessage = { sender: string; text: string; message: UserMessage; parts: unknown[] };
+
+/** DSH 0.2.2's per-session model selection (`agent.model`), the parts this file uses. */
+type AgentModelLike = {
+  current(): { provider: string; model: string; reasoningEffort?: string } | undefined;
+  select(selection: { provider: string; model: string; reasoningEffort?: string }): void;
+};
+
+/** What the host `llm` service reports about one route's model (the parts this file reads). */
+type RouteModelInfo = {
+  inputModalities?: readonly string[];
+  reasoning?: { efforts?: readonly { id: string }[]; defaultEffort?: string };
+  /** The deployment's declared output limit for this model, when it declares one. */
+  defaultMaxTokens?: number;
+};
 
 /** The text of a session message (its text parts). */
 function messageText(data: unknown): string {
@@ -74,7 +96,7 @@ function wechatUserMessage(parts: unknown[]): UserMessage {
 import { IdleCompactor, IDLE_COMPACT_RATIO, hostCompactionThreshold } from "./idle-compact.js";
 import { registerSendFileTool } from "./tool.js";
 import { randomUUID } from "node:crypto";
-import { captureTurnMemory, type MemoryJudge } from "./memory-auto.js";
+import { captureTurnMemory, judgeCallControls, type MemoryJudge } from "./memory-auto.js";
 import type { ResolvedWeixinAccount } from "./ilink/auth/accounts.js";
 import { logger } from "./ilink/util/logger.js";
 
@@ -201,6 +223,14 @@ export class WechatBridge {
   private readonly steeredIntoOtherTurn = new Set<string>();
   /** When the running reminder turn was due: what a refused reminder is stamped with. */
   private reminderDueAt: string | undefined;
+  /**
+   * The running turn's scheduled messages (by message id): what each asked for
+   * and when it was due. Kept until the bot sends the owner anything; if the turn
+   * then fails, they go out as they are (reminderFallback).
+   */
+  private readonly unansweredReminders = new Map<string, { prompts: string[]; due?: string }>();
+  /** Stops listening for the host taking reminders out of the inbox. */
+  private offInboxClaimed: (() => void) | undefined;
 
   constructor(ctx: Context, config: ClawbotConfig, sendText: SendTextFn, deps: BridgeDeps) {
     this.ctx = ctx;
@@ -209,6 +239,13 @@ export class WechatBridge {
     this.deps = deps;
     this.sessionId = SessionId(config.sessionId);
     this.backlog = deps.backlog ?? new Backlog();
+    try {
+      const on = (ctx as unknown as { on?: (name: string, listener: (args: unknown) => void) => unknown }).on;
+      const off = typeof on === "function" ? on.call(ctx, "agent/inbox/claimed", (args: unknown) => this.onInboxClaimed(args)) : undefined;
+      if (typeof off === "function") this.offInboxClaimed = off as () => void;
+    } catch (err) {
+      logger.warn(`reminder-fallback: not watching the inbox (${String(err)}); reminders are counted when written`);
+    }
     this.typing = new TypingIndicator({
       getAccount: () => deps.getAccount(),
       isWaitingFor: (sender) => deps.pending.hasFor(sender),
@@ -317,6 +354,7 @@ export class WechatBridge {
     }
     this.turnMessageCount += 1;
     this.answeredThisTurn = true;
+    if (sender === this.deps.getAccount()?.userId) this.unansweredReminders.clear();
     const due = this.reminderDueAt ?? new Date().toISOString();
     this.sendChain = this.sendChain.then(async () => {
       try {
@@ -337,11 +375,73 @@ export class WechatBridge {
     this.keep(to, { kind: "file", at: this.reminderDueAt ?? new Date().toISOString(), ...file });
   }
 
+  /** A scheduled message of the running turn: remembered once, by message id (claimed, then written). */
+  private noteReminder(id: unknown, text: string): void {
+    const key = typeof id === "string" ? id : `reminder-${this.unansweredReminders.size}`;
+    if (this.unansweredReminders.has(key)) return;
+    const prompts = scheduledReminders(text);
+    if (prompts.length > 0) this.unansweredReminders.set(key, { prompts, due: occurrenceAt(text) });
+  }
+
+  /**
+   * The host took a message out of the inbox for a turn. A reminder is counted
+   * here, before the model request is even prepared, so a turn that fails that
+   * early still counts it: its `user/message` is then never written.
+   */
+  private onInboxClaimed(args: unknown): void {
+    try {
+      const { message, agent } = (args ?? {}) as {
+        message?: { id?: unknown; source?: { kind?: unknown; plugin?: unknown } };
+        agent?: { id?: unknown };
+      };
+      if (typeof agent?.id !== "string" || !this.isWechatSession(agent.id)) return;
+      if (message?.source?.kind !== "schedule" && message?.source?.plugin !== "schedule") return;
+      this.noteReminder(message.id, messageText(message));
+    } catch (err) {
+      logger.warn(`reminder-fallback: could not read a claimed message: ${String(err)}`);
+    }
+  }
+
+  /**
+   * A reminder's turn failed before the bot sent the owner anything: send each
+   * reminder as it was set. The host marks a reminder delivered the moment it
+   * fires and never retries it, so this is its last chance. On 2026-11-04 and
+   * 11-05 a model provider's outage swallowed a reminder this way.
+   *
+   * Unlike an ordinary reply, the text is kept on ANY failed send, not only
+   * when WeChat's window is closed: a model that cannot be reached often means
+   * no network either. The note to the bot goes after the send, which is also
+   * outside the `turn/end` event: the host refuses an append to the session
+   * while it is publishing one, so a note written from the event never landed.
+   */
+  private reminderFallback(reminders: ReadonlyArray<{ prompts: string[]; due?: string }>, reason: unknown, started: boolean): void {
+    const owner = this.deps.getAccount()?.userId;
+    if (!owner || this.disposed) return;
+    const text = reminderFallbackText(reminders.flatMap((r) => r.prompts), reason, started);
+    const due = this.reminderDueAt ?? reminders.find((r) => r.due !== undefined)?.due ?? new Date().toISOString();
+    const detail = String((reason as { error?: { message?: unknown } } | undefined)?.error?.message ?? (reason as { kind?: unknown })?.kind ?? "").slice(0, 100);
+    logger.warn(`reminder-fallback: a reminder's turn failed before anything reached ${owner}; sending the reminder itself (${detail})`);
+    this.sendChain = this.sendChain.then(async () => {
+      let sent = false;
+      try {
+        await this.sendText(owner, text);
+        this.typing.noteDelivered(owner);
+        sent = true;
+      } catch (err) {
+        this.keep(owner, { kind: "text", at: due, text },
+          isSendWindowClosed(err) ? undefined : `the reminder could not be sent (${String(err).slice(0, 80)})`);
+      }
+      this.noteSession(sent
+        ? `[提醒兜底] 定时提醒那一轮出错了，插件已经把下面这段直接发给了对方，不用再发一遍：\n${text}`
+        : `[提醒兜底] 定时提醒那一轮出错了，插件想把下面这段直接发给对方，但微信这会儿发不出去，已经存着，等对方下次发消息后会补发，不用再发一遍：\n${text}`);
+    });
+  }
+
   /** Keep what WeChat would not take now (see backlog.ts). */
-  private keep(to: string, item: NewBacklogItem): void {
+  private keep(to: string, item: NewBacklogItem, why = "WeChat will not let the bot write first now"): void {
     try {
       this.backlog.add(to, item);
-      logger.info(`backlog: WeChat will not let the bot write first now; kept a ${item.kind} for ${to} until they write again`);
+      logger.info(`backlog: ${why}; kept a ${item.kind} for ${to} until they write again`);
     } catch (err) {
       logger.error(`backlog: could not keep a ${item.kind} for ${to}: ${String(err)}`);
     }
@@ -583,6 +683,7 @@ export class WechatBridge {
       return { status: "undelivered", detail };
     }
     this.answeredThisTurn = true;
+    this.unansweredReminders.clear();
     if (signal?.aborted) return { status: "stopped" };
     return new Promise<OwnerAnswer>((resolve) => {
       let settled = false;
@@ -650,12 +751,62 @@ export class WechatBridge {
     return this.ctx.get("agentDefaultModel")?.currentSelection();
   }
 
+  /** The WeChat agent's durable model selection (DSH 0.2.2+), or undefined on older hosts. */
+  private agentModel(agent?: unknown): AgentModelLike | undefined {
+    const target = (agent ?? this.ctx.agents.get(this.sessionId) ?? this.handle?.agent) as { model?: Partial<AgentModelLike> } | undefined;
+    const model = target?.model;
+    return typeof model?.select === "function" && typeof model?.current === "function" ? model as AgentModelLike : undefined;
+  }
+
+  /**
+   * Record the plugin's model choice in the WeChat session (DSH 0.2.2+).
+   *
+   * 0.2.2 routes each step by the session's own selection (`agent.model`: its
+   * latest `model/selection`, else the last request header), and the
+   * two-argument `installModelSelection` that used to pin the route per request
+   * now takes one argument and ignores the selection. On 2026-11-05 the bot ran
+   * on whatever the web UI had last picked for its session, without the
+   * plugin's `low`, and a model changed in the settings card did nothing. A
+   * no-op when the session already has this choice, and on older hosts.
+   *
+   * Deferred: called from a session-event listener, an append to the session is
+   * refused while the host is publishing.
+   */
+  private recordSelection(why: string, agent?: unknown): void {
+    queueMicrotask(() => {
+      try {
+        if (this.disposed) return;
+        const model = this.agentModel(agent);
+        const want = this.selectionRef.current;
+        if (model === undefined || want === undefined) return;
+        const have = model.current();
+        if (have !== undefined && have.provider === want.provider && have.model === want.model
+          && (have.reasoningEffort ?? undefined) === (want.reasoningEffort ?? undefined)) return;
+        model.select({
+          provider: want.provider,
+          model: want.model,
+          ...(want.reasoningEffort === undefined ? {} : { reasoningEffort: want.reasoningEffort }),
+        });
+        logger.info(`model selection: 微信会话记下 ${want.provider}/${want.model} reasoningEffort=${want.reasoningEffort ?? "(默认)"}（${why}）`);
+      } catch (err) {
+        logger.warn(`model selection: 没记下（${why}）: ${String(err).slice(0, 120)}`);
+      }
+    });
+  }
+
   private installSelection(agentCtx: Context): void {
-    if (this.selectionInstalled.has(agentCtx)) return;
+    if (this.selectionInstalled.has(agentCtx)) {
+      this.recordSelection("会话被宿主唤醒");
+      return;
+    }
     const selection = this.desiredSelection();
     if (!selection) return;
     this.selectionRef.current = selection;
+    this.recordSelection("装上");
     try {
+      // Before DSH 0.2.2 this pins the route per request; from 0.2.2 it takes one
+      // argument, ignores the selection and only adds the "model changed" notice
+      // (the host adds it for agents it composes; this plugin composes its own).
       installModelSelection(agentCtx, this.selectionRef);
       this.selectionInstalled.add(agentCtx);
       logger.info(
@@ -688,6 +839,7 @@ export class WechatBridge {
     // value that turns out to be fine.
     if (this.selectionRef.current === undefined) {
       this.selectionRef.current = next;
+      this.recordSelection("设置变了");
       return;
     }
     const llm = this.llmService();
@@ -702,6 +854,7 @@ export class WechatBridge {
       }
     }
     this.selectionRef.current = next;
+      this.recordSelection("设置变了");
     logger.info(
       `refreshSelection: 微信会话现在走 ${next.provider}/${next.model} reasoningEffort=${next.reasoningEffort ?? "(默认)"}`,
     );
@@ -823,6 +976,8 @@ export class WechatBridge {
         }
         markSessionCreated(this.sessionId);
       }
+      // DSH 0.2.2+: the route lives in the session (see recordSelection).
+      this.recordSelection("建好或恢复了微信会话", this.handle.agent);
       // The WeChat session answers approvals via WeChat: force `ask`.
       try {
         setApprovalPolicy(this.handle.agent.session, "ask");
@@ -914,11 +1069,11 @@ export class WechatBridge {
     }
   }
 
-  private llmService(): { resolveModelInfo: (p: string, m: string) => Promise<{ inputModalities?: readonly string[] }> } | undefined {
-    const llm = this.service<{ resolveModelInfo?: (p: string, m: string) => Promise<{ inputModalities?: readonly string[] }> }>("llm");
+  private llmService(): { resolveModelInfo: (p: string, m: string) => Promise<RouteModelInfo> } | undefined {
+    const llm = this.service<{ resolveModelInfo?: (p: string, m: string) => Promise<RouteModelInfo> }>("llm");
     return llm?.resolveModelInfo === undefined
       ? undefined
-      : (llm as { resolveModelInfo: (p: string, m: string) => Promise<{ inputModalities?: readonly string[] }> });
+      : (llm as { resolveModelInfo: (p: string, m: string) => Promise<RouteModelInfo> });
   }
 
   /**
@@ -948,18 +1103,36 @@ export class WechatBridge {
     const route = this.currentRoute();
     if (llm?.stream === undefined || route === null) return undefined;
     const stream = llm.stream.bind(llm);
+    const info = this.llmService();
 
     return async (prompt: string): Promise<string | null> => {
+      // 分类不需要推敲,而且**思考和回复共用输出预算** —— 留着思考会把
+      // maxTokens 吃光、message 全空(deepseek-flash 上踩过)。所以能关就关;
+      // 关不掉的路由(OpenCode Go 的 DeepSeek V4.1 Flash、Kimi K3.1、GLM)用它最低的
+      // 一档并放宽上限。以前一律写 "off",宿主对不认这一档的模型直接拒绝,
+      // bot 2026-10-19 换到 DSF 之后自动记忆一条都没记成。规则见 judgeCallControls()。
+      let controls: { reasoningEffort?: string; maxTokens: number };
+      try {
+        const model = info === undefined ? undefined : await info.resolveModelInfo(route.provider, route.model);
+        controls = judgeCallControls(model?.reasoning, model?.defaultMaxTokens);
+      } catch (err) {
+        // 下面的调用要解析同一个模型,照样会失败:不白发这一次。
+        logger.warn(
+          `memory-auto: 读不到 ${route.provider}/${route.model} 的思考档位,这条不判定 `
+          + `${String(err).slice(0, 100)}`,
+        );
+        return null;
+      }
+      logger.info(
+        `memory-auto: 判定走 ${route.provider}/${route.model} `
+        + `思考=${controls.reasoningEffort ?? "(不指定)"} 输出上限=${controls.maxTokens}`,
+      );
       const parts: string[] = [];
       try {
         for await (const chunk of stream({
           provider: route.provider,
           model: route.model,
-          // 分类不需要推敲,而且**思考和回复共用输出预算** —— 留着思考会把
-          // maxTokens 吃光、message 全空(deepseek-flash 上踩过)。
-          // 'off' 是 DSH 的合法档位名,两个 provider 都声明了它;万一某个 provider
-          // 没声明,下面的 catch 会把它降级成「这条不记」,不会拖垮这一轮对话。
-          reasoningEffort: "off",
+          ...(controls.reasoningEffort === undefined ? {} : { reasoningEffort: controls.reasoningEffort }),
           system: "你是记忆提取助手,只输出 JSON。",
           messages: [{
             id: randomUUID(),
@@ -968,7 +1141,7 @@ export class WechatBridge {
             // 适配器会读 source.kind(assistant 那条分支用得到),给不出就会抛。
             source: { kind: "user" },
           }],
-          maxTokens: 400,
+          maxTokens: controls.maxTokens,
         })) {
           if (chunk.type === "text-delta" && chunk.text !== undefined) parts.push(chunk.text);
           if (chunk.type === "finish" && chunk.reason?.kind !== "stop") {
@@ -1341,6 +1514,7 @@ export class WechatBridge {
   /** A reply tool went ahead: later messages this turn are follow-ups, not part of the same answer. */
   noteAnswered(): void {
     this.answeredThisTurn = true;
+    this.unansweredReminders.clear();
   }
 
   /** Start the serialized worker if it is not already running. */
@@ -1457,6 +1631,7 @@ export class WechatBridge {
       this.holdsThisTurn = 0;
       this.toolCallsThisTurn = 0;
       this.reminderDueAt = undefined;
+      this.unansweredReminders.clear();
       const turn = (event.data as { turn?: unknown } | undefined)?.turn;
       this.hostTurn = typeof turn === "number" ? turn : this.hostTurn + 1;
       this.hostStep = 0;
@@ -1466,6 +1641,18 @@ export class WechatBridge {
       this.hostStep = typeof step === "number" ? step : this.hostStep + 1;
     }
     if (event.type === "tool/call") this.toolCallsThisTurn += 1;
+    // DSH 0.2.2+: a model picked in the web UI for this session would now route the
+    // bot. The settings card is where the bot's model is chosen (as before 0.2.2,
+    // when the web UI never reached it), so a pinned choice is recorded again.
+    const loose = event as unknown as { type: string; data?: unknown };
+    if (loose.type === "model/selection" && this.config.provider !== undefined && this.config.model !== undefined) {
+      const picked = loose.data as { provider?: unknown; model?: unknown; reasoningEffort?: unknown } | undefined;
+      const want = this.selectionRef.current;
+      if (want !== undefined && (picked?.provider !== want.provider || picked?.model !== want.model
+        || (picked?.reasoningEffort ?? undefined) !== (want.reasoningEffort ?? undefined))) {
+        this.recordSelection("网页上改了小bot会话的模型；以插件设置为准");
+      }
+    }
     // The host takes a message out of the inbox before the step and writes it
     // into the history only when the step starts; until this event a restart
     // would cancel the turn and lose the message. Pinned to this turn and
@@ -1480,6 +1667,17 @@ export class WechatBridge {
         // What a refused reminder is stamped with: when it was due (even if it
         // fired late), not when the bot got round to it.
         this.reminderDueAt = occurrenceAt(messageText(event.data)) ?? new Date().toISOString();
+        this.noteReminder((event.data as { id?: unknown } | undefined)?.id, messageText(event.data));
+      }
+    }
+    // A reminder's turn that failed before the bot said anything: the host has
+    // already marked the reminder delivered and never retries it.
+    if (event.type === "turn/end") {
+      const reminders = [...this.unansweredReminders.values()];
+      this.unansweredReminders.clear();
+      const reason = (event.data as { reason?: { kind?: unknown } } | undefined)?.reason;
+      if (reminders.length > 0 && typeof reason?.kind === "string" && FAILED_TURN.has(reason.kind)) {
+        this.reminderFallback(reminders, reason, this.toolCallsThisTurn > 0);
       }
     }
     if (event.type === "tool/call" && this.currentSender) {
@@ -1742,6 +1940,11 @@ export class WechatBridge {
       // (dsh-subagent-acp), if the profile mounts one under this name: it is
       // for the web UI; the WeChat session keeps its own Claude bridge.
       "claude_code",
+      // DSH 0.2.2's standard preset: lists, enables, disables, installs and
+      // removes plugins and grants version exemptions, under full access. Not a
+      // job for a chat that reads web pages and takes requests over WeChat: one
+      // planted line could switch off this very plugin. The web UI keeps it.
+      "plugin_manager",
     ];
     try {
       // Direct property access, matching how this plugin already registers its
@@ -1779,6 +1982,7 @@ export class WechatBridge {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.offInboxClaimed?.();
     this.typing.dispose();
     this.idleCompact.dispose();
     // The tools go before the agent: if something else keeps the agent alive,
