@@ -123,7 +123,9 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     // agent (and part of the prompt cache), so these restart the WeChat
     // listener in place: the old bridge takes its tools back (bridge.ts
     // releaseTools), the new one registers the new set. No plugin reload.
-    const toolSwitches = hot.filter((key) => key === "macCalendar" || key === "codexPeer");
+    const toolSwitches = hot.filter(
+      (key) => key === "macCalendar" || key === "codexPeer" || key === "claudePeer",
+    );
     if (toolSwitches.length > 0 && !superseded) {
       if (hot.includes("codexPeer") && config.codexPeer !== true) codexPeer.close();
       void (async () => {
