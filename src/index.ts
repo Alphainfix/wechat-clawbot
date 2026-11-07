@@ -556,6 +556,17 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
     codexPeer.close();
     await stopMonitor(reason);
   });
+  // Make the effective working directory visible. Without a configured `cwd` the
+  // session records the host process's directory, which is not something the
+  // settings show (an Electron host lands in its own profile directory), and a
+  // typo in `cwd` used to be accepted silently.
+  const effectiveCwd = config.cwd ?? process.cwd();
+  if (config.cwd !== undefined && !fs.existsSync(config.cwd)) {
+    logger.warn(`cwd: ${config.cwd} does not exist; the session will record it anyway`);
+  }
+  logger.info(
+    `cwd: ${effectiveCwd} (${config.cwd === undefined ? "host process directory, cwd not configured" : "from config"})`,
+  );
   logger.info(`clawbot instance #${claim.id} active`);
   if (config.autoStart) {
     void claim.ready.then(() => {

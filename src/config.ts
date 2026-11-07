@@ -5,6 +5,8 @@
  * (see `cordis.patch.yml` and the profile's own patch layer). Every field has
  * a safe default, so the row can be as small as `{ autoStart: true }`.
  */
+import path from "node:path";
+
 import Schema from "@deepseek-ai/schemastery";
 
 import type { LogLevel } from "./ilink/util/logger.js";
@@ -301,7 +303,10 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
       typeof r.sessionId === "string" && r.sessionId.trim()
         ? r.sessionId.trim()
         : DEFAULT_CONFIG.sessionId,
-    cwd: typeof r.cwd === "string" && r.cwd.trim() ? r.cwd : undefined,
+    // Resolve once, here: the value is used as `meta.cwd` when the session is
+    // created and as the base for relative tool paths, so a relative path would
+    // otherwise be read against whatever directory the host happens to have.
+    cwd: typeof r.cwd === "string" && r.cwd.trim() ? path.resolve(r.cwd.trim()) : undefined,
     forwardQuestions:
       typeof r.forwardQuestions === "boolean"
         ? r.forwardQuestions
