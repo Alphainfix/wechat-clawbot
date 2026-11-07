@@ -60,7 +60,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:codex": "npm run build && node --test test/codex-bridge.mjs",
     "clean": "rm -rf lib",
-    "test:memory": "npm run build && node test/memory-eval-run.mjs"
+    "test:memory": "npm run build && node test/memory-eval-run.mjs",
+    "test:monitor": "node test/monitor.mjs"
   },
   "dsh": {
     "bundle": {
