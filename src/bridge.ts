@@ -1618,6 +1618,25 @@ export class WechatBridge {
   onSessionEvent(session: Session, event: SessionEvent): void {
     if (session.id !== this.sessionId) return;
     logger.debug(`sessionEvent: type=${event.type} seq=${event.seq}`);
+    // Follow a model picked in the web UI. `installModelSelection()` snapshots
+    // `current` per step, so a ref that is written only at install pins the agent
+    // to its creation-time route: the picker appends `model/selection` and the
+    // global default, but neither of those writes the ref. Mirroring the session's
+    // own choice keeps the ref in step with it, so the next request (and the
+    // request header that later readers use) follows the pick.
+    // `model/selection` is declared by the agent package rather than by the
+    // session's own event union, so compare it as a plain string.
+    if ((event.type as string) === "model/selection") {
+      const chosen = event.data as unknown as Partial<ModelSelection> | undefined;
+      if (chosen?.provider && chosen.model) {
+        this.selectionRef.current = {
+          provider: chosen.provider,
+          model: chosen.model,
+          ...(chosen.reasoningEffort === undefined ? {} : { reasoningEffort: chosen.reasoningEffort }),
+        };
+        logger.info(`sessionEvent: session picked ${chosen.provider}/${chosen.model} (next request)`);
+      }
+    }
     // Turns the worker drives stop the indicator themselves; this covers
     // reminder turns and messages steered into a turn someone else started.
     if (event.type === "assistant/message") {
