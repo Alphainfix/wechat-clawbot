@@ -1940,6 +1940,9 @@ export class WechatBridge {
       // (dsh-subagent-acp), if the profile mounts one under this name: it is
       // for the web UI; the WeChat session keeps its own Claude bridge.
       "claude_code",
+      // Same for the out-of-process Codex (dsh-subagent-codex, toolName in its
+      // own cordis.patch.yml). The WeChat session has its own Codex bridge.
+      "subagent_codex",
       // DSH 0.2.2's standard preset: lists, enables, disables, installs and
       // removes plugins and grants version exemptions, under full access. Not a
       // job for a chat that reads web pages and takes requests over WeChat: one
