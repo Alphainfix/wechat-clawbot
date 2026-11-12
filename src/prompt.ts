@@ -23,6 +23,7 @@ import {
   zonedWeekday,
 } from "./localtime.js";
 import { loadMemoryText } from "./memory.js";
+import type { ScheduleGeneration } from "./schedule-migrate.js";
 
 /**
  * The wall-clock header, recomputed on every prompt assembly.
@@ -114,15 +115,62 @@ const MEMORY_RULES = `关于长期记忆:
 - 每大约 5 轮对话,回顾一次:如果用户透露过值得记住但还没记录的信息,补记进去(通过 remember_user_info)。`;
 
 /**
+ * G5 for Hosts up to 0.2.1: `schedule_create` takes one timing selector
+ * (`at`, `after_seconds`, `every_seconds`, …) and answers `scheduledAt` in UTC;
+ * `schedule_list`/`schedule_update`/`schedule_delete` only see this Session.
+ */
+function reminderRulesV1(): string {
+  return `G5 — 定时提醒(schedule_create / 定时触发):
+1. 填 \`at\` 的日期:只能是"当前时刻"那一节里的今天/明天/后天(更远的按它们往后推)。**绝不要从聊天记录、旧提醒、记忆条目里抄日期。** 用户只给钟点时,按那一节的规则选今天还是明天——不要自己算。
+2. 工具报 \`not_future\`(The scheduled time must be strictly in the future):意思是**你填的日期或钟点已经过去了**,几乎总是因为抄了旧日期。照"当前时刻"那一节重填一次即可。绝对不要把它转述成"现在已经过了这个时间"——真出过一次:22:30 时把提醒填成 8-29 23:00 被拒,然后告诉用户"现在已经过了晚上11点",用户看到的是一句凭空编的话。只有当用户给的钟点确实**早于**那一节的"现在"时,才可以对用户说"这个时间已经过了";晚于"现在"就绝不能这么说,那种情况下 not_future 只说明你的日期填错了。另外,用户明确说了哪一天(如"今天凌晨一点")而那个钟点在那天已经过去时,确认里必须点明一句(如"今天凌晨1点已经过了,我设到明天凌晨1点"),不要默默换成别的日期就当没事——日期写对了但没说,用户以为你听错了。
+3. 工具成功返回的 \`scheduledAt\` 是 **UTC**(带 Z),不是本地时间,**不要照读**。确认消息里的日期时间必须来自你刚才填进 \`at\` 的那两个值,逐字一致;如果用的是 \`after_seconds\`,钟点 = "当前时刻"里的现在 + 那个时长。拿不准就调 \`schedule_list\` 看一眼,别凭感觉写。
+4. 创建后,只回复一条简短确认,仅包含提醒内容和本地触发时间(使用用户本地时区——绝不要报 UTC 或原始时间戳)。确认里必须写出**绝对日期+星期**,如"已设提醒:8月20日(周四)上午10点交报告"。绝不要只说"明天/后天上午10点"——相对词会把算错的日期藏起来,用户看不出问题(曾经把"明天"排到了后天,确认里写"明天"所以完全没被发现)。可以追加一句提醒用户保持 DSH 图形界面运行,如"记得保持服务开着,到点我会提醒你"。不要解释定时工具、机制、会话本地性,或任何替代方案;不要发送第二条消息。
+5. 定时提醒触发并被注入你的会话时:必须调用 send_wechat_text 工具,发送一条只包含提醒内容的短消息(如"提醒:交报告啦")。没有任何自动转发——不调用工具,用户就永远收不到提醒,所以一定要发送。不要解释这是定时触发的,不要描述机制,不要道歉,不要提供后续提议,不要重复设置细节。例外:提醒内容以「任务:」开头的(冒号全角半角都算),是用户让你到点去做的事(见第 7 条),不是要转给用户的话:照着内容去做(该查就查、该设就设),做完只发内容要求发的结果;内容说没事就不用打扰的,那就一条都不发;要问用户的,问一句就结束这一轮,等回复再接着做。任务回合不用先发确认,也不用规则 A/H 的总结;任务没能做成(工具不可用、出错)时,不管内容怎么说,都要发一句说明。任务里的「今天/明天/第二天」都按原定时间算:电脑睡着时定时消息会晚到,跨了日期的,后面紧跟一条「[定时消息晚到]」写明原定哪天,日子照它算;已经过去的时间不补。
+6. 用户要求列出或取消提醒时:一条短消息报出事实(每个提醒的时间+内容,或"已取消")。不叙述。
+7. 用户要你到点(或每天定时)去**做**一件事、而不只是提醒一声时(比如每晚看第二天的行程排闹钟、每天早上查天气发过去):用 schedule_create 建提醒,内容以「任务:」开头(只是提醒一声的,内容不要这样开头),写清楚做什么、按什么规则、做完发不发消息、发什么——用户说的规则原样写进去,日期写成相对原定时间的(如「原定时间的第二天」),不要写死。确认时照第 4 条写清时间,再用一句话说这个任务做什么。`;
+}
+
+/**
+ * G5 for DSH 0.2.2+: `schedule_create` takes `title`/`prompt`/`rrule`/`target`,
+ * the task list is Host-wide, `schedule_update`/`schedule_delete` are gone
+ * (one `schedule_edit` replaces them), and the result carries `scheduledAtLocal`.
+ *
+ * @param sessionId - this WeChat Session, the only task target the bot may see.
+ */
+function reminderRulesV2(sessionId: string): string {
+  return `G5 — 定时提醒(schedule_create / 定时触发):
+1. 参数(DSH 0.2.2 起):schedule_create 只收 title、prompt、rrule、target,没有 at / after_seconds / daily 这些时间选择参数。rrule 固定两行(中间一个换行):第一行 DTSTART;TZID=时区:YYYYMMDDTHHMMSS,第二行 RRULE。一次性提醒的第二行是 RRULE:FREQ=DAILY;COUNT=1;每天/每周重复用 RRULE:FREQ=DAILY 或 RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR。例子(2026-11-07 09:00 一次性,两行之间是一个真换行,不是 \\n 这两个字符):第一行 DTSTART;TZID=Asia/Shanghai:20261107T090000,第二行 RRULE:FREQ=DAILY;COUNT=1——时区用"当前日期"那一节里的时区,日期时间写成 YYYYMMDDTHHMMSS(去掉横线和冒号)。
+2. DTSTART 的日期:只能是"当前日期"那一节里的今天/明天/后天(更远的按它们往后推),钟点用用户说的。**绝不要从聊天记录、旧提醒、记忆条目里抄日期。** 用户只给钟点时,按那一节的规则选今天还是明天——不要自己算。工具报 \`not_future\`(rrule must contain an occurrence strictly in the future):意思是这条规则里没有任何将来的时间,几乎总是因为抄了旧日期——照"当前日期"那一节重填一次即可;绝对不要把它转述成"现在已经过了这个时间"。
+3. **target 每次都必须填 "this_session"**。不填会默认新建一个会话,提醒投进那个新会话,微信永远收不到。
+4. 工具成功返回里的 \`scheduledAtLocal\` 就是本地时间(带星期几),确认消息逐字用它;**不要读 \`scheduledAt\`(那是 UTC),也不要自己算**。创建后只回复一条简短确认,仅包含提醒内容和本地触发时间,必须写出**绝对日期+星期**,如"已设提醒:11月7日(周六)上午9点交报告"。绝不要只说"明天/后天上午9点"。不要解释定时工具、机制、会话本地性,或任何替代方案;不要发送第二条消息。
+5. 定时提醒触发并被注入你的会话时:必须调用 send_wechat_text 工具,发送一条只包含提醒内容的短消息(如"提醒:交报告啦")。没有任何自动转发——不调用工具,用户就永远收不到提醒,所以一定要发送。不要解释这是定时触发的,不要描述机制,不要道歉,不要提供后续提议,不要重复设置细节。例外:提醒内容以「任务:」开头的(冒号全角半角都算),是用户让你到点去做的事(见第 7 条),不是要转给用户的话:照着内容去做(该查就查、该设就设),做完只发内容要求发的结果;内容说没事就不用打扰的,那就一条都不发;要问用户的,问一句就结束这一轮,等回复再接着做。任务回合不用先发确认,也不用规则 A/H 的总结;任务没能做成(工具不可用、出错)时,不管内容怎么说,都要发一句说明。任务里的「今天/明天/第二天」都按原定时间算:电脑睡着时定时消息会晚到,跨了日期的,后面紧跟一条「[定时消息晚到]」写明原定哪天,日子照它算;已经过去的时间不补。
+6. 列出/取消/改期:schedule_list 列的是**宿主的全部任务**,不只本会话的;只有 target.sessionId 等于 \`${sessionId}\` 的任务才是本会话的提醒,别的一律不要动、也不要向用户报。取消用 schedule_edit(action:"delete", id);改时间用 schedule_edit(action:"update", id, rrule=新的两行规则);暂停/继续用 schedule_edit 的 active 参数。报给用户时每个提醒只说时间和内容,或一句"已取消"。不叙述过程。
+7. 用户要你到点(或每天定时)去**做**一件事、而不只是提醒一声时(比如每晚看第二天的行程排闹钟、每天早上查天气发过去):用 schedule_create 建提醒,内容以「任务:」开头(只是提醒一声的,内容不要这样开头),写清楚做什么、按什么规则、做完发不发消息、发什么——用户说的规则原样写进去,日期写成相对原定时间的(如「原定时间的第二天」),不要写死。target 照样填 "this_session"。确认时照第 4 条写清时间,再用一句话说这个任务做什么。`;
+}
+
+/**
+ * G5 for the schedule service this Host actually runs. The two generations take
+ * different tool parameters, so the model must be told the one it has.
+ * @param generation - 2 for DSH 0.2.2+ (rrule + Host-wide tasks), 1 otherwise.
+ * @param sessionId - the WeChat Session, used to filter the Host-wide list.
+ */
+function reminderRules(generation: ScheduleGeneration, sessionId: string): string {
+  return generation === 2 ? reminderRulesV2(sessionId) : reminderRulesV1();
+}
+
+/**
  * The rule text, built per prompt assembly because one rule depends on a live
- * setting (`stripEmoji`). Everything else is constant.
+ * setting (`stripEmoji`) and the reminder rules depend on the Host's schedule
+ * service generation. Everything else is constant.
  *
  * @param allowEmoji - whether ordinary Unicode emoji may appear in replies.
  *   Mirrors `config.stripEmoji` inverted: the plugin strips them deterministically
  *   when it is on, so telling the model to use them anyway would just produce
  *   text that gets mangled on the way out.
+ * @param generation - schedule service generation; see {@link reminderRules}.
+ * @param sessionId - the WeChat Session named in the Host-wide task filter.
  */
-function weixinRules(allowEmoji: boolean): string {
+function weixinRules(allowEmoji: boolean, generation: ScheduleGeneration, sessionId: string): string {
   return `你正在通过 ClawBot 桥接与用户进行微信聊天。请严格按照以下规则执行,按顺序:
 
 规则 A0 — 唯一发送方式:显式调用发送工具(最重要规则):
@@ -214,14 +262,7 @@ G3 — 其他所有信息(事实、搜索结果、对比、推荐):直接给结�
 
 G4 — 地点请求:用户问某个地方在哪时,除了坐标/文字答案,一定要附上 Google Maps 位置链接(如 https://maps.google.com/?q=<地点名> 或该地点的地图链接)。在回复中紧随答案给出。
 
-G5 — 定时提醒(schedule_create / 定时触发):
-1. 填 \`at\` 的日期:只能是"当前时刻"那一节里的今天/明天/后天(更远的按它们往后推)。**绝不要从聊天记录、旧提醒、记忆条目里抄日期。** 用户只给钟点时,按那一节的规则选今天还是明天——不要自己算。
-2. 工具报 \`not_future\`(The scheduled time must be strictly in the future):意思是**你填的日期或钟点已经过去了**,几乎总是因为抄了旧日期。照"当前时刻"那一节重填一次即可。绝对不要把它转述成"现在已经过了这个时间"——真出过一次:22:30 时把提醒填成 8-29 23:00 被拒,然后告诉用户"现在已经过了晚上11点",用户看到的是一句凭空编的话。只有当用户给的钟点确实**早于**那一节的"现在"时,才可以对用户说"这个时间已经过了";晚于"现在"就绝不能这么说,那种情况下 not_future 只说明你的日期填错了。另外,用户明确说了哪一天(如"今天凌晨一点")而那个钟点在那天已经过去时,确认里必须点明一句(如"今天凌晨1点已经过了,我设到明天凌晨1点"),不要默默换成别的日期就当没事——日期写对了但没说,用户以为你听错了。
-3. 工具成功返回的 \`scheduledAt\` 是 **UTC**(带 Z),不是本地时间,**不要照读**。确认消息里的日期时间必须来自你刚才填进 \`at\` 的那两个值,逐字一致;如果用的是 \`after_seconds\`,钟点 = "当前时刻"里的现在 + 那个时长。拿不准就调 \`schedule_list\` 看一眼,别凭感觉写。
-4. 创建后,只回复一条简短确认,仅包含提醒内容和本地触发时间(使用用户本地时区——绝不要报 UTC 或原始时间戳)。确认里必须写出**绝对日期+星期**,如"已设提醒:8月20日(周四)上午10点交报告"。绝不要只说"明天/后天上午10点"——相对词会把算错的日期藏起来,用户看不出问题(曾经把"明天"排到了后天,确认里写"明天"所以完全没被发现)。可以追加一句提醒用户保持 DSH 图形界面运行,如"记得保持服务开着,到点我会提醒你"。不要解释定时工具、机制、会话本地性,或任何替代方案;不要发送第二条消息。
-5. 定时提醒触发并被注入你的会话时:必须调用 send_wechat_text 工具,发送一条只包含提醒内容的短消息(如"提醒:交报告啦")。没有任何自动转发——不调用工具,用户就永远收不到提醒,所以一定要发送。不要解释这是定时触发的,不要描述机制,不要道歉,不要提供后续提议,不要重复设置细节。例外:提醒内容以「任务:」开头的(冒号全角半角都算),是用户让你到点去做的事(见第 7 条),不是要转给用户的话:照着内容去做(该查就查、该设就设),做完只发内容要求发的结果;内容说没事就不用打扰的,那就一条都不发;要问用户的,问一句就结束这一轮,等回复再接着做。任务回合不用先发确认,也不用规则 A/H 的总结;任务没能做成(工具不可用、出错)时,不管内容怎么说,都要发一句说明。任务里的「今天/明天/第二天」都按原定时间算:电脑睡着时定时消息会晚到,跨了日期的,后面紧跟一条「[定时消息晚到]」写明原定哪天,日子照它算;已经过去的时间不补。
-6. 用户要求列出或取消提醒时:一条短消息报出事实(每个提醒的时间+内容,或"已取消")。不叙述。
-7. 用户要你到点(或每天定时)去**做**一件事、而不只是提醒一声时(比如每晚看第二天的行程排闹钟、每天早上查天气发过去):用 schedule_create 建提醒,内容以「任务:」开头(只是提醒一声的,内容不要这样开头),写清楚做什么、按什么规则、做完发不发消息、发什么——用户说的规则原样写进去,日期写成相对原定时间的(如「原定时间的第二天」),不要写死。确认时照第 4 条写清时间,再用一句话说这个任务做什么。
+${reminderRules(generation, sessionId)}
 
 G6 — 看图识别/物品鉴定(如玩具、周边、动漫角色):
 1. 用户发来物品照片问"这是什么/哪一款"时:图就附在消息里,你直接看。看完如果只是眼熟但不确定,必须上网搜索核实官方名称、系列、发售信息,再下结论。
@@ -290,10 +331,14 @@ G13 — 别的 agent 已经发给用户的消息:
  * `scripts/bot-sim.mjs` exercises the same string the live bot gets, instead of
  * a hand-copied approximation that drifts the moment a rule changes.
  */
-export function buildWechatSystemPrompt(allowEmoji = false): string {
+export function buildWechatSystemPrompt(
+  allowEmoji = false,
+  generation: ScheduleGeneration = 1,
+  sessionId = "wechat-main",
+): string {
   const memory = loadMemoryText();
   const memorySection = memory ? `${MEMORY_RULES}\n\n## 用户记忆（长期）\n${memory}\n\n` : "";
-  return `${memorySection}${currentTimeSection()}${weixinRules(allowEmoji)}`;
+  return `${memorySection}${currentTimeSection()}${weixinRules(allowEmoji, generation, sessionId)}`;
 }
 
 /**
@@ -303,11 +348,15 @@ export function buildWechatSystemPrompt(allowEmoji = false): string {
  * function the harness calls on every prompt assembly, so flipping the emoji
  * setting changes the very next turn's rules with no restart. Passing a copy
  * here would quietly pin the prompt to whatever the setting was at boot.
+ *
+ * `generation` is a getter for the same reason: the schedule service is
+ * injected after this registration, and 0.2.2 needs different G5 rules.
  */
 export function registerWechatGuidanceGlobal(
   ctx: Context,
   sessionId: string,
   config: { stripEmoji: boolean },
+  generation: () => ScheduleGeneration = () => 1,
 ): void {
   ctx.systemPrompt.section({
     name: "wechat-guidance",
@@ -318,7 +367,7 @@ export function registerWechatGuidanceGlobal(
       const agent = (context as { agent?: { session?: { id?: unknown } } }).agent;
       if (String(agent?.session?.id) !== String(sessionId)) return "";
       // Prepended per assembly so the clock is never stale.
-      return `${currentTimeSection()}${weixinRules(!config.stripEmoji)}`;
+      return `${currentTimeSection()}${weixinRules(!config.stripEmoji, generation(), sessionId)}`;
     },
   });
   ctx.systemPrompt.section({
