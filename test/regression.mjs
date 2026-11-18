@@ -2331,9 +2331,10 @@ function check(name, ok, detail) {
   mkdirSync(join(home, ".nvm/versions/node/v22.1.0/bin"), { recursive: true });
   symlinkSync(join(pkg, "bin/claude.exe"), join(home, ".nvm/versions/node/v22.1.0/bin/claude"));
   mkdirSync(join(home, ".local/share/claude/versions"), { recursive: true });
-  writeFileSync(join(home, ".local/share/claude/versions/2.1.296"), "#!/bin/sh\n", { mode: 0o755 });
+  // Newer than any real install (the candidates include /opt/homebrew/bin and /usr/local/bin).
+  writeFileSync(join(home, ".local/share/claude/versions/99.0.1"), "#!/bin/sh\n", { mode: 0o755 });
   mkdirSync(join(home, ".local/bin"), { recursive: true });
-  symlinkSync(join(home, ".local/share/claude/versions/2.1.296"), join(home, ".local/bin/claude"));
+  symlinkSync(join(home, ".local/share/claude/versions/99.0.1"), join(home, ".local/bin/claude"));
   const saved = { HOME: process.env.HOME, PATH: process.env.PATH };
   process.env.HOME = home;
   process.env.PATH = "/usr/bin:/bin";
