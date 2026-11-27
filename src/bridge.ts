@@ -24,7 +24,9 @@ import { zonedStamp } from "./localtime.js";
 import { compressForUpload } from "./image-compress.js";
 import { registerClaudePeerTools } from "./claude-peer.js";
 import { registerDshSessionTools } from "./dsh-sessions.js";
-import { NOTIFY_TOOL } from "./owner-notify.js";
+import { NOTIFY_TOOL, notifyOwner } from "./owner-notify.js";
+import { Onboarding, registerSetupGuideTool } from "./onboarding.js";
+import { registerVoiceSetupTools, type VoiceSetupDeps } from "./voice-setup.js";
 import { registerCodexPeerTools, type CodexPeer } from "./codex-peer.js";
 import { registerCalendarTools, type CalendarHelper, type OwnerAnswer } from "./mac-calendar.js";
 import { registerAlarmTools, type AlarmService } from "./mac-alarms.js";
@@ -231,6 +233,8 @@ export class WechatBridge {
   private readonly unansweredReminders = new Map<string, { prompts: string[]; due?: string }>();
   /** Stops listening for the host taking reminders out of the inbox. */
   private offInboxClaimed: (() => void) | undefined;
+  /** The first-time setup guide (onboarding.ts). */
+  private readonly onboarding: Onboarding;
 
   constructor(ctx: Context, config: ClawbotConfig, sendText: SendTextFn, deps: BridgeDeps) {
     this.ctx = ctx;
@@ -239,6 +243,19 @@ export class WechatBridge {
     this.deps = deps;
     this.sessionId = SessionId(config.sessionId);
     this.backlog = deps.backlog ?? new Backlog();
+    this.onboarding = new Onboarding({
+      voice: { ctx: this.ctx, config: this.config },
+      config: this.config,
+      getAccount: () => deps.getAccount(),
+      activeSender: () => this.activeSender,
+      tellOwner: (text) => this.tellOwner(text),
+    });
+    // Stamped now, before any message arrives: a new pairing has no history yet, an existing owner does.
+    try {
+      this.onboarding.state();
+    } catch (err) {
+      logger.warn(`setup: could not read the setup state (${String(err).slice(0, 160)})`);
+    }
     try {
       const on = (ctx as unknown as { on?: (name: string, listener: (args: unknown) => void) => unknown }).on;
       const off = typeof on === "function" ? on.call(ctx, "agent/inbox/claimed", (args: unknown) => this.onInboxClaimed(args)) : undefined;
@@ -648,6 +665,33 @@ export class WechatBridge {
       signal?.addEventListener("abort", withdraw, { once: true });
       this.deps.pending.push(entry);
     });
+  }
+
+  /**
+   * Tell the owner something outside any turn: the first-time checklist, the
+   * end of a download they asked for. Goes out like any notification (kept for
+   * the digest when WeChat will not take it now), with a copy in the
+   * conversation so the bot knows what they were told.
+   */
+  private async tellOwner(text: string): Promise<void> {
+    const outcome = await notifyOwner(
+      this.ctx,
+      { config: this.config, sendText: this.sendText, getAccount: () => this.deps.getAccount(), backlog: this.backlog },
+      { text, source: "DSH" },
+    );
+    if (!outcome.ok) throw new Error(outcome.message);
+  }
+
+  /** What the tools that set voice up need from here (voice-setup.ts). */
+  private voiceSetupDeps(): VoiceSetupDeps {
+    return {
+      ctx: this.ctx,
+      config: this.config,
+      getAccount: () => this.deps.getAccount(),
+      activeSender: () => this.activeSender,
+      askOwner: (question, signal) => this.askOwner(question, 600_000, signal),
+      tellOwner: (text) => this.tellOwner(text),
+    };
   }
 
   /**
@@ -1599,6 +1643,8 @@ export class WechatBridge {
         this.idleCompact.noteIdle();
         // Answered: now what WeChat would not take before (after the reply on the chain).
         this.deliverBacklog(first.sender);
+        // …and, the first time a new owner has been answered, the setup checklist.
+        void this.onboarding.afterReply(first.sender).catch(() => undefined);
       }
     }
     this.currentSender = undefined;
@@ -1857,6 +1903,16 @@ export class WechatBridge {
       registerClaudePeerTools(agentCtx, this.config);
       // The same for the owner's other DSH conversations, in any folder.
       registerDshSessionTools(agentCtx, this.ctx, this.config.sessionId);
+      // Getting set up: the first-time checklist, and switching DSH's speech recognition on at the owner's word.
+      try {
+        registerVoiceSetupTools(agentCtx, this.voiceSetupDeps());
+        registerSetupGuideTool(agentCtx, this.onboarding, {
+          getAccount: () => this.deps.getAccount(),
+          activeSender: () => this.activeSender,
+        });
+      } catch (err) {
+        logger.warn(`ensureTools: the setup tools did not register (the rest did): ${String(err).slice(0, 200)}`);
+      }
       // Codex tools only when the owner switched them on: every registered tool
       // rides along on every request. codexPeer is a cold field, so a flip
       // restarts the listener and lands here again with the new value.

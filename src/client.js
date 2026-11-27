@@ -852,6 +852,17 @@ window.__ModuleLoader__.load({
           }),
         }),
         Field({
+          label: "语音没带文字时在本机转写",
+          hint: "微信一般会把语音转成文字一起发来。哪次没带，就在这台电脑上转：先用 DSH 自带的「语音输入」（在左边「插件」里打开，各平台都能用），它没开时 Mac（macOS 26 及以上）用系统自带的听写。语音不出这台电脑。关掉则这种语音只回一句「听不了」",
+          overridden: isSet("voiceTranscribe"), disabled,
+          onReset: () => clear("voiceTranscribe"),
+          inline: h(Switch, {
+            on: v.voiceTranscribe !== false, disabled,
+            label: "语音没带文字时在本机转写",
+            onChange: (next) => set("voiceTranscribe", next),
+          }),
+        }),
+        Field({
           label: "空闲时整理对话",
           hint: "回复结束、安静 10 分钟后，上下文接近压缩阈值就趁空闲把旧对话整理成摘要。下一条消息来时不用再等压缩",
           overridden: isSet("idleCompaction"), disabled,

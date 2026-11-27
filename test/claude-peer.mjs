@@ -208,7 +208,10 @@ if (selfName !== undefined) {
   if (title !== undefined) {
     const word = title.split(/\s+/)[0].slice(0, 6);
     const viaTitle = await tools.get("read_claude_session").execute({ session: word, limit: 1 });
-    check(`a title fragment resolves ("${word}")`, viaTitle.ok === true,
+    // Two real conversations on this machine may start with the same words; being
+    // asked to pick between them is the title matching, too.
+    const several = viaTitle.ok !== true && /同时匹配到 \d+ 个/.test(viaTitle.summary ?? "");
+    check(`a title fragment resolves ("${word}")`, viaTitle.ok === true || several,
       (viaTitle.summary ?? "").slice(0, 200));
   }
   // The id comes from the LISTING, which is the output that carries `id=`; the

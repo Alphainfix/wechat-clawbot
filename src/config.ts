@@ -151,6 +151,20 @@ export interface ClawbotConfig {
   workspaceInstructions: boolean;
 
   /**
+   * Transcribe a voice message on this machine when WeChat sends it without
+   * its transcript (see `src/voice.ts`). WeChat usually sends the text along
+   * and nothing here runs. When it does not, the audio is turned into text by
+   * DSH's own speech recognition when the owner has it switched on (any
+   * platform), else by the system's on-device speech models on a Mac with
+   * macOS 26 or later: the audio stays on the machine and macOS asks for no
+   * permission. On by default — off, such a message gets a one-line reply
+   * saying the bot cannot hear it. Hot: read per message.
+   */
+  voiceTranscribe: boolean;
+  /** BCP 47 tag of the language people speak to the bot in (zh-CN, en-US, …), for the Mac's own models. Hot. */
+  voiceLanguage: string;
+
+  /**
    * Whether the `/plugins/clawbot/mcp/*` bridge answers requests — the surface
    * an MCP client (the bundled clawbot-mcp, or a Claude Code MCP server) calls. Off makes every route
    * return 403 while leaving them registered, so this is a live kill switch
@@ -271,6 +285,8 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   autoMemory: true,
   idleCompaction: true,
   workspaceInstructions: true,
+  voiceTranscribe: true,
+  voiceLanguage: "zh-CN",
   mcpBridge: true,
   codexPeer: false,
   codexTransport: "socket",
@@ -292,6 +308,13 @@ function asStringArray(value: unknown): string[] {
 }
 
 /** Merge a raw (possibly partial) row config over the defaults. */
+/** A language tag as typed (zh-CN, zh_CN, en-us); anything that is not one falls back to the default. */
+function normalizeVoiceLanguage(value: unknown): string {
+  if (typeof value !== "string") return DEFAULT_CONFIG.voiceLanguage;
+  const tag = value.trim().replace(/_/g, "-");
+  return /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(tag) ? tag : DEFAULT_CONFIG.voiceLanguage;
+}
+
 export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, unknown>): ClawbotConfig {
   const r = (raw ?? {}) as Record<string, unknown>;
   return {
@@ -352,6 +375,9 @@ export function normalizeConfig(raw?: Partial<ClawbotConfig> | Record<string, un
         : undefined,
     workspaceInstructions:
       typeof r.workspaceInstructions === "boolean" ? r.workspaceInstructions : DEFAULT_CONFIG.workspaceInstructions,
+    voiceTranscribe:
+      typeof r.voiceTranscribe === "boolean" ? r.voiceTranscribe : DEFAULT_CONFIG.voiceTranscribe,
+    voiceLanguage: normalizeVoiceLanguage(r.voiceLanguage),
     mcpBridge:
       typeof r.mcpBridge === "boolean" ? r.mcpBridge : DEFAULT_CONFIG.mcpBridge,
     codexPeer:
@@ -448,6 +474,17 @@ export const BaseConfig = Schema.object({
       + "关掉则微信会话里不再自动塞这些文件——DSH 每次文件改动都会重发整份,"
       + "bot 只在某个项目里干过一次活,那份文件也会一直跟着涨。网页会话和子代理不受影响。",
     ),
+  voiceTranscribe: Schema.boolean()
+    .default(true)
+    .description(
+      "语音没带文字时在本机转写(默认开):微信一般会把语音转成文字一起发来,这时什么都不做。"
+      + "哪次没带文字,就在这台电脑上转成文字:先用 DSH 自带的「语音输入」(在「插件」里打开,各平台都能用),"
+      + "它没开时 Mac(macOS 26 及以上)用系统自带的听写模型。"
+      + "语音不出这台电脑,也不用授权。关掉则这种语音只回一句「听不了」。",
+    ),
+  voiceLanguage: Schema.string()
+    .default("zh-CN")
+    .description("对 bot 说话用的语言,只给 Mac 自带的转写用(DSH 的「语音输入」自己认语言),写语言代码:zh-CN、zh-TW、yue-CN、en-US、ja-JP……系统里要有这种语言的听写"),
   mcpBridge: Schema.boolean()
     .default(true)
     .description("开放 MCP 桥(/plugins/clawbot/mcp/*):让 Claude Code / Codex 列出/读取/驱动 DSH 会话,并通过 bot 给你发微信。只监听本机,而且每个请求都要 token"),
@@ -572,6 +609,9 @@ export const HOT_FIELDS = new Set<keyof ClawbotConfig>([
   "idleCompaction",
   "idleCompactionTokens",
   "workspaceInstructions",
+  // Read per voice message (voice.ts).
+  "voiceTranscribe",
+  "voiceLanguage",
   "stripEmoji",
   "mcpBridge",
   "maxImageEdge",

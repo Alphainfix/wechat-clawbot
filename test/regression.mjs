@@ -465,7 +465,8 @@ function check(name, ok, detail) {
     `mode ${(statSync(tokenFile).mode & 0o777).toString(8)}`);
   check("a second call returns the same token", ensureMcpToken() === minted);
   unlinkSync(tokenFile);
-  delete process.env.CLAWBOT_STATE_DIR;
+  // Back to the suite's own state folder — never unset: what follows would read and write the real one.
+  process.env.CLAWBOT_STATE_DIR = STATE;
 }
 
 // ------------------------------------------------------- reset script hygiene
@@ -3341,7 +3342,7 @@ function check(name, ok, detail) {
       const iifeBody = src.slice(iifeStart + "void (async () => {".length, iifeEnd);
       const harness = new Function("deps", `
         let { ctx, config, sendText, codexPeer, pending, backlog, calendarHelper, alarms, uploadFileTo, fs,
-              pickAccount, WechatBridge, InboundRouter, runMonitor, logger, carryOverLegacyReminders } = deps;
+              pickAccount, WechatBridge, InboundRouter, runMonitor, logger, carryOverLegacyReminders, prewarmSpeechHelper, logVoiceSetup } = deps;
         let bridge = null, router = null, monitorTask = null, currentAccount = null, warmSession, abort = new AbortController();
         ${monitorCode}
         const restart = (hot) => {
@@ -3369,7 +3370,7 @@ function check(name, ok, detail) {
           pending: { abortAll() {}, close() {}, reopen() {} }, backlog: {}, calendarHelper: { prepare: async () => {} }, alarms: {},
           uploadFileTo: async () => ({}), fs: {}, pickAccount: () => ({ accountId: "acct", configured: true, userId: "owner" }),
           WechatBridge: FakeBridge, InboundRouter: class { handle() {} }, runMonitor,
-          logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {},
+          logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {}, prewarmSpeechHelper() {}, logVoiceSetup: async () => {},
         });
         hh.startMonitor();
         config.macCalendar = false;
@@ -3401,7 +3402,7 @@ function check(name, ok, detail) {
           uploadFileTo: async () => ({}), fs: {}, pickAccount: () => ({ accountId: "acct", configured: true, userId: "owner" }),
           WechatBridge: WaitingBridge, InboundRouter: class { handle() {} },
           runMonitor: ({ signal }) => (async () => { while (!signal.aborted) await sleep(5); })(),
-          logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {},
+          logger: { info() {}, warn() {}, error() {} }, carryOverLegacyReminders() {}, prewarmSpeechHelper() {}, logVoiceSetup: async () => {},
         });
         hh.startMonitor();
         const ended = await Promise.race([hh.stopMonitor("switch").then(() => true), sleep(2000).then(() => false)]);

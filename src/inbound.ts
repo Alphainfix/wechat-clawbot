@@ -18,6 +18,7 @@ import type { WechatBridge } from "./bridge.js";
 import { PendingRegistry } from "./pending.js";
 import { loadContextToken, saveContextToken } from "./state.js";
 import { logger } from "./ilink/util/logger.js";
+import { sharedSpeechHelper, transcribeVoiceItem, voiceLacksTranscript, voiceNotice, type HostSpeech, type VoiceOutcome } from "./voice.js";
 
 function isMediaItem(item: MessageItem | undefined): boolean {
   return (
@@ -89,6 +90,41 @@ export function hasNonTextItem(msg: WeixinMessage): boolean {
 }
 
 /**
+ * What to tell the sender about a message nothing could be read from, by what
+ * the message actually was. (Every such message used to be called a video,
+ * a voice message without its transcript included.)
+ */
+export function unreadableNotice(msg: WeixinMessage, voice?: VoiceOutcome): string | null {
+  const types = new Set((msg.item_list ?? []).map((item) => item.type));
+  if (types.has(MessageItemType.VOICE)) return voiceNotice(voice);
+  if (types.has(MessageItemType.VIDEO)) return "[DSH] 收到视频消息，暂不支持处理。";
+  if (types.has(MessageItemType.IMAGE)) return "[DSH] 收到一张图片，但没能下载下来，麻烦再发一次。";
+  if (types.has(MessageItemType.FILE)) return "[DSH] 收到一个文件，但没能下载下来，麻烦再发一次。";
+  if (hasNonTextItem(msg)) return "[DSH] 收到一条我还处理不了的消息（不是文字、图片、文件或语音）。";
+  return null;
+}
+
+/**
+ * What a voice item carried, without the audio or the words: enough to tell
+ * "WeChat sent no transcript" from "the transcript moved somewhere new".
+ */
+function voiceShape(item: MessageItem): Record<string, unknown> {
+  const voice = item.voice_item;
+  return {
+    itemKeys: Object.keys(item).sort(),
+    keys: Object.keys(voice ?? {}).sort(),
+    textChars: typeof voice?.text === "string" ? [...voice.text].length : null,
+    playtime: voice?.playtime ?? null,
+    encodeType: voice?.encode_type ?? null,
+    sampleRate: voice?.sample_rate ?? null,
+    media: voice?.media
+      ? { query: !!voice.media.encrypt_query_param, url: !!voice.media.full_url, key: !!voice.media.aes_key }
+      : null,
+    completed: item.is_completed ?? null,
+  };
+}
+
+/**
  * Resolve the quoted (引用) content of an inbound message. The wire only
  * carries the quoted message's id and creation time; the content comes from
  * the local quote-history registry, with a timestamp fallback over the
@@ -123,6 +159,7 @@ export class InboundRouter {
   private readonly bridge: WechatBridge;
   private readonly pending: PendingRegistry;
   private readonly sendText: (to: string, text: string) => Promise<void>;
+  private readonly transcribeVoice: (item: MessageItem) => Promise<VoiceOutcome>;
 
   constructor(deps: {
     config: ClawbotConfig;
@@ -130,12 +167,22 @@ export class InboundRouter {
     bridge: WechatBridge;
     pending: PendingRegistry;
     sendText: (to: string, text: string) => Promise<void>;
+    /** DSH's own speech recognition, when the owner has it switched on (looked up per message). */
+    hostSpeech?: () => HostSpeech | undefined;
+    /** Tests stand in for the speech models. */
+    transcribeVoice?: (item: MessageItem) => Promise<VoiceOutcome>;
   }) {
     this.config = deps.config;
     this.account = deps.account;
     this.bridge = deps.bridge;
     this.pending = deps.pending;
     this.sendText = deps.sendText;
+    this.transcribeVoice = deps.transcribeVoice ?? ((item) => transcribeVoiceItem(item, {
+      cdnBaseUrl: this.account.cdnBaseUrl,
+      language: this.config.voiceLanguage || "zh-CN",
+      helper: sharedSpeechHelper(),
+      ...(deps.hostSpeech === undefined ? {} : { hostSpeech: deps.hostSpeech }),
+    }));
   }
 
   /** Whether a sender may talk to the agent. */
@@ -175,6 +222,7 @@ export class InboundRouter {
           t: Date.now(),
           seq: msg.seq,
           msgType: msg.message_type,
+          msgState: msg.message_state ?? null,
           msgId: msg.message_id,
           clientId: msg.client_id,
           items: (msg.item_list ?? []).map((i) => ({
@@ -182,6 +230,7 @@ export class InboundRouter {
             text: i.text_item?.text ?? null,
             hasRef: !!i.ref_msg,
             ref: i.ref_msg ?? null,
+            ...(i.type === MessageItemType.VOICE ? { voice: voiceShape(i) } : {}),
           })),
         }) + "\n",
       );
@@ -206,18 +255,48 @@ export class InboundRouter {
       return;
     }
 
-    // Until it is handed to the bridge (an image may take seconds to download),
-    // the bot's reply tools give it a moment to arrive (see coalesce.ts).
+    // Until it is handed to the bridge (an image may take seconds to download,
+    // a voice message a moment to transcribe), the bot's reply tools give it a
+    // moment to arrive (see coalesce.ts).
     this.bridge.noteIncoming(sender, 1);
     try {
-      await this.route(msg, sender);
+      const voice = await this.fillVoiceTranscripts(msg);
+      await this.route(msg, sender, voice);
     } finally {
       this.bridge.noteIncoming(sender, -1);
     }
   }
 
+  /**
+   * A voice message WeChat sent without its transcript: make one on this
+   * machine and put it where WeChat's would have been, so everything after —
+   * a pending question, the agent — reads the message the way it reads any
+   * voice message. Returns what became of the first such item
+   * (the reply to an unreadable message is about that one); undefined when the
+   * message has none.
+   */
+  private async fillVoiceTranscripts(msg: WeixinMessage): Promise<VoiceOutcome | undefined> {
+    let first: VoiceOutcome | undefined;
+    for (const item of msg.item_list ?? []) {
+      if (!voiceLacksTranscript(item)) continue;
+      let outcome: VoiceOutcome;
+      if (this.config.voiceTranscribe === false) {
+        outcome = { ok: false, reason: "off" };
+      } else {
+        try {
+          outcome = await this.transcribeVoice(item);
+        } catch (err) {
+          outcome = { ok: false, reason: "failed", detail: String((err as Error).message ?? err).slice(0, 200) };
+        }
+      }
+      if (outcome.ok) item.voice_item = { ...item.voice_item, text: outcome.text };
+      first ??= outcome;
+    }
+    return first;
+  }
+
   /** Everything after the sender is known and allowed. */
-  private async route(msg: WeixinMessage, sender: string): Promise<void> {
+  private async route(msg: WeixinMessage, sender: string, voice?: VoiceOutcome): Promise<void> {
     const plainText = extractPlainText(msg);
     const body = bodyFromItemList(msg.item_list);
     const quotePrefix = buildQuotePrefix(msg, this.bridge);
@@ -284,13 +363,15 @@ export class InboundRouter {
     }
 
     if (!body && !mediaNote) {
-      if (hasNonTextItem(msg)) {
-        await this.sendText(
-          sender,
-          "[DSH] 收到视频消息，暂不支持处理。",
-        ).catch(() => {});
-      }
+      const notice = unreadableNotice(msg, voice);
+      if (notice !== null) await this.sendText(sender, notice).catch(() => {});
       return;
+    }
+    // WeChat's own transcript is good enough to pass as typed text. This
+    // machine's is rougher (names and English words above all), and the agent
+    // reads it better knowing where it came from.
+    if (voice?.ok === true) {
+      mediaNote += "\n（这条是语音，文字是电脑转写的，可能有错字；拿不准的词按上下文理解。）";
     }
 
     // Record this inbound message so future quotes of it can be resolved.

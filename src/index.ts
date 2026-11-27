@@ -16,6 +16,8 @@ import type { Context } from "@deepseek-ai/cordis";
 import { normalizeConfig, snapshotConfig, HOT_FIELDS, type ClawbotConfig } from "./config.js";
 import { WechatBridge } from "./bridge.js";
 import { InboundRouter } from "./inbound.js";
+import { prewarmSpeechHelper } from "./voice.js";
+import { hostSpeech, logVoiceSetup } from "./voice-setup.js";
 import { ApprovalRelay } from "./approvals.js";
 import { tryRegisterQuestionProvider } from "./questions.js";
 import { runMonitor } from "./monitor.js";
@@ -418,7 +420,13 @@ export function apply(ctx: Context, rawConfig?: Partial<ClawbotConfig>): () => P
       bridge,
       pending,
       sendText,
+      hostSpeech: () => hostSpeech(ctx),
     });
+    // A voice message WeChat sends without its transcript is transcribed on
+    // this machine (voice.ts); have the helper compiled before the first one.
+    if (config.voiceTranscribe !== false) prewarmSpeechHelper();
+    // Where voice stands, once DSH's other plugins have had a moment to start.
+    setTimeout(() => { void logVoiceSetup({ ctx, config }); }, 8000).unref?.();
 
     abort = new AbortController();
     const signal = abort.signal;
