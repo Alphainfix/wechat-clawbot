@@ -174,6 +174,28 @@ function projectsDir(): string {
   return path.join(os.homedir(), ".claude", "projects");
 }
 
+/**
+ * Whether Claude Code is on this computer: it has kept sessions here, or its
+ * program is installed. Decides whether the three tools are registered at all
+ * (each one rides along on every request).
+ */
+export function claudeCodePresent(
+  home: string = os.homedir(),
+  program: () => string | undefined = findClaude,
+): boolean {
+  try {
+    const dir = path.join(home, ".claude");
+    if (fs.existsSync(path.join(dir, "projects")) || fs.existsSync(path.join(dir, "sessions"))) return true;
+  } catch {
+    // fall through to the program
+  }
+  try {
+    return program() !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 /** How long a send may take before we stop waiting on the helper process. */
 const SEND_TIMEOUT_MS = 120_000;
 

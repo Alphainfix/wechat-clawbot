@@ -22,7 +22,7 @@ import { SessionId, type Session, type SessionEvent } from "@deepseek-ai/dsh-ses
 import { createUserMessage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import { zonedStamp } from "./localtime.js";
 import { compressForUpload } from "./image-compress.js";
-import { registerClaudePeerTools } from "./claude-peer.js";
+import { claudeCodePresent, registerClaudePeerTools } from "./claude-peer.js";
 import { registerDshSessionTools } from "./dsh-sessions.js";
 import { NOTIFY_TOOL, notifyOwner } from "./owner-notify.js";
 import { Onboarding, registerSetupGuideTool } from "./onboarding.js";
@@ -1672,9 +1672,16 @@ export class WechatBridge {
     // request header that later readers use) follows the pick.
     // `model/selection` is declared by the agent package rather than by the
     // session's own event union, so compare it as a plain string.
-    if ((event.type as string) === "model/selection") {
+    // Only when the plugin's settings pin no model: a pinned model is the bot's
+    // model whatever the web UI picks (the branch further down records it again).
+    // On DSH 0.2.2 the ref is also what installSelection() writes back into the
+    // session on every WeChat message, so without this the pick lasted only
+    // until the next message.
+    if ((event.type as string) === "model/selection" && this.config.model === undefined) {
       const chosen = event.data as unknown as Partial<ModelSelection> | undefined;
-      if (chosen?.provider && chosen.model) {
+      const have = this.selectionRef.current;
+      if (chosen?.provider && chosen.model && (have?.provider !== chosen.provider || have?.model !== chosen.model
+        || (have?.reasoningEffort ?? undefined) !== (chosen.reasoningEffort ?? undefined))) {
         this.selectionRef.current = {
           provider: chosen.provider,
           model: chosen.model,
@@ -1917,10 +1924,11 @@ export class WechatBridge {
       });
       // Visibility into the user's Claude Code sessions, so a WeChat message can
       // ask "what is Claude doing" or redirect a coding session the user is not
-      // sitting in front of. Off by default, like the Codex tools below: every
-      // registered tool rides along on every request. restrictTools further down
-      // is a DENY list, so these three are visible without being named there.
-      const claude = this.config.claudePeer === true;
+      // sitting in front of. Only when Claude Code is on this computer (and the
+      // switch is not off): every registered tool rides along on every request.
+      // restrictTools further down is a DENY list, so these three are visible
+      // without being named there.
+      const claude = this.config.claudePeer !== false && claudeCodePresent();
       if (claude) registerClaudePeerTools(agentCtx, this.config);
       // The same for the owner's other DSH conversations, in any folder.
       registerDshSessionTools(agentCtx, this.ctx, this.config.sessionId);
@@ -1970,7 +1978,7 @@ export class WechatBridge {
       const offLate = registerLateScheduleNotes(target, (id) => this.isWechatSession(id), (text) => wechatUserMessage([{ type: "text", text }]));
       if (typeof offLate === "function") this.toolDisposers.push(offLate as () => void);
       this.toolsRegistered = true;
-      logger.info(`ensureTools: WeChat tools registered (Claude tools ${claude ? "on" : "off"}, Codex tools ${codex ? "on" : "off"}, calendar tools ${calendar ? "on" : "off"})`);
+      logger.info(`ensureTools: WeChat tools registered (Claude tools ${claude ? "on" : this.config.claudePeer === false ? "off" : "off: no Claude Code on this computer"}, Codex tools ${codex ? "on" : "off"}, calendar tools ${calendar ? "on" : "off"})`);
     } catch (err) {
       // Undo the half that did register, so the retry starts clean.
       this.releaseTools();

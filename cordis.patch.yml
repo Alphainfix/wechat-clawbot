@@ -14,7 +14,8 @@
         logLevel: 'info'
 
     # dsh-schedule: the DSH official reminder plugin. The WeChat agent uses
-    # its schedule_create/list/delete tools for timed reminders, and the
+    # its schedule_* tools for timed reminders (create/list/update/delete up to
+    # DSH 0.2.1; create/list/view/edit, with rrule timing, from 0.2.2), and the
     # bridge delivers the injected reminders back to WeChat. Bundled here so
     # installing this plugin brings the reminder feature automatically —
     # no profile-level patch needed.

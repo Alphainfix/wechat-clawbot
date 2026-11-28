@@ -345,13 +345,21 @@ function check(name, ok, detail) {
   // follow the Host the plugin runs on, not the one it was written against.
   const modern = buildWechatSystemPrompt(false, 2, "wechat-main");
   check("0.2.2 guidance teaches the two-line rrule form",
-    /DTSTART;TZID=/.test(modern) && /RRULE:FREQ=DAILY;COUNT=1/.test(modern) && /20261107T090000/.test(modern));
-  check("0.2.2 guidance requires target this_session",
-    /target 每次都必须填 "this_session"/.test(modern));
-  check("0.2.2 guidance reads scheduledAtLocal instead of the UTC scheduledAt",
-    /scheduledAtLocal/.test(modern) && !/填 `at` 的日期/.test(modern));
-  check("0.2.2 guidance scopes the Host-wide list and uses schedule_edit",
-    /schedule_edit\(action:"delete", id\)/.test(modern) && /target\.sessionId 等于 `wechat-main`/.test(modern));
+    /DTSTART;TZID=时区:YYYYMMDDTHHMMSS/.test(modern) && /RRULE:FREQ=DAILY;COUNT=1/.test(modern) && /RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR/.test(modern));
+  check("0.2.2 guidance requires target this_session, for reminders and tasks",
+    (modern.match(/target 填 "this_session"|target 照样填 "this_session"/g) ?? []).length === 2);
+  check("0.2.2 guidance reads scheduledAtLocal (no weekday in it) instead of the UTC scheduledAt",
+    /scheduledAtLocal` 是本地时间\(如 2026-11-27T15:00:00-05:00,不带星期\)/.test(modern) && !/填 `at` 的日期/.test(modern)
+      && !/after_seconds/.test(modern) && !/"当前时刻"/.test(modern.slice(modern.indexOf("G5 — "), modern.indexOf("G6 — "))));
+  check("0.2.2 guidance: the list covers all of DSH, this session's reminders are the ones targeting it, schedule_edit changes them",
+    /schedule_edit\(action "delete"\)/.test(modern) && /target\.sessionId 是 `wechat-main` 的才是这个微信对话里的提醒/.test(modern)
+      && /别的会话的任务,用户明确问起或要你改时才看、才动/.test(modern));
+  {
+    const g5 = (text) => text.slice(text.indexOf("G5 — "), text.indexOf("G6 — "));
+    const item = (text, n) => g5(text).split("\n").find((line) => line.startsWith(`${n}. `));
+    check("0.2.2 guidance keeps the confirmation and delivery rules (items 4, 5) word for word",
+      item(modern, 4) === item(prompt, 4) && item(modern, 5) === item(prompt, 5) && item(modern, 4)?.includes("绝对日期+星期"));
+  }
   check("0.2.1 guidance keeps the selector-based form",
     /填 `at` 的日期/.test(prompt) && /after_seconds/.test(prompt) && !/RRULE:FREQ=DAILY;COUNT=1/.test(prompt));
 }
@@ -2478,11 +2486,31 @@ function check(name, ok, detail) {
   setLogLevel("error");
   const cal = await import(join(ROOT, "lib/mac-calendar.js"));
   const cfgMod = await import(join(ROOT, "lib/config.js"));
+  {
+    // PR 3: the Claude Code tools ride along on every request. On by default, but
+    // registered only when Claude Code is on this computer; off never registers them.
+    const peer = await import(join(ROOT, "lib/claude-peer.js"));
+    const bridgeSrc = readFileSync(join(ROOT, "src/bridge.ts"), "utf-8");
+    check("Claude Code tools: on by default, the card can flip it, and they register only when Claude Code is here",
+      cfgMod.DEFAULT_CONFIG.claudePeer === true && cfgMod.normalizeConfig({ claudePeer: false }).claudePeer === false
+        && typeof peer.claudeCodePresent === "function"
+        && /const claude = this\.config\.claudePeer !== false && claudeCodePresent\(\);\s*if \(claude\) registerClaudePeerTools\(/.test(bridgeSrc)
+        && /set\("claudePeer", next\)/.test(readFileSync(join(ROOT, "src/client.js"), "utf-8")));
+    const home = mkdtempSync(join(tmpdir(), "clawbot-noclaude-"));
+    const none = peer.claudeCodePresent(home, () => undefined);
+    const withProgram = peer.claudeCodePresent(home, () => "/somewhere/claude");
+    mkdirSync(join(home, ".claude", "projects"), { recursive: true });
+    const withSessions = peer.claudeCodePresent(home, () => undefined);
+    rmSync(home, { recursive: true, force: true });
+    check("Claude Code tools: no ~/.claude and no claude program = not here; either one = here",
+      none === false && withProgram === true && withSessions === true, JSON.stringify({ none, withProgram, withSessions }));
+  }
   check("calendar: off by default, with no name",
     cfgMod.DEFAULT_CONFIG.macCalendar === false && cfgMod.DEFAULT_CONFIG.macCalendarName === "");
   check("calendar: the tool switches are hot (the card can only write volatile fields), and flipping one restarts the listener",
     cfgMod.HOT_FIELDS.has("macCalendar") && cfgMod.HOT_FIELDS.has("codexPeer") && cfgMod.HOT_FIELDS.has("macCalendarName")
-      && /const toolSwitches = hot\.filter\(\(key\) => key === "macCalendar" \|\| key === "codexPeer"\);[\s\S]{0,400}await stopMonitor\([\s\S]{0,80}startMonitor\(\);/
+      && cfgMod.HOT_FIELDS.has("claudePeer")
+      && /const toolSwitches = hot\.filter\(\s*\(key\) => key === "macCalendar" \|\| key === "codexPeer" \|\| key === "claudePeer",?\s*\);[\s\S]{0,400}await stopMonitor\([\s\S]{0,80}startMonitor\(\);/
         .test(readFileSync(join(ROOT, "src/index.ts"), "utf-8")));
   {
     // The host's settings form refuses writes to non-volatile fields (silently,
@@ -4508,6 +4536,48 @@ function check(name, ok, detail) {
   await sleep(10);
   check("0.2.2 模型选择:设置里没钉模型时,不去改网页上的选择", b.selects.length === 0, JSON.stringify(b.selects));
   await b.bridge.dispose();
+
+  // Not pinned, and the next WeChat message arrives after a pick in the web UI (PR 2):
+  // installSelection() runs again on the live agent and must not put the startup
+  // default back.
+  {
+    let publishing = false;
+    const selects = [];
+    const state = { recorded: { provider: "zhipu", model: "glm-5.3-flash" } };
+    let globalDefault = { provider: "zhipu", model: "glm-5.3-flash" };
+    const agent = { inject: () => {}, session: { requestHeader: () => undefined },
+      model: { current: () => ({ ...state.recorded }), select: (sel) => {
+        if (publishing) throw new Error("session append cannot reenter while another append is being published");
+        selects.push(sel); state.recorded = { ...sel };
+      } } };
+    const config = { ...DEFAULT_CONFIG, sessionId: "sim-follow", autoMemory: false, idleCompaction: false };
+    const deps = { getAccount: () => ({ configured: true, userId: "o@im.wechat" }), getContextToken: () => "", pending: new PendingRegistry() };
+    const ctx = { agents: { get: () => agent },
+      get: (name) => name === "agentDefaultModel" ? { currentSelection: () => ({ ...globalDefault }) } : undefined };
+    const bridge = new WechatBridge(ctx, config, async () => {}, deps);
+    const quiet = new Proxy({}, { get: () => () => {} });
+    bridge.typing = quiet;
+    bridge.idleCompact = quiet;
+    const agentCtx = { on: () => () => {}, get: () => undefined };
+    const ev = (type, data) => {
+      publishing = true;
+      try { bridge.onSessionEvent({ id: "sim-follow" }, { type, data, seq: 1, time: Date.now() }); }
+      finally { publishing = false; }
+    };
+    bridge.installSelection(agentCtx);
+    await sleep(10);
+    const pick = { provider: "opencode-go", model: "deepseek-v4.1-flash", reasoningEffort: "high" };
+    state.recorded = { ...pick };
+    globalDefault = { ...pick };
+    ev("model/selection", pick);
+    await sleep(10);
+    bridge.installSelection(agentCtx);   // the next WeChat message
+    await sleep(10);
+    check("没钉模型:网页上给小bot会话选的模型,下一条微信来了也照用(不改回启动时的默认)",
+      state.recorded.provider === "opencode-go" && state.recorded.model === "deepseek-v4.1-flash"
+        && state.recorded.reasoningEffort === "high" && selects.length === 0, JSON.stringify({ recorded: state.recorded, selects }));
+    await bridge.dispose();
+  }
 
   // An older host's agent has no `model`: nothing is recorded and nothing throws.
   const c = make(undefined, { durable: false });

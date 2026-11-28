@@ -300,6 +300,40 @@ const { normalizeConfig, HOT_FIELDS } = await import(lib("config.js"));
     const withText = raw.find((row) => row.items?.[0]?.voice?.textChars === 4);
     check("…and for one WeChat transcribed, how long the transcript was", withText !== undefined && !JSON.stringify(withText).includes("到楼下了"));
   }
+  {
+    // A text message with a quote. At the default log level the raw log keeps its
+    // lengths and fields only (PR 4: it used to keep a plaintext copy of every chat);
+    // at logLevel debug a row carries the text and the quote as they came.
+    const h = make();
+    h.router.bridge.lookupQuoteByTime = () => undefined;   // no quote history in this test
+    await h.router.handle({ from_user_id: "u1", message_id: 7, client_id: "c-text-1", item_list: [{ type: 1, text_item: { text: "周五下午三点见" },
+      ref_msg: { title: "上次说的地方", message_item: { type: 1, text_item: { text: "老地方" } } } }] });
+    const hd = make({ config: { logLevel: "debug" } });
+    await hd.router.handle({ from_user_id: "u1", message_id: 8, client_id: "c-text-2", item_list: [{ type: 1, text_item: { text: "调试时留原文" } }] });
+    const rows = readFileSync(join(STATE, "inbound-raw.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+    const plain = rows.find((row) => row.clientId === "c-text-1");
+    const dbg = rows.find((row) => row.clientId === "c-text-2");
+    check("the raw log keeps a text message's length and quote fields, not the text or the quote",
+      plain !== undefined && plain.items[0].textChars === 7 && !("text" in plain.items[0])
+        && plain.items[0].ref?.titleChars === 6 && plain.items[0].ref?.item?.type === 1
+        && !/周五|老地方|上次说的地方/.test(JSON.stringify(plain)), JSON.stringify(plain));
+    check("…at logLevel debug a row carries the text as it came", dbg?.items?.[0]?.text === "调试时留原文", JSON.stringify(dbg));
+    check("…and the file is private (0600)", (statSync(join(STATE, "inbound-raw.jsonl")).mode & 0o777) === 0o600);
+
+    // A log written by an older version is 0644, and so are its rotated copies.
+    const old = mkdtempSync(join(tmpdir(), "clawbot-rawlog-"));
+    writeFileSync(join(old, "inbound-raw.jsonl"), "{}\n", { mode: 0o644 });
+    writeFileSync(join(old, "inbound-raw.jsonl.1"), "{}\n", { mode: 0o644 });
+    const probe = `const { InboundRouter } = await import(${JSON.stringify(new URL("../lib/inbound.js", import.meta.url).href)});
+      const router = new InboundRouter({ config: { allowFrom: [] }, account: { accountId: "acc", userId: "u1", cdnBaseUrl: "http://127.0.0.1:9" },
+        bridge: { enqueueMessage: async () => {}, noteIncoming: () => {} }, pending: { popFor: () => undefined }, sendText: async () => {},
+        transcribeVoice: async () => ({ ok: false, reason: "no-engine" }) });
+      await router.handle({ from_user_id: "u1", item_list: [{ type: 1, text_item: { text: "hi" } }] });`;
+    execFileSync(process.execPath, ["--input-type=module", "-e", probe], { env: { ...process.env, CLAWBOT_STATE_DIR: old }, stdio: "pipe" });
+    const modes = ["inbound-raw.jsonl", "inbound-raw.jsonl.1"].map((name) => statSync(join(old, name)).mode & 0o777);
+    rmSync(old, { recursive: true, force: true });
+    check("…and a log an older version left at 0644 is made 0600, rotated copies too", modes.every((mode) => mode === 0o600), modes.map((m) => m.toString(8)).join(","));
+  }
 }
 
 // ------------------------------------------------- 3. outcomes without the helper

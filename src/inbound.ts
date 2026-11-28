@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import type { MessageItem, WeixinMessage } from "./ilink/api/types.js";
+import type { MessageItem, RefMessage, WeixinMessage } from "./ilink/api/types.js";
 import { MessageItemType } from "./ilink/api/types.js";
 import { resolveStateDir } from "./ilink/storage/state-dir.js";
 import { downloadMediaFromItem } from "./inbound-media.js";
@@ -108,6 +108,34 @@ export function unreadableNotice(msg: WeixinMessage, voice?: VoiceOutcome): stri
  * What a voice item carried, without the audio or the words: enough to tell
  * "WeChat sent no transcript" from "the transcript moved somewhere new".
  */
+/** A quoted message in the raw log, without its content (see InboundRouter.handle). */
+function refShape(ref: RefMessage): Record<string, unknown> {
+  const item = ref.message_item;
+  return {
+    keys: Object.keys(ref).sort(),
+    titleChars: typeof ref.title === "string" ? [...ref.title].length : null,
+    item: item ? { type: item.type ?? null, keys: Object.keys(item).sort() } : null,
+  };
+}
+
+let rawLogTightened = false;
+
+/**
+ * Make the raw log and its rotated copies 0600, once per process: files written
+ * before 1.4.1 were 0644 (`mode` on append only applies to a new file).
+ */
+function tightenRawLog(rawPath: string): void {
+  if (rawLogTightened) return;
+  rawLogTightened = true;
+  for (const file of [rawPath, `${rawPath}.1`, `${rawPath}.2`, `${rawPath}.3`]) {
+    try {
+      fs.chmodSync(file, 0o600);
+    } catch {
+      // missing, or not ours to change
+    }
+  }
+}
+
 function voiceShape(item: MessageItem): Record<string, unknown> {
   const voice = item.voice_item;
   return {
@@ -196,9 +224,14 @@ export class InboundRouter {
 
   /** Handle one inbound message from the monitor. */
   async handle(msg: WeixinMessage): Promise<void> {
-    // Debug: record the raw item structure (types + ref fields) to a file so
-    // quote handling can be diagnosed without access to the GUI terminal.
-    // Rotates at 5MB, keeping 3 old files, to bound disk use and privacy.
+    // Record the structure of every inbound message (item types, quote and voice
+    // fields, lengths) so quote handling and WeChat's format changes can be
+    // diagnosed without the GUI terminal — the 2026-11 voice format was found
+    // this way. The content stays out of it: before 1.4.1 every row carried the
+    // message text and the quoted content, so a normal install kept a plaintext
+    // copy of the owner's WeChat chats here (PR 4). Only at logLevel debug does a
+    // row carry the text and the quote as they came. 0600; rotates at 5MB,
+    // keeping 3 old files.
     try {
       const rawPath = path.join(resolveStateDir(), "inbound-raw.jsonl");
       try {
@@ -216,32 +249,29 @@ export class InboundRouter {
       } catch {
         // fresh file / stat race: proceed
       }
-      // Only at debug level. The dump stores the text of every inbound message
-      // (and the quoted content it carries) on disk, which is more than a
-      // diagnostic should collect without being asked: a normal deployment would
-      // keep a plaintext transcript of the owner's WeChat chats in the state
-      // directory. The rotation above stays unconditional and cheap, so an old
-      // file from a debug session is still bounded.
-      if (this.config.logLevel === "debug") {
-        fs.appendFileSync(
-          rawPath,
-          JSON.stringify({
-            t: Date.now(),
-            seq: msg.seq,
-            msgType: msg.message_type,
-            msgState: msg.message_state ?? null,
-            msgId: msg.message_id,
-            clientId: msg.client_id,
-            items: (msg.item_list ?? []).map((i) => ({
-              type: i.type,
-              text: i.text_item?.text ?? null,
-              hasRef: !!i.ref_msg,
-              ref: i.ref_msg ?? null,
-              ...(i.type === MessageItemType.VOICE ? { voice: voiceShape(i) } : {}),
-            })),
-          }) + "\n",
-        );
-      }
+      const debug = this.config.logLevel === "debug";
+      fs.appendFileSync(
+        rawPath,
+        JSON.stringify({
+          t: Date.now(),
+          seq: msg.seq,
+          msgType: msg.message_type,
+          msgState: msg.message_state ?? null,
+          msgId: msg.message_id,
+          clientId: msg.client_id,
+          items: (msg.item_list ?? []).map((i) => ({
+            type: i.type,
+            ...(debug
+              ? { text: i.text_item?.text ?? null }
+              : { textChars: typeof i.text_item?.text === "string" ? [...i.text_item.text].length : null }),
+            hasRef: !!i.ref_msg,
+            ref: i.ref_msg ? (debug ? i.ref_msg : refShape(i.ref_msg)) : null,
+            ...(i.type === MessageItemType.VOICE ? { voice: voiceShape(i) } : {}),
+          })),
+        }) + "\n",
+        { mode: 0o600 },
+      );
+      tightenRawLog(rawPath);
     } catch {
       // ignore logging failures
     }

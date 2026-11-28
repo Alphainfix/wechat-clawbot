@@ -186,11 +186,14 @@ export interface ClawbotConfig {
   codexPeer: boolean;
   codexTransport: "socket" | "stdio";
   /**
-   * Register the Claude Code peer tools (list / read / relay). Off by default:
-   * every registered tool rides along on every request, so a deployment without
-   * Claude Code pays for three schemas on every message. Cold on purpose —
-   * flipping it restarts the WeChat listener, which rebuilds the tool list, so
-   * the tools and prompt stay byte-stable between flips (prompt cache).
+   * Register the Claude Code peer tools (list / read / relay). On by default,
+   * but the tools are registered only when Claude Code is on this computer
+   * (`claudeCodePresent()`): every registered tool rides along on every request
+   * (about 3,500 characters for these three), so a deployment without Claude
+   * Code no longer pays for them, while one that has it keeps them without
+   * touching a setting. `false` never registers them. Flipping it restarts the
+   * WeChat listener, which rebuilds the tool list, so the tools and prompt stay
+   * byte-stable between flips (prompt cache).
    */
   claudePeer: boolean;
 
@@ -300,7 +303,7 @@ export const DEFAULT_CONFIG: ClawbotConfig = {
   mcpBridge: true,
   codexPeer: false,
   codexTransport: "socket",
-  claudePeer: false,
+  claudePeer: true,
   macCalendar: false,
   macCalendarName: "",
   macCalendarAlert: true,
@@ -508,8 +511,8 @@ export const BaseConfig = Schema.object({
     .default(false)
     .description("【改动会重启微信监听】让微信 bot 查看 Codex 项目/会话、转发消息和查询进度(默认关)。关着时这几个工具不发给模型,不占 token"),
   claudePeer: Schema.boolean()
-    .default(false)
-    .description("【改动会重启微信监听】让微信 bot 查看 Claude Code 会话、读取与转发消息(默认关)。关着时这几个工具不发给模型,不占 token"),
+    .default(true)
+    .description("【改动会重启微信监听】让微信 bot 查看 Claude Code 会话、读取与转发消息。开着时,这台电脑上有 Claude Code 才注册这三个工具(没有就不发给模型、不占 token);关掉就一直不注册"),
   codexTransport: Schema.union(["socket", "stdio"] as const)
     .default("socket")
     .description("【改动会重启微信监听】socket 通过 WebSocket 连接共享 Codex App Server;stdio 启动独立后台服务,只能在明确允许续聊后执行历史任务"),

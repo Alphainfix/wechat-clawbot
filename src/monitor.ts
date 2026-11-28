@@ -211,7 +211,9 @@ export class SeenSet {
     if (this.ids.length > SEEN_LIMIT) this.ids.splice(0, this.ids.length - SEEN_LIMIT);
     try {
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      fs.writeFileSync(this.file, JSON.stringify({ ids: this.ids }), "utf-8");
+      // 0600: the ids are WeChat's own message ids, nothing more, but every other
+      // file next to them (account, cursor, context tokens) is private too.
+      fs.writeFileSync(this.file, JSON.stringify({ ids: this.ids }), { encoding: "utf-8", mode: 0o600 });
     } catch (err) {
       // Best effort: a full disk degrades to at-least-once, which is the safe side.
       logger.warn(`seen: could not persist ${this.file}: ${String(err)}`);

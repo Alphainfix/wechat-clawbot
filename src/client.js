@@ -989,6 +989,17 @@ window.__ModuleLoader__.load({
           }),
         }),
         Field({
+          label: "Claude Code 会话联动",
+          hint: "默认开:这台电脑上有 Claude Code 时,bot 可以查看 Claude Code 会话、读取和转发消息,每次请求多带 3 个工具(约 1.5k token);"
+            + "没装 Claude Code 就不带。关掉就一直不带。改动会重启微信监听",
+          overridden: isSet("claudePeer"), disabled,
+          onReset: () => clear("claudePeer"),
+          inline: h(Switch, {
+            label: "Claude Code 会话联动", on: v.claudePeer !== false, disabled,
+            onChange: (next) => set("claudePeer", next),
+          }),
+        }),
+        Field({
           label: "拉活关掉的 Claude 会话时",
           hint: "会话没开着时,先用 --bg 在后台把它拉活成正常会话再投消息。"
             + "这是拉活时给它的审批模式。默认沿用那个会话自己的 —— 要人盯着批的模式"
